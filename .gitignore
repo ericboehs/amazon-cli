@@ -1,0 +1,5 @@
+pyworker/.venv/
+pyworker/.python-version
+__pycache__/
+*.pyc
+*.log

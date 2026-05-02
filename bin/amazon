@@ -1,0 +1,22 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "pathname"
+
+ROOT = Pathname(__dir__).join("..").realpath
+$LOAD_PATH.unshift(ROOT.join("lib").to_s)
+
+require "amazon/config"
+require "amazon/store"
+require "amazon/worker"
+require "amazon/formatter"
+require "amazon/cli"
+require "amazon/commands/login"
+require "amazon/commands/sync"
+require "amazon/commands/list"
+require "amazon/commands/show"
+require "amazon/commands/search"
+require "amazon/commands/config"
+require "amazon/commands/buy"
+
+exit(Amazon::CLI.run(ARGV))
