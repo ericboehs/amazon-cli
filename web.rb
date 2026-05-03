@@ -77,7 +77,7 @@ helpers do
       when 31..365 then "#{(days / 30.0).round}mo ago"
       else "#{(days / 365.0).round}y ago"
       end
-    %(<span title="#{h(d.strftime('%A, %B %-d, %Y'))}">#{h(d.strftime('%b %-d, %Y'))} <span class="text-zinc-500 dark:text-zinc-600">· #{label}</span></span>)
+    %(<span title="#{h(d.strftime('%A, %B %-d, %Y'))}">#{h(d.strftime('%b %-d, %Y'))} <span class="text-zinc-500 dark:text-zinc-400">· #{label}</span></span>)
   end
 
   def index_data
@@ -307,19 +307,34 @@ __END__
   <title><%= h(@_title) %></title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23f59e0b'%3E%3Cpath d='M3 3h2l3 12h11l3-9H7'/%3E%3Ccircle cx='9' cy='20' r='1.5'/%3E%3Ccircle cx='17' cy='20' r='1.5'/%3E%3C/svg%3E" type="image/svg+xml">
   <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :where(a, button, input, [tabindex]):focus-visible {
+      outline: 2px solid #f59e0b; /* amber-500 */
+      outline-offset: 2px;
+      border-radius: 0.375rem;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+      .group-hover\:scale-105 { transform: none !important; }
+    }
+  </style>
 </head>
 <body class="h-full bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased">
   <header class="sticky top-0 z-10 border-b border-zinc-200 dark:border-zinc-800 bg-white/80 dark:bg-zinc-950/80 backdrop-blur">
     <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-4">
-      <a href="/" class="flex items-center gap-2 font-semibold text-amber-600 dark:text-amber-400 hover:text-amber-700 dark:hover:text-amber-300 shrink-0">
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5"><path d="M3 3h2l3 12h11l3-9H7"/><circle cx="9" cy="20" r="1.5"/><circle cx="17" cy="20" r="1.5"/></svg>
-        Amazon Orders
+      <a href="/" aria-label="Amazon Orders home" class="flex items-center gap-2 font-semibold text-amber-700 dark:text-amber-400 hover:text-amber-800 dark:hover:text-amber-300 shrink-0">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5" aria-hidden="true"><path d="M3 3h2l3 12h11l3-9H7"/><circle cx="9" cy="20" r="1.5"/><circle cx="17" cy="20" r="1.5"/></svg>
+        <span class="hidden sm:inline">Amazon Orders</span>
       </a>
       <form action="/" method="get" class="flex-1 max-w-xl ml-auto flex gap-2">
         <div class="relative flex-1">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4 absolute left-3 top-2.5 text-zinc-500"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd"/></svg>
-          <input type="search" name="q" value="<%= h(@query) %>" placeholder="Search items, sellers, order IDs…" autocomplete="off"
-                 class="w-full bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg pl-9 pr-3 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-amber-500/40 focus:border-amber-500/40">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4 absolute left-3 top-2.5 text-zinc-500 dark:text-zinc-400"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd"/></svg>
+          <input type="search" name="q" value="<%= h(@query) %>" placeholder="Search items, sellers, order IDs…" aria-label="Search orders" autocomplete="off"
+                 class="w-full bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg pl-9 pr-3 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-600 dark:placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500">
         </div>
         <% if @year %>
           <input type="hidden" name="year" value="<%= h(@year) %>">
@@ -331,14 +346,17 @@ __END__
           <input type="hidden" name="density" value="<%= h(@density) %>">
         <% end %>
       </form>
-      <a href="/stats" class="text-sm text-zinc-600 dark:text-zinc-400 hover:text-amber-700 dark:hover:text-amber-300 shrink-0">Stats</a>
+      <a href="/stats" aria-label="Stats" class="text-sm text-zinc-700 dark:text-zinc-300 hover:text-amber-800 dark:hover:text-amber-300 shrink-0 inline-flex items-center gap-1 rounded-md px-1">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4 sm:hidden" aria-hidden="true"><path d="M2 11a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1H3a1 1 0 01-1-1v-6zM8 5a1 1 0 011-1h2a1 1 0 011 1v12a1 1 0 01-1 1H9a1 1 0 01-1-1V5zM14 8a1 1 0 011-1h2a1 1 0 011 1v9a1 1 0 01-1 1h-2a1 1 0 01-1-1V8z"/></svg>
+        <span class="hidden sm:inline">Stats</span>
+      </a>
     </div>
   </header>
   <main class="max-w-6xl mx-auto px-4 py-6">
     <%= @_content %>
   </main>
-  <footer class="max-w-6xl mx-auto px-4 py-8 text-xs text-zinc-500 dark:text-zinc-600 flex flex-wrap items-center gap-3">
-    <code class="text-zinc-500"><%= h(DATA_ROOT.sub(Dir.home, '~')) %></code>
+  <footer class="max-w-6xl mx-auto px-4 py-8 text-xs text-zinc-500 dark:text-zinc-400 flex flex-wrap items-center gap-3">
+    <code class="text-zinc-500 dark:text-zinc-400"><%= h(DATA_ROOT.sub(Dir.home, '~')) %></code>
     <% if @last_sync %>
       <span>· last sync <%= h(@last_sync) %></span>
     <% end %>
@@ -365,10 +383,10 @@ __END__
         · avg <span class="tabular-nums"><%= money(@stats[:avg]) %></span>
       <% end %>
       <% if @stats[:missing_total].positive? %>
-        · <span class="text-zinc-500"><%= @stats[:missing_total] %> w/o total</span>
+        · <span class="text-zinc-500 dark:text-zinc-400"><%= @stats[:missing_total] %> w/o total</span>
       <% end %>
       <% if @total_pages > 1 %>
-        · <span class="text-zinc-500">page <%= @page %>/<%= @total_pages %></span>
+        · <span class="text-zinc-500 dark:text-zinc-400">page <%= @page %>/<%= @total_pages %></span>
       <% end %>
     </p>
   </div>
@@ -384,23 +402,23 @@ __END__
         parts.empty? ? '/' : "/?#{parts.join('&')}"
       }
     %>
-    <a href="<%= qs.call(year: nil) %>" class="px-3 py-1.5 rounded-md text-xs font-medium <%= @year.nil? ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 ring-1 ring-amber-300 dark:ring-amber-500/30' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-800 dark:text-zinc-200' %>">All years</a>
+    <a href="<%= qs.call(year: nil) %>"<%= ' aria-current="page"' if @year.nil? %> class="px-3 py-1.5 rounded-md text-xs font-medium <%= @year.nil? ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-300 ring-1 ring-amber-400 dark:ring-amber-500/30' : 'text-zinc-700 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-zinc-100' %>">All years</a>
     <% @years.each do |y| %>
-      <a href="<%= qs.call(year: y) %>" class="px-3 py-1.5 rounded-md text-xs font-medium tabular-nums <%= @year == y ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 ring-1 ring-amber-300 dark:ring-amber-500/30' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-800 dark:text-zinc-200' %>"><%= y %></a>
+      <a href="<%= qs.call(year: y) %>"<%= ' aria-current="page"' if @year == y %> class="px-3 py-1.5 rounded-md text-xs font-medium tabular-nums <%= @year == y ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-300 ring-1 ring-amber-400 dark:ring-amber-500/30' : 'text-zinc-700 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-zinc-100' %>"><%= y %></a>
     <% end %>
   </div>
 </div>
 
 <div class="mb-4 flex items-center justify-between gap-3 flex-wrap">
   <% if @cancelled_count.positive? || @show_cancelled %>
-    <a href="<%= qs.call(cancelled: !@show_cancelled) %>" class="inline-flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400 hover:text-zinc-800 dark:text-zinc-200 select-none group">
-      <span class="w-4 h-4 rounded border <%= @show_cancelled ? 'bg-amber-500 dark:bg-amber-500/80 border-amber-500 dark:border-amber-400' : 'border-zinc-400 dark:border-zinc-600 group-hover:border-zinc-600 dark:group-hover:border-zinc-400' %> flex items-center justify-center">
+    <a href="<%= qs.call(cancelled: !@show_cancelled) %>" role="checkbox" aria-checked="<%= @show_cancelled %>" class="inline-flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-zinc-100 select-none group">
+      <span aria-hidden="true" class="w-4 h-4 rounded border <%= @show_cancelled ? 'bg-amber-600 dark:bg-amber-500/80 border-amber-700 dark:border-amber-400' : 'border-zinc-500 dark:border-zinc-500 group-hover:border-zinc-700 dark:group-hover:border-zinc-300' %> flex items-center justify-center">
         <% if @show_cancelled %>
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3 h-3 text-white dark:text-zinc-950"><path fill-rule="evenodd" d="M16.704 4.153a.75.75 0 01.143 1.052l-8 10.5a.75.75 0 01-1.127.075l-4.5-4.5a.75.75 0 011.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 011.05-.143z" clip-rule="evenodd"/></svg>
         <% end %>
       </span>
       Show cancelled orders
-      <span class="text-zinc-500 dark:text-zinc-600">(<%= @cancelled_count %>)</span>
+      <span class="text-zinc-500 dark:text-zinc-400">(<%= @cancelled_count %>)</span>
     </a>
   <% else %>
     <span></span>
@@ -412,7 +430,7 @@ __END__
       ['comfortable', 'M2 4h16v4H2zM2 12h16v4H2z'],
       ['gallery',    'M3 3h6v6H3zM11 3h6v6h-6zM3 11h6v6H3zM11 11h6v6h-6z']
     ].each do |val, path| %>
-      <a href="<%= qs.call(density: val) %>" title="<%= val.capitalize %>" aria-label="<%= val.capitalize %>" class="px-2.5 py-1.5 transition <%= @density == val ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-900' %>">
+      <a href="<%= qs.call(density: val) %>" title="<%= val.capitalize %> density" aria-label="<%= val.capitalize %> density"<%= ' aria-current="true"' if @density == val %> class="px-2.5 py-1.5 transition <%= @density == val ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-300' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-50 dark:hover:bg-zinc-900' %>">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4"><path d="<%= path %>"/></svg>
       </a>
     <% end %>
@@ -434,7 +452,7 @@ __END__
            refund = refund_kind(o['order_id'])
       %>
         <li>
-          <a href="/o/<%= h(o['order_id']) %>" class="group block rounded-lg overflow-hidden border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 hover:border-zinc-300 dark:hover:border-zinc-700 transition <%= 'opacity-60' if cancelled %>">
+          <a href="/o/<%= h(o['order_id']) %>" class="group block rounded-lg overflow-hidden border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 hover:border-zinc-300 dark:hover:border-zinc-700 transition <%= '' %>">
             <div class="relative aspect-square bg-zinc-100 dark:bg-zinc-800">
               <% if first_item && first_item['image_link'] %>
                 <img src="<%= h(first_item['image_link']) %>" alt="" loading="lazy" class="absolute inset-0 w-full h-full object-contain p-2 group-hover:scale-105 transition-transform duration-200">
@@ -452,9 +470,9 @@ __END__
                 <span class="absolute top-1.5 left-1.5 inline-flex items-center rounded bg-zinc-900/70 text-white px-1.5 py-0.5 text-[10px] font-medium tabular-nums backdrop-blur">+<%= extra %></span>
               <% end %>
               <% if cancelled %>
-                <span class="absolute top-1.5 right-1.5 inline-flex items-center rounded bg-rose-500 text-white px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide shadow">Cancelled</span>
+                <span class="absolute top-1.5 right-1.5 inline-flex items-center rounded bg-rose-700 text-white px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide shadow">Cancelled</span>
               <% elsif refund %>
-                <span class="absolute top-1.5 right-1.5 inline-flex items-center rounded bg-emerald-500 text-white px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide shadow">
+                <span class="absolute top-1.5 right-1.5 inline-flex items-center rounded bg-emerald-700 text-white px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide shadow">
                   <%= refund == :full ? 'Refunded' : 'Partial' %>
                 </span>
               <% end %>
@@ -465,13 +483,13 @@ __END__
               </div>
             </div>
 
-            <div class="px-3 py-2 text-xs text-zinc-700 dark:text-zinc-300 leading-snug line-clamp-2 min-h-[2.5rem]">
+            <div class="px-3 py-2 text-xs text-zinc-700 dark:text-zinc-300 leading-snug line-clamp-3 min-h-[3.25rem]">
               <% if first_item %>
                 <%= highlight(first_item['title'].to_s, @query) %>
               <% elsif cancelled %>
-                <span class="italic text-zinc-500">Cancelled order</span>
+                <span class="italic text-zinc-500 dark:text-zinc-400">Cancelled order</span>
               <% else %>
-                <span class="italic text-zinc-500">No items recorded</span>
+                <span class="italic text-zinc-500 dark:text-zinc-400">No items recorded</span>
               <% end %>
             </div>
           </a>
@@ -498,12 +516,12 @@ __END__
            refund_amount = full && full['refund_total']
       %>
         <li>
-          <a href="/o/<%= h(o['order_id']) %>" class="block rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 hover:bg-zinc-50 dark:hover:bg-zinc-900 hover:border-zinc-300 dark:hover:border-zinc-700 <%= card_pad %> transition <%= 'opacity-60' if cancelled %>">
+          <a href="/o/<%= h(o['order_id']) %>" class="block rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 hover:bg-zinc-50 dark:hover:bg-zinc-900 hover:border-zinc-300 dark:hover:border-zinc-700 <%= card_pad %> transition <%= '' %>">
             <div class="flex items-<%= @density == 'compact' ? 'center' : 'start' %> gap-<%= @density == 'compact' ? '3' : '4' %>">
               <% if first_item && first_item['image_link'] %>
                 <img src="<%= h(first_item['image_link']) %>" alt="" loading="lazy" class="<%= img_size %> rounded bg-zinc-100 dark:bg-zinc-800 object-contain shrink-0 ring-1 ring-zinc-200 dark:ring-zinc-800">
               <% elsif cancelled %>
-                <div class="<%= img_size %> rounded bg-zinc-100 dark:bg-zinc-900 ring-1 ring-zinc-200 dark:ring-zinc-800 shrink-0 flex items-center justify-center text-zinc-500 dark:text-zinc-600">
+                <div class="<%= img_size %> rounded bg-zinc-100 dark:bg-zinc-900 ring-1 ring-zinc-200 dark:ring-zinc-800 shrink-0 flex items-center justify-center text-zinc-500 dark:text-zinc-400">
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="<%= @density == 'compact' ? 'w-4 h-4' : 'w-6 h-6' %>"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd"/></svg>
                 </div>
               <% else %>
@@ -517,12 +535,12 @@ __END__
                       <% if first_item %>
                         <%= highlight(first_item['title'].to_s, @query) %>
                       <% elsif cancelled %>
-                        <span class="italic text-zinc-500">Cancelled order</span>
+                        <span class="italic text-zinc-500 dark:text-zinc-400">Cancelled order</span>
                       <% else %>
-                        <span class="italic text-zinc-500">No items recorded</span>
+                        <span class="italic text-zinc-500 dark:text-zinc-400">No items recorded</span>
                       <% end %>
                     </span>
-                    <span class="text-xs text-zinc-500 tabular-nums shrink-0 hidden sm:inline"><%= h(parse_date(o['date'])&.strftime('%b %-d, %Y') || o['date']) %></span>
+                    <span class="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums shrink-0 hidden sm:inline"><%= h(parse_date(o['date'])&.strftime('%b %-d, %Y') || o['date']) %></span>
                     <% if cancelled %>
                       <span class="inline-flex items-center rounded bg-rose-100 dark:bg-rose-500/15 text-rose-700 dark:text-rose-300 ring-1 ring-rose-300 dark:ring-rose-500/30 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide shrink-0">Cancelled</span>
                     <% end %>
@@ -533,7 +551,7 @@ __END__
                     <% end %>
                   </div>
                 <% else %>
-                  <div class="flex items-center gap-2 text-xs text-zinc-500 mb-1 flex-wrap">
+                  <div class="flex items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400 mb-1 flex-wrap">
                     <span class="font-mono text-zinc-600 dark:text-zinc-400"><%= h(o['order_id']) %></span>
                     <span>·</span>
                     <span><%= relative_date(o['date']) %></span>
@@ -548,16 +566,16 @@ __END__
                   </div>
                   <% if first_item %>
                     <div class="text-zinc-900 dark:text-zinc-100 font-medium leading-snug <%= title_clamp %>"><%= highlight(first_item['title'].to_s, @query) %></div>
-                    <div class="text-xs text-zinc-500 mt-1">
+                    <div class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
                       <% if first_item['seller'] %>sold by <span class="text-zinc-600 dark:text-zinc-400"><%= highlight(first_item['seller'].to_s, @query) %></span><% end %>
                       <% if extra.positive? %>
                         <span class="ml-1 inline-flex items-center rounded-full bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-zinc-700 dark:text-zinc-300">+<%= extra %> more item<%= 's' if extra != 1 %></span>
                       <% end %>
                     </div>
                   <% elsif cancelled %>
-                    <div class="text-zinc-500 text-sm italic">Cancelled — no items shipped</div>
+                    <div class="text-zinc-500 dark:text-zinc-400 text-sm italic">Cancelled — no items shipped</div>
                   <% else %>
-                    <div class="text-zinc-500 italic text-sm">No items recorded</div>
+                    <div class="text-zinc-500 dark:text-zinc-400 italic text-sm">No items recorded</div>
                   <% end %>
                 <% end %>
               </div>
@@ -590,7 +608,7 @@ __END__
       <% else %>
         <span></span>
       <% end %>
-      <span class="text-zinc-500 tabular-nums">Page <%= @page %> of <%= @total_pages %> · <%= @total_count %> orders</span>
+      <span class="text-zinc-500 dark:text-zinc-400 tabular-nums">Page <%= @page %> of <%= @total_pages %> · <%= @total_count %> orders</span>
       <% if @page < @total_pages %>
         <a href="<%= page_url.call(@page + 1) %>" class="px-3 py-1.5 rounded-md border border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-900">Next →</a>
       <% else %>
@@ -603,7 +621,7 @@ __END__
 @@order
 <% items = @order['items'] || [] %>
 <% shipments = @order['shipments'] || [] %>
-<nav class="text-xs text-zinc-500 mb-4 flex items-center gap-2">
+<nav class="text-xs text-zinc-500 dark:text-zinc-400 mb-4 flex items-center gap-2">
   <a href="/" class="hover:text-zinc-700 dark:text-zinc-300">← All orders</a>
   <% if @meta['year'] %>
     <span class="text-zinc-300 dark:text-zinc-700">·</span>
@@ -613,14 +631,14 @@ __END__
 
 <div class="mb-6 flex items-start justify-between gap-4 flex-wrap">
   <div class="min-w-0">
-    <div class="text-xs text-zinc-500 font-mono"><%= h(@order_id) %></div>
+    <div class="text-xs text-zinc-500 dark:text-zinc-400 font-mono"><%= h(@order_id) %></div>
     <h1 class="text-2xl font-semibold text-zinc-900 dark:text-zinc-100 mt-1">Order placed <%= relative_date(@order['order_placed']) %></h1>
     <% if @order['ship_to'] %>
-      <p class="text-sm text-zinc-600 dark:text-zinc-400 mt-1">Shipped to <span class="text-zinc-800 dark:text-zinc-200"><%= h(@order['ship_to']) %></span><% if @order['ship_to_address'] %> · <span class="text-zinc-500"><%= h(short_address(@order['ship_to_address'])) %></span><% end %></p>
+      <p class="text-sm text-zinc-600 dark:text-zinc-400 mt-1">Shipped to <span class="text-zinc-800 dark:text-zinc-200"><%= h(@order['ship_to']) %></span><% if @order['ship_to_address'] %> · <span class="text-zinc-500 dark:text-zinc-400"><%= h(short_address(@order['ship_to_address'])) %></span><% end %></p>
     <% end %>
   </div>
   <% if @order['order_details_link'] %>
-    <a href="<%= h(amazon_url(@order['order_details_link'])) %>" target="_blank" rel="noopener" class="text-xs text-amber-600 dark:text-amber-400 hover:text-amber-700 dark:hover:text-amber-300 shrink-0">View on Amazon →</a>
+    <a href="<%= h(amazon_url(@order['order_details_link'])) %>" target="_blank" rel="noopener" class="text-xs text-amber-700 dark:text-amber-400 hover:text-amber-800 dark:hover:text-amber-300 shrink-0">View on Amazon →</a>
   <% end %>
 </div>
 
@@ -628,7 +646,7 @@ __END__
   <div class="md:col-span-2 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 p-5">
     <h2 class="text-sm font-semibold text-zinc-700 dark:text-zinc-300 uppercase tracking-wide mb-3">Items (<%= items.size %>)</h2>
     <% if items.empty? %>
-      <div class="text-zinc-500 text-sm italic">No items recorded for this order.</div>
+      <div class="text-zinc-500 dark:text-zinc-400 text-sm italic">No items recorded for this order.</div>
     <% else %>
       <ul class="divide-y divide-zinc-200 dark:divide-zinc-800">
         <% items.each do |item| %>
@@ -644,7 +662,7 @@ __END__
               <% else %>
                 <div class="text-zinc-900 dark:text-zinc-100 font-medium leading-snug"><%= h(item['title']) %></div>
               <% end %>
-              <div class="text-xs text-zinc-500 mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+              <div class="text-xs text-zinc-500 dark:text-zinc-400 mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
                 <% if item['seller'] %><span>sold by <span class="text-zinc-600 dark:text-zinc-400"><%= h(item['seller']) %></span></span><% end %>
                 <% if item['quantity'] %><span>qty <%= h(item['quantity']) %></span><% end %>
               </div>
@@ -676,7 +694,7 @@ __END__
       <% end %>
     </dl>
     <% if @order['payment_method'] %>
-      <div class="mt-4 pt-4 border-t border-zinc-200 dark:border-zinc-800 text-xs text-zinc-500">
+      <div class="mt-4 pt-4 border-t border-zinc-200 dark:border-zinc-800 text-xs text-zinc-500 dark:text-zinc-400">
         Paid with <span class="text-zinc-700 dark:text-zinc-300"><%= h(@order['payment_method']) %></span><% if @order['payment_method_last_4'] %> ending in <span class="font-mono text-zinc-700 dark:text-zinc-300"><%= h(@order['payment_method_last_4']) %></span><% end %>
       </div>
     <% end %>
@@ -691,7 +709,7 @@ __END__
       <% trackable.each do |s| %>
         <li class="flex items-center gap-3 text-sm">
           <% if s['delivery_status'] %><span class="text-zinc-800 dark:text-zinc-200"><%= h(s['delivery_status']) %></span><% end %>
-          <% if s['tracking_link'] %><a href="<%= h(amazon_url(s['tracking_link'])) %>" target="_blank" rel="noopener" class="text-amber-600 dark:text-amber-400 hover:text-amber-700 dark:hover:text-amber-300 text-xs">tracking →</a><% end %>
+          <% if s['tracking_link'] %><a href="<%= h(amazon_url(s['tracking_link'])) %>" target="_blank" rel="noopener" class="text-amber-700 dark:text-amber-400 hover:text-amber-800 dark:hover:text-amber-300 text-xs">tracking →</a><% end %>
         </li>
       <% end %>
     </ul>
@@ -699,12 +717,12 @@ __END__
 <% end %>
 
 <details class="mt-4">
-  <summary class="text-xs text-zinc-500 cursor-pointer hover:text-zinc-700 dark:text-zinc-300">raw JSON</summary>
+  <summary class="text-xs text-zinc-500 dark:text-zinc-400 cursor-pointer hover:text-zinc-700 dark:text-zinc-300">raw JSON</summary>
   <pre class="mt-2 bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg p-4 overflow-x-auto text-xs text-zinc-700 dark:text-zinc-300"><%= h(JSON.pretty_generate(@order)) %></pre>
 </details>
 
 @@stats
-<nav class="text-xs text-zinc-500 mb-4"><a href="/" class="hover:text-zinc-700 dark:text-zinc-300">← All orders</a></nav>
+<nav class="text-xs text-zinc-500 dark:text-zinc-400 mb-4"><a href="/" class="hover:text-zinc-700 dark:text-zinc-300">← All orders</a></nav>
 <div class="mb-6">
   <h1 class="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Stats</h1>
   <p class="text-sm text-zinc-600 dark:text-zinc-400 mt-1">
@@ -728,7 +746,7 @@ __END__
       <% max_total = @yearly.map { |_, s| s[:total] }.max || 1 %>
       <% @yearly.each do |year, s| %>
         <tr class="hover:bg-zinc-100 dark:bg-zinc-900/60">
-          <td class="px-4 py-3"><a href="/?year=<%= year %>" class="text-amber-600 dark:text-amber-400 hover:text-amber-700 dark:hover:text-amber-300 font-medium tabular-nums"><%= year %></a></td>
+          <td class="px-4 py-3"><a href="/?year=<%= year %>" class="text-amber-700 dark:text-amber-400 hover:text-amber-800 dark:hover:text-amber-300 font-medium tabular-nums"><%= year %></a></td>
           <td class="px-4 py-3 text-right tabular-nums text-zinc-700 dark:text-zinc-300"><%= s[:count] %></td>
           <td class="px-4 py-3 text-right tabular-nums text-zinc-900 dark:text-zinc-100">
             <div class="flex items-center justify-end gap-2">
