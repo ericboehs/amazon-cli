@@ -173,8 +173,8 @@ def main() -> int:
     otp_secret = req.get("otp_secret")
     known_order_ids = set(req.get("known_order_ids") or [])
     # Rate-limit knobs (seconds). Conservative defaults so Amazon doesn't 503.
-    detail_delay = float(req.get("detail_delay", 0.1))
-    detail_jitter = float(req.get("detail_jitter", 0.1))
+    detail_delay = float(req.get("detail_delay", 0.05))
+    detail_jitter = float(req.get("detail_jitter", 0.05))
     retry_backoff = [float(x) for x in (req.get("retry_backoff") or [30, 60, 120])]
 
     if not email or not password:
@@ -196,9 +196,12 @@ def main() -> int:
         data={
             "cookie_jar_path": str(cache_dir / "cookies.json"),
             "output_dir": str(cache_dir / "output"),
-            # Cap parallel detail fetches; Amazon 503s above ~5 concurrent.
-            "thread_pool_size": 5,
-            "connection_pool_size": 10,
+            # Cap parallel detail fetches; Amazon 503s above ~7 concurrent.
+            "thread_pool_size": 7,
+            "connection_pool_size": 14,
+            # Don't blow up the whole year if one ancient order has an
+            # unparseable required field (common on pre-2018 orders).
+            "warn_on_missing_required_field": True,
         },
     )
 

@@ -31,13 +31,18 @@ module Amazon
         config = Amazon::Config.load
         years ||= default_years(config)
 
-        unless config.password_op_ref
-          warn "config: password_op_ref must be set (e.g., op://Personal/Amazon/password)"
-          return 2
+        if cookies_authenticated?
+          password = "unused-have-cookies"
+          otp_secret = nil
+          log "using cached browser session (skipping 1Password prompt)"
+        else
+          unless config.password_op_ref
+            warn "config: password_op_ref must be set, or run `amazon login` first"
+            return 2
+          end
+          password = fetch_password(config.password_op_ref)
+          otp_secret = config.otp_op_ref ? fetch_password(config.otp_op_ref) : nil
         end
-
-        password = fetch_password(config.password_op_ref)
-        otp_secret = config.otp_op_ref ? fetch_password(config.otp_op_ref) : nil
 
         store = Amazon::Store.new
         known_ids = full_resync ? [] : store.index["orders"].keys
@@ -81,6 +86,13 @@ module Amazon
         n = config.default_year_window || 2
         cur = Date.today.year
         ((cur - n + 1)..cur).to_a
+      end
+
+      def cookies_authenticated?
+        path = Amazon::Config.cache_dir.join("cookies.json")
+        return false unless path.exist?
+        data = JSON.parse(path.read) rescue {}
+        data.key?("x-main")
       end
 
       def fetch_password(ref)
