@@ -480,7 +480,7 @@ __END__
               </div>
             </div>
 
-            <div class="px-3 py-2 text-xs text-zinc-700 dark:text-zinc-300 leading-snug line-clamp-3 min-h-[3.25rem]">
+            <div class="px-3 py-2 text-xs text-zinc-700 dark:text-zinc-300 leading-snug line-clamp-3 min-h-[4.5rem]">
               <% if first_item %>
                 <%= highlight(first_item['title'].to_s, @query) %>
               <% elsif cancelled %>
@@ -618,6 +618,7 @@ __END__
 @@order
 <% items = @order['items'] || [] %>
 <% shipments = @order['shipments'] || [] %>
+<% hero_item = items.find { |i| i['image_link'] } %>
 <nav class="text-xs text-zinc-500 dark:text-zinc-400 mb-4 flex items-center gap-2">
   <a href="/" class="hover:text-zinc-700 dark:text-zinc-300">← All orders</a>
   <% if @meta['year'] %>
@@ -625,6 +626,18 @@ __END__
     <a href="/?year=<%= @meta['year'] %>" class="hover:text-zinc-700 dark:text-zinc-300"><%= @meta['year'] %></a>
   <% end %>
 </nav>
+
+<% if hero_item %>
+  <div class="mb-6 rounded-lg bg-zinc-100 dark:bg-zinc-900 ring-1 ring-zinc-200 dark:ring-zinc-800 overflow-hidden flex items-center justify-center">
+    <% if hero_item['link'] %>
+      <a href="<%= h(amazon_url(hero_item['link'])) %>" target="_blank" rel="noopener" class="block">
+        <img src="<%= h(hero_item['image_link']) %>" alt="<%= h(hero_item['title']) %>" class="max-h-80 sm:max-h-96 w-auto object-contain p-6">
+      </a>
+    <% else %>
+      <img src="<%= h(hero_item['image_link']) %>" alt="<%= h(hero_item['title']) %>" class="max-h-80 sm:max-h-96 w-auto object-contain p-6">
+    <% end %>
+  </div>
+<% end %>
 
 <div class="mb-6 flex items-start justify-between gap-4 flex-wrap">
   <div class="min-w-0">
