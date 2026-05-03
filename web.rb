@@ -216,16 +216,18 @@ helpers do
 end
 
 set :environment, ENV['RACK_ENV'] || :production
-set :bind, '127.0.0.1'
+set :bind, ENV['BIND'] || '0.0.0.0'
 set :port, ENV['PORT'] || 4824
 set :protection, host_authorization: { permitted_hosts: [] }
 
 PAGE_SIZE = 200
+DENSITIES = %w[compact comfortable gallery].freeze
 
 get '/' do
   year = params[:year] && !params[:year].empty? ? params[:year].to_i : nil
   query = params[:q].to_s.strip
   show_cancelled = params[:cancelled] == '1'
+  density = DENSITIES.include?(params[:density]) ? params[:density] : 'comfortable'
   page = [params[:page].to_i, 1].max
   orders = filter_orders(all_orders, year: year, query: query, include_cancelled: show_cancelled)
   cancelled_count = filter_orders(all_orders, year: year, query: query, include_cancelled: true)
@@ -242,6 +244,7 @@ get '/' do
               query: query,
               show_cancelled: show_cancelled,
               cancelled_count: cancelled_count,
+              density: density,
               years: years,
               stats: stats(orders),
               yearly: yearly_breakdown,
@@ -324,6 +327,9 @@ __END__
         <% if @show_cancelled %>
           <input type="hidden" name="cancelled" value="1">
         <% end %>
+        <% if @density && @density != 'comfortable' %>
+          <input type="hidden" name="density" value="<%= h(@density) %>">
+        <% end %>
       </form>
       <a href="/stats" class="text-sm text-zinc-600 dark:text-zinc-400 hover:text-amber-700 dark:hover:text-amber-300 shrink-0">Stats</a>
     </div>
@@ -369,99 +375,202 @@ __END__
 
   <div class="flex items-center gap-1 flex-wrap">
     <%
-      qs = ->(year:, cancelled:) {
+      qs = ->(year: @year, cancelled: @show_cancelled, density: @density) {
         parts = []
         parts << "year=#{year}" if year
         parts << "q=#{h(@query)}" unless @query.empty?
         parts << 'cancelled=1' if cancelled
+        parts << "density=#{density}" unless density == 'comfortable'
         parts.empty? ? '/' : "/?#{parts.join('&')}"
       }
     %>
-    <a href="<%= qs.call(year: nil, cancelled: @show_cancelled) %>" class="px-3 py-1.5 rounded-md text-xs font-medium <%= @year.nil? ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 ring-1 ring-amber-300 dark:ring-amber-500/30' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-800 dark:text-zinc-200' %>">All years</a>
+    <a href="<%= qs.call(year: nil) %>" class="px-3 py-1.5 rounded-md text-xs font-medium <%= @year.nil? ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 ring-1 ring-amber-300 dark:ring-amber-500/30' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-800 dark:text-zinc-200' %>">All years</a>
     <% @years.each do |y| %>
-      <a href="<%= qs.call(year: y, cancelled: @show_cancelled) %>" class="px-3 py-1.5 rounded-md text-xs font-medium tabular-nums <%= @year == y ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 ring-1 ring-amber-300 dark:ring-amber-500/30' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-800 dark:text-zinc-200' %>"><%= y %></a>
+      <a href="<%= qs.call(year: y) %>" class="px-3 py-1.5 rounded-md text-xs font-medium tabular-nums <%= @year == y ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 ring-1 ring-amber-300 dark:ring-amber-500/30' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-800 dark:text-zinc-200' %>"><%= y %></a>
     <% end %>
   </div>
 </div>
 
-<% if @cancelled_count.positive? || @show_cancelled %>
-  <div class="mb-4 flex items-center justify-end">
-    <a href="<%= qs.call(year: @year, cancelled: !@show_cancelled) %>" class="inline-flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400 hover:text-zinc-800 dark:text-zinc-200 select-none group">
-      <span class="w-4 h-4 rounded border <%= @show_cancelled ? 'bg-amber-500 dark:bg-amber-500/80 border-amber-500 dark:border-amber-400' : 'border-zinc-600 group-hover:border-zinc-400' %> flex items-center justify-center">
+<div class="mb-4 flex items-center justify-between gap-3 flex-wrap">
+  <% if @cancelled_count.positive? || @show_cancelled %>
+    <a href="<%= qs.call(cancelled: !@show_cancelled) %>" class="inline-flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400 hover:text-zinc-800 dark:text-zinc-200 select-none group">
+      <span class="w-4 h-4 rounded border <%= @show_cancelled ? 'bg-amber-500 dark:bg-amber-500/80 border-amber-500 dark:border-amber-400' : 'border-zinc-400 dark:border-zinc-600 group-hover:border-zinc-600 dark:group-hover:border-zinc-400' %> flex items-center justify-center">
         <% if @show_cancelled %>
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3 h-3 text-zinc-950"><path fill-rule="evenodd" d="M16.704 4.153a.75.75 0 01.143 1.052l-8 10.5a.75.75 0 01-1.127.075l-4.5-4.5a.75.75 0 011.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 011.05-.143z" clip-rule="evenodd"/></svg>
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3 h-3 text-white dark:text-zinc-950"><path fill-rule="evenodd" d="M16.704 4.153a.75.75 0 01.143 1.052l-8 10.5a.75.75 0 01-1.127.075l-4.5-4.5a.75.75 0 011.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 011.05-.143z" clip-rule="evenodd"/></svg>
         <% end %>
       </span>
       Show cancelled orders
       <span class="text-zinc-500 dark:text-zinc-600">(<%= @cancelled_count %>)</span>
     </a>
+  <% else %>
+    <span></span>
+  <% end %>
+
+  <div class="inline-flex items-center rounded-md border border-zinc-200 dark:border-zinc-800 overflow-hidden text-xs" role="group" aria-label="Display density">
+    <% [
+      ['compact',     'M2 5h16M2 10h16M2 15h16'],
+      ['comfortable', 'M2 4h16v4H2zM2 12h16v4H2z'],
+      ['gallery',    'M3 3h6v6H3zM11 3h6v6h-6zM3 11h6v6H3zM11 11h6v6h-6z']
+    ].each do |val, path| %>
+      <a href="<%= qs.call(density: val) %>" title="<%= val.capitalize %>" aria-label="<%= val.capitalize %>" class="px-2.5 py-1.5 transition <%= @density == val ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-900' %>">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="w-4 h-4"><path d="<%= path %>"/></svg>
+      </a>
+    <% end %>
   </div>
-<% end %>
+</div>
 
 <% if @orders.empty? %>
   <div class="text-zinc-600 dark:text-zinc-400 text-sm border border-zinc-200 dark:border-zinc-800 rounded-lg p-6">No matching orders.</div>
 <% else %>
-  <ul class="space-y-2">
-    <% @orders.each do |o|
-         full = load_order(o['order_id'])
-         items = full ? (full['items'] || []) : []
-         first_item = items.first
-         extra = items.size - 1
-         shipment_statuses = (full && full['shipments'] || []).map { |s| s['delivery_status'].to_s }.reject(&:empty?)
-         cancelled = items.empty? && shipment_statuses.any? { |s| s.match?(/cancel/i) }
-         refund = refund_kind(o['order_id'])
-         refund_amount = full && full['refund_total']
-    %>
-      <li>
-        <a href="/o/<%= h(o['order_id']) %>" class="block rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 hover:bg-zinc-100 dark:bg-zinc-900 hover:border-zinc-300 dark:border-zinc-700 p-4 transition <%= 'opacity-60' if cancelled %>">
-          <div class="flex items-start gap-4">
-            <% if first_item && first_item['image_link'] %>
-              <img src="<%= h(first_item['image_link']) %>" alt="" loading="lazy" class="w-16 h-16 rounded bg-zinc-100 dark:bg-zinc-800 object-contain shrink-0 ring-1 ring-zinc-200 dark:ring-zinc-800">
-            <% elsif cancelled %>
-              <div class="w-16 h-16 rounded bg-zinc-100 dark:bg-zinc-900 ring-1 ring-zinc-200 dark:ring-zinc-800 shrink-0 flex items-center justify-center text-zinc-500 dark:text-zinc-600">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-6 h-6"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd"/></svg>
-              </div>
-            <% else %>
-              <div class="w-16 h-16 rounded bg-zinc-100 dark:bg-zinc-800 ring-1 ring-zinc-300 dark:ring-zinc-700 shrink-0 flex items-center justify-center text-zinc-500 dark:text-zinc-600 text-xs">no image</div>
-            <% end %>
-
-            <div class="min-w-0 flex-1">
-              <div class="flex items-center gap-2 text-xs text-zinc-500 mb-1 flex-wrap">
-                <span class="font-mono text-zinc-600 dark:text-zinc-400"><%= h(o['order_id']) %></span>
-                <span>·</span>
-                <span><%= relative_date(o['date']) %></span>
-                <% if cancelled %>
-                  <span class="inline-flex items-center rounded-full bg-rose-100 dark:bg-rose-500/15 text-rose-700 dark:text-rose-300 ring-1 ring-rose-300 dark:ring-rose-500/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide">Cancelled</span>
-                <% end %>
-                <% if refund %>
-                  <span title="Refunded <%= h(money(refund_amount)) %>" class="inline-flex items-center rounded-full bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 ring-1 ring-emerald-300 dark:ring-emerald-500/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide">
-                    <%= refund == :full ? 'Refunded' : 'Partial refund' %>
-                  </span>
-                <% end %>
-              </div>
-              <% if first_item %>
-                <div class="text-zinc-900 dark:text-zinc-100 font-medium leading-snug line-clamp-2"><%= highlight(first_item['title'].to_s, @query) %></div>
-                <div class="text-xs text-zinc-500 mt-1">
-                  <% if first_item['seller'] %>sold by <span class="text-zinc-600 dark:text-zinc-400"><%= highlight(first_item['seller'].to_s, @query) %></span><% end %>
-                  <% if extra.positive? %>
-                    <span class="ml-1 inline-flex items-center rounded-full bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-zinc-700 dark:text-zinc-300">+<%= extra %> more item<%= 's' if extra != 1 %></span>
+  <% if @density == 'gallery' %>
+    <ul class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">
+      <% @orders.each do |o|
+           full = load_order(o['order_id'])
+           items = full ? (full['items'] || []) : []
+           first_item = items.first
+           extra = items.size - 1
+           shipment_statuses = (full && full['shipments'] || []).map { |s| s['delivery_status'].to_s }.reject(&:empty?)
+           cancelled = items.empty? && shipment_statuses.any? { |s| s.match?(/cancel/i) }
+           refund = refund_kind(o['order_id'])
+      %>
+        <li>
+          <a href="/o/<%= h(o['order_id']) %>" class="group block rounded-lg overflow-hidden border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 hover:border-zinc-300 dark:hover:border-zinc-700 transition <%= 'opacity-60' if cancelled %>">
+            <div class="relative aspect-square bg-zinc-100 dark:bg-zinc-800">
+              <% if first_item && first_item['image_link'] %>
+                <img src="<%= h(first_item['image_link']) %>" alt="" loading="lazy" class="absolute inset-0 w-full h-full object-contain p-2 group-hover:scale-105 transition-transform duration-200">
+              <% else %>
+                <div class="absolute inset-0 flex items-center justify-center text-zinc-400 dark:text-zinc-600">
+                  <% if cancelled %>
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-10 h-10"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd"/></svg>
+                  <% else %>
+                    <span class="text-xs">no image</span>
                   <% end %>
                 </div>
-              <% elsif cancelled %>
-                <div class="text-zinc-500 text-sm italic">Cancelled — no items shipped</div>
-              <% else %>
-                <div class="text-zinc-500 italic text-sm">No items recorded</div>
               <% end %>
+
+              <% if extra.positive? %>
+                <span class="absolute top-1.5 left-1.5 inline-flex items-center rounded bg-zinc-900/70 text-white px-1.5 py-0.5 text-[10px] font-medium tabular-nums backdrop-blur">+<%= extra %></span>
+              <% end %>
+              <% if cancelled %>
+                <span class="absolute top-1.5 right-1.5 inline-flex items-center rounded bg-rose-500 text-white px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide shadow">Cancelled</span>
+              <% elsif refund %>
+                <span class="absolute top-1.5 right-1.5 inline-flex items-center rounded bg-emerald-500 text-white px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide shadow">
+                  <%= refund == :full ? 'Refunded' : 'Partial' %>
+                </span>
+              <% end %>
+
+              <div class="absolute bottom-0 left-0 right-0 px-2 py-1.5 bg-gradient-to-t from-black/80 via-black/40 to-transparent text-white flex items-end justify-between gap-2">
+                <span class="text-[11px] tabular-nums opacity-90"><%= h(parse_date(o['date'])&.strftime('%b %-d, %Y') || o['date']) %></span>
+                <span class="text-sm font-semibold tabular-nums"><%= money(o['total']) %></span>
+              </div>
             </div>
 
-            <div class="text-right shrink-0">
-              <div class="text-lg font-semibold tabular-nums text-zinc-900 dark:text-zinc-100"><%= money(o['total']) %></div>
+            <div class="px-3 py-2 text-xs text-zinc-700 dark:text-zinc-300 leading-snug line-clamp-2 min-h-[2.5rem]">
+              <% if first_item %>
+                <%= highlight(first_item['title'].to_s, @query) %>
+              <% elsif cancelled %>
+                <span class="italic text-zinc-500">Cancelled order</span>
+              <% else %>
+                <span class="italic text-zinc-500">No items recorded</span>
+              <% end %>
             </div>
-          </div>
-        </a>
-      </li>
-    <% end %>
-  </ul>
+          </a>
+        </li>
+      <% end %>
+    </ul>
+  <% else %>
+    <%
+      img_size = { 'compact' => 'w-9 h-9', 'comfortable' => 'w-16 h-16' }[@density]
+      card_pad = { 'compact' => 'px-3 py-2',  'comfortable' => 'p-4' }[@density]
+      list_gap = { 'compact' => 'space-y-1',  'comfortable' => 'space-y-2' }[@density]
+      title_clamp = { 'compact' => 'line-clamp-1', 'comfortable' => 'line-clamp-2' }[@density]
+      total_size = { 'compact' => 'text-sm', 'comfortable' => 'text-lg' }[@density]
+    %>
+    <ul class="<%= list_gap %>">
+      <% @orders.each do |o|
+           full = load_order(o['order_id'])
+           items = full ? (full['items'] || []) : []
+           first_item = items.first
+           extra = items.size - 1
+           shipment_statuses = (full && full['shipments'] || []).map { |s| s['delivery_status'].to_s }.reject(&:empty?)
+           cancelled = items.empty? && shipment_statuses.any? { |s| s.match?(/cancel/i) }
+           refund = refund_kind(o['order_id'])
+           refund_amount = full && full['refund_total']
+      %>
+        <li>
+          <a href="/o/<%= h(o['order_id']) %>" class="block rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 hover:bg-zinc-50 dark:hover:bg-zinc-900 hover:border-zinc-300 dark:hover:border-zinc-700 <%= card_pad %> transition <%= 'opacity-60' if cancelled %>">
+            <div class="flex items-<%= @density == 'compact' ? 'center' : 'start' %> gap-<%= @density == 'compact' ? '3' : '4' %>">
+              <% if first_item && first_item['image_link'] %>
+                <img src="<%= h(first_item['image_link']) %>" alt="" loading="lazy" class="<%= img_size %> rounded bg-zinc-100 dark:bg-zinc-800 object-contain shrink-0 ring-1 ring-zinc-200 dark:ring-zinc-800">
+              <% elsif cancelled %>
+                <div class="<%= img_size %> rounded bg-zinc-100 dark:bg-zinc-900 ring-1 ring-zinc-200 dark:ring-zinc-800 shrink-0 flex items-center justify-center text-zinc-500 dark:text-zinc-600">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="<%= @density == 'compact' ? 'w-4 h-4' : 'w-6 h-6' %>"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd"/></svg>
+                </div>
+              <% else %>
+                <div class="<%= img_size %> rounded bg-zinc-100 dark:bg-zinc-800 ring-1 ring-zinc-300 dark:ring-zinc-700 shrink-0"></div>
+              <% end %>
+
+              <div class="min-w-0 flex-1">
+                <% if @density == 'compact' %>
+                  <div class="flex items-center gap-3 min-w-0">
+                    <span class="text-zinc-900 dark:text-zinc-100 font-medium truncate flex-1">
+                      <% if first_item %>
+                        <%= highlight(first_item['title'].to_s, @query) %>
+                      <% elsif cancelled %>
+                        <span class="italic text-zinc-500">Cancelled order</span>
+                      <% else %>
+                        <span class="italic text-zinc-500">No items recorded</span>
+                      <% end %>
+                    </span>
+                    <span class="text-xs text-zinc-500 tabular-nums shrink-0 hidden sm:inline"><%= h(parse_date(o['date'])&.strftime('%b %-d, %Y') || o['date']) %></span>
+                    <% if cancelled %>
+                      <span class="inline-flex items-center rounded bg-rose-100 dark:bg-rose-500/15 text-rose-700 dark:text-rose-300 ring-1 ring-rose-300 dark:ring-rose-500/30 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide shrink-0">Cancelled</span>
+                    <% end %>
+                    <% if refund %>
+                      <span title="Refunded <%= h(money(refund_amount)) %>" class="inline-flex items-center rounded bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 ring-1 ring-emerald-300 dark:ring-emerald-500/30 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide shrink-0">
+                        <%= refund == :full ? 'Refunded' : 'Partial' %>
+                      </span>
+                    <% end %>
+                  </div>
+                <% else %>
+                  <div class="flex items-center gap-2 text-xs text-zinc-500 mb-1 flex-wrap">
+                    <span class="font-mono text-zinc-600 dark:text-zinc-400"><%= h(o['order_id']) %></span>
+                    <span>·</span>
+                    <span><%= relative_date(o['date']) %></span>
+                    <% if cancelled %>
+                      <span class="inline-flex items-center rounded-full bg-rose-100 dark:bg-rose-500/15 text-rose-700 dark:text-rose-300 ring-1 ring-rose-300 dark:ring-rose-500/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide">Cancelled</span>
+                    <% end %>
+                    <% if refund %>
+                      <span title="Refunded <%= h(money(refund_amount)) %>" class="inline-flex items-center rounded-full bg-emerald-100 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 ring-1 ring-emerald-300 dark:ring-emerald-500/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide">
+                        <%= refund == :full ? 'Refunded' : 'Partial refund' %>
+                      </span>
+                    <% end %>
+                  </div>
+                  <% if first_item %>
+                    <div class="text-zinc-900 dark:text-zinc-100 font-medium leading-snug <%= title_clamp %>"><%= highlight(first_item['title'].to_s, @query) %></div>
+                    <div class="text-xs text-zinc-500 mt-1">
+                      <% if first_item['seller'] %>sold by <span class="text-zinc-600 dark:text-zinc-400"><%= highlight(first_item['seller'].to_s, @query) %></span><% end %>
+                      <% if extra.positive? %>
+                        <span class="ml-1 inline-flex items-center rounded-full bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 text-zinc-700 dark:text-zinc-300">+<%= extra %> more item<%= 's' if extra != 1 %></span>
+                      <% end %>
+                    </div>
+                  <% elsif cancelled %>
+                    <div class="text-zinc-500 text-sm italic">Cancelled — no items shipped</div>
+                  <% else %>
+                    <div class="text-zinc-500 italic text-sm">No items recorded</div>
+                  <% end %>
+                <% end %>
+              </div>
+
+              <div class="text-right shrink-0">
+                <div class="<%= total_size %> font-semibold tabular-nums text-zinc-900 dark:text-zinc-100"><%= money(o['total']) %></div>
+              </div>
+            </div>
+          </a>
+        </li>
+      <% end %>
+    </ul>
+  <% end %>
 
   <% if @total_pages > 1 %>
     <%
@@ -470,6 +579,7 @@ __END__
         parts << "year=#{@year}" if @year
         parts << "q=#{h(@query)}" unless @query.empty?
         parts << 'cancelled=1' if @show_cancelled
+        parts << "density=#{@density}" if @density && @density != 'comfortable'
         parts << "page=#{p}" if p > 1
         parts.empty? ? '/' : "/?#{parts.join('&')}"
       }
@@ -603,8 +713,8 @@ __END__
   </p>
 </div>
 
-<div class="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 overflow-hidden">
-  <table class="w-full text-sm">
+<div class="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 overflow-x-auto">
+  <table class="w-full text-sm min-w-[32rem]">
     <thead class="bg-zinc-100 dark:bg-zinc-900 text-zinc-600 dark:text-zinc-400 text-xs uppercase tracking-wide">
       <tr>
         <th class="text-left px-4 py-2">Year</th>

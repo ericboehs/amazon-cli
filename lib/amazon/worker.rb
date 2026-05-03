@@ -58,20 +58,25 @@ module Amazon
         @quiet = quiet
         @tty = $stderr.tty?
         @line_drawn = false
+        @start_time = nil
       end
 
       def start(event)
         return if @quiet
         warn("year #{event["year"]}: #{event["count"]} orders")
+        @start_time = nil
       end
 
       def tick(event)
         return if @quiet
+        @start_time ||= Time.now
         total = event["grand_total"] ? format("$%.2f", event["grand_total"]) : "         "
+        eta = format_eta(event["i"], event["n"])
         line = format(
-          "  [%3d/%-3d] %s %s %s  %s  %s",
+          "  [%3d/%-3d] %s %s %s %s  %s  %s",
           event["i"], event["n"],
           bar(event["i"], event["n"]),
+          eta,
           event["date"] || "??????????",
           total,
           event["order_id"],
@@ -110,6 +115,19 @@ module Amazon
         return "[" + ("░" * BAR_WIDTH) + "]" if n.to_i.zero?
         filled = (i.to_f / n * BAR_WIDTH).round
         "[" + ("█" * filled) + ("░" * (BAR_WIDTH - filled)) + "]"
+      end
+
+      def format_eta(i, n)
+        return "ETA --:--" if @start_time.nil? || i.to_i <= 0 || n.to_i <= 0
+        elapsed = Time.now - @start_time
+        remaining = (elapsed / i) * (n - i)
+        return "ETA --:--" if remaining.nan? || remaining.infinite? || remaining < 0
+        secs = remaining.to_i
+        if secs >= 3600
+          format("ETA %d:%02d:%02d", secs / 3600, (secs % 3600) / 60, secs % 60)
+        else
+          format("ETA %2d:%02d", secs / 60, secs % 60)
+        end
       end
     end
 

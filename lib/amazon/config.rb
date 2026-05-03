@@ -7,8 +7,8 @@ module Amazon
       "default_year_window" => 2,
       "output" => { "color" => true },
       "rate_limit" => {
-        "detail_delay" => 0.5,
-        "detail_jitter" => 0.3,
+        "detail_delay" => 0.1,
+        "detail_jitter" => 0.1,
         "retry_backoff" => [30, 60, 120]
       }
     }.freeze
