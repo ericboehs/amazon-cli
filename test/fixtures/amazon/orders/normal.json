@@ -1,0 +1,41 @@
+{
+  "order_id": "111-NORMAL",
+  "order_placed": "2024-12-15",
+  "grand_total": 25.50,
+  "subtotal": 23.50,
+  "shipping_total": 2.00,
+  "estimated_tax": 0.00,
+  "total_before_tax": 25.50,
+  "currency": "USD",
+  "order_details_link": "/gp/your-account/order-details?orderID=111-NORMAL",
+  "ship_to": "Eric Boehs",
+  "ship_to_address": "123 Farm Rd\nSomewhere, OK 74000\nUSA\nEarth",
+  "items": [
+    {
+      "title": "Widget gadget thingamajig",
+      "link": "/dp/B000ABC",
+      "price": 19.99,
+      "quantity": 1,
+      "image_link": "https://example.com/img.jpg",
+      "seller": "AcmeCorp"
+    },
+    {
+      "title": "Bonus item",
+      "price": 5.00,
+      "quantity": 1
+    }
+  ],
+  "shipments": [
+    {
+      "delivery_status": "Delivered Dec 20",
+      "tracking_link": "/tracking/123"
+    },
+    {
+      "delivery_status": null,
+      "tracking_link": null
+    }
+  ],
+  "refund_total": null,
+  "payment_method": "Visa",
+  "payment_method_last_4": "1234"
+}

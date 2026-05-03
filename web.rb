@@ -17,20 +17,17 @@ require 'sinatra'
 require 'json'
 require 'erb'
 
-DATA_ROOT  = File.expand_path('~/.local/share/amazon')
+DATA_ROOT  = ENV['AMAZON_DATA_ROOT'] || File.expand_path('~/.local/share/amazon')
 INDEX_PATH = File.join(DATA_ROOT, 'index.json')
-END_OF_FILE = defined?(DATA) ? DATA.pos.freeze : 0
+WEB_RB_PATH = File.expand_path(__FILE__)
 
 def load_templates
   return @templates if @templates
 
-  DATA.pos = END_OF_FILE
-  raw = DATA.read.force_encoding('UTF-8')
+  raw = File.read(WEB_RB_PATH).force_encoding('UTF-8').split(/^__END__$/, 2).last.to_s
   parts = raw.split(/^@@(\w+)\s*\n/)
   parts.shift
-  @templates = {}
-  parts.each_slice(2) { |name, body| @templates[name] = body }
-  @templates
+  @templates = parts.each_slice(2).to_h
 end
 
 def template(name)
@@ -294,7 +291,7 @@ get '/health' do
 end
 
 $started_at = Time.now
-Sinatra::Application.run!
+Sinatra::Application.run! if $PROGRAM_NAME == __FILE__
 
 __END__
 

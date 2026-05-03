@@ -1,0 +1,19 @@
+{
+  "order_id": "111-PARTIAL-REFUND",
+  "order_placed": "2023-08-15",
+  "grand_total": 100.00,
+  "refund_total": 30.00,
+  "currency": "USD",
+  "items": [
+    {
+      "title": "Discounted later",
+      "price": 100.00,
+      "quantity": 1,
+      "seller": "Marketplace",
+      "image_link": "https://example.com/discounted.jpg"
+    }
+  ],
+  "shipments": [
+    { "delivery_status": null, "tracking_link": "https://tracking.example.com/abc" }
+  ]
+}

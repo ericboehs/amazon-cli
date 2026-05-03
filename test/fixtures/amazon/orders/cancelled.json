@@ -1,0 +1,10 @@
+{
+  "order_id": "111-CANCELLED",
+  "order_placed": "2024-11-01",
+  "grand_total": 10.00,
+  "currency": "USD",
+  "items": [],
+  "shipments": [
+    { "delivery_status": "Cancelled" }
+  ]
+}

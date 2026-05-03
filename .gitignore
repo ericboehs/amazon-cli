@@ -3,3 +3,4 @@ pyworker/.python-version
 __pycache__/
 *.pyc
 *.log
+/coverage/
