@@ -32,7 +32,7 @@ module Amazon
       index["orders"][id] = {
         "year" => year,
         "date" => order["order_placed"],
-        "total" => order["grand_total"],
+        "total" => order["grand_total"] || order["total_before_tax"] || order["subtotal"],
         "file" => relative
       }
       file

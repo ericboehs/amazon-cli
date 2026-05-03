@@ -26,7 +26,7 @@ module Amazon
 
       puts "#{bold("Order")} #{order["order_id"]}"
       puts "  Placed:  #{order["order_placed"]}"
-      puts "  Total:   #{format_money(order["grand_total"])}"
+      puts "  Total:   #{format_money(effective_total(order))}"
       puts "  Ship to: #{order["ship_to"]}" if order["ship_to"]
       puts "  Payment: #{order["payment_method"]} #{order["payment_method_last_4"] ? "•••• #{order["payment_method_last_4"]}" : ""}".rstrip if order["payment_method"]
       if (link = order["order_details_link"])
@@ -64,12 +64,16 @@ module Amazon
         items = o["items"] || []
         first = items.find { |i| i["title"].to_s.downcase.include?(query.downcase) } || items.first
         title = first ? first["title"] : "(no items)"
-        line = "#{o["order_placed"]}  #{o["order_id"]}  #{format_money(o["grand_total"])}  #{title}"
+        line = "#{o["order_placed"]}  #{o["order_id"]}  #{format_money(effective_total(o))}  #{title}"
         puts line
       end
     end
 
     private
+
+    def effective_total(order)
+      order["grand_total"] || order["total_before_tax"] || order["subtotal"]
+    end
 
     def print_table(headers, rows)
       cols = headers.size

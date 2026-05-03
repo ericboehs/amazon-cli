@@ -28,6 +28,7 @@ import random
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -131,6 +132,21 @@ def _seller_name(seller: Any) -> str | None:
     return getattr(seller, "name", None) or str(seller)
 
 
+def _emit_progress(year: int, i: int, n: int, order: Any) -> None:
+    first_item = order.items[0] if getattr(order, "items", None) else None
+    title = (getattr(first_item, "title", "") or "").strip()[:60] if first_item else ""
+    emit(
+        "progress",
+        year=int(year),
+        i=i,
+        n=n,
+        order_id=order.order_number,
+        date=order.order_placed_date.isoformat() if order.order_placed_date else None,
+        grand_total=order.grand_total,
+        title=title,
+    )
+
+
 def _fetch_with_retry(api: Any, order: Any, backoff: list[float], emit_fn: Any) -> Any:
     """Fetch full order details with retry-on-503. Returns the populated order, or None to skip."""
     for attempt, wait in enumerate([0.0, *backoff]):
@@ -176,6 +192,7 @@ def main() -> int:
     detail_delay = float(req.get("detail_delay", 0.05))
     detail_jitter = float(req.get("detail_jitter", 0.05))
     retry_backoff = [float(x) for x in (req.get("retry_backoff") or [30, 60, 120])]
+    workers = int(req.get("workers", 7))
 
     if not email or not password:
         emit("error", msg="email and password are required")
@@ -235,33 +252,43 @@ def main() -> int:
 
         n = len(orders)
         new_orders = [o for o in orders if o.order_number not in known_order_ids]
-        cached_count = n - len(new_orders)
-        emit("total", year=int(year), count=n, new=len(new_orders), cached=cached_count)
+        new_n = len(new_orders)
+        cached_count = n - new_n
+        emit("total", year=int(year), count=new_n, new=new_n, cached=cached_count)
         if cached_count:
             emit("log", level="info", msg=f"year {year}: skipping {cached_count} already-stored orders")
-        for i, order in enumerate(new_orders, start=1):
-            first_item = order.items[0] if getattr(order, "items", None) else None
-            title = (getattr(first_item, "title", "") or "").strip()[:60] if first_item else ""
-            emit(
-                "progress",
-                year=int(year),
-                i=i,
-                n=len(new_orders),
-                order_id=order.order_number,
-                date=order.order_placed_date.isoformat() if order.order_placed_date else None,
-                grand_total=order.grand_total,
-                title=title,
-            )
-            if full_details:
-                order = _fetch_with_retry(
-                    api, order, retry_backoff, emit_fn=emit
-                ) or order
-                if i < len(new_orders):
+
+        if not full_details:
+            for i, order in enumerate(new_orders, start=1):
+                _emit_progress(year, i, new_n, order)
+                emit("order", data=order_to_dict(order, _ao_mod.__version__))
+                total += 1
+            continue
+
+        # Parallel detail fetches with throttled submission.
+        completed = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {}
+            for order in new_orders:
+                fut = pool.submit(_fetch_with_retry, api, order, retry_backoff, emit)
+                futures[fut] = order
+                if detail_delay > 0:
                     sleep_for = detail_delay + random.uniform(-detail_jitter, detail_jitter)
                     if sleep_for > 0:
                         time.sleep(sleep_for)
-            emit("order", data=order_to_dict(order, _ao_mod.__version__))
-            total += 1
+            for fut in as_completed(futures):
+                completed += 1
+                original = futures[fut]
+                fetched = None
+                try:
+                    fetched = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    emit("log", level="warn",
+                         msg=f"detail fetch raised for {original.order_number}: {e}")
+                order = fetched or original
+                _emit_progress(year, completed, new_n, order)
+                emit("order", data=order_to_dict(order, _ao_mod.__version__))
+                total += 1
 
     emit("done", count=total, skipped=skipped)
     return 0
