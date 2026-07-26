@@ -1006,6 +1006,11 @@ end
 class CorruptStoreTest < Minitest::Test
   def setup = write_config!
 
+  # These tests deliberately poison the shared XDG store. Without this, a
+  # later test that builds a Store without seeding first inherits the corrupt
+  # index and errors — order-dependent, so it only shows up on some seeds.
+  def teardown = reset_store!
+
   def test_unreadable_order_file_is_skipped_not_fatal
     store = seed_multi!
     path = File.join(Amazon::Config.data_dir, store.index['orders']['111-0000000-0000001']['file'])
