@@ -1546,3 +1546,110 @@ class WorkerStderrTest < Minitest::Test
     end
   end
 end
+
+# --- Session reuse ----------------------------------------------------
+#
+# These build the files `amazon login` actually writes. An earlier version of
+# this check looked for an "expires" key inside cookies.json — which that file
+# has never contained — so it always reported "not authenticated" and every
+# sync did a full login. Fixtures shaped like the real thing are the point.
+
+class SessionCookieTest < Minitest::Test
+  FUTURE = 1_809_648_000 # 2027-05-01
+  PAST   = 1_714_521_600 # 2024-05-01
+
+  def setup
+    @dir = Amazon::Config.cache_dir
+    FileUtils.mkdir_p(@dir)
+    FileUtils.rm_f([@dir.join('cookies.json'), @dir.join('storage_state.json')])
+  end
+  alias teardown setup
+
+  # A flat name => value map, exactly as amazon-orders consumes it.
+  def write_jar(**extra)
+    File.write(@dir.join('cookies.json'), JSON.generate(
+      { 'session-id' => '131-000', 'ubid-main' => '133-000', 'x-main' => 'abc' }.merge(extra)
+    ))
+  end
+
+  def write_storage_state(cookies)
+    File.write(@dir.join('storage_state.json'), JSON.generate('cookies' => cookies, 'origins' => []))
+  end
+
+  def cookie(name, expires)
+    { 'name' => name, 'value' => 'v', 'domain' => '.amazon.com', 'path' => '/', 'expires' => expires }
+  end
+
+  def authenticated?
+    sync = Amazon::Commands::Order::Sync.new(
+      Amazon::GlobalOptions.new(json: false, quiet: true, verbose: false)
+    )
+    sync.send(:cookies_authenticated?)
+  end
+
+  def test_unexpired_session_skips_the_password_prompt
+    write_jar
+    write_storage_state([cookie('session-id', FUTURE), cookie('x-main', FUTURE)])
+    assert authenticated?
+  end
+
+  def test_expired_session_falls_back_to_a_real_login
+    write_jar
+    write_storage_state([cookie('x-main', PAST)])
+    refute authenticated?
+  end
+
+  # The regression: the jar alone carries no timestamps, so it can never on its
+  # own prove the session is live.
+  def test_jar_without_storage_state_is_not_enough
+    write_jar
+    refute authenticated?
+  end
+
+  def test_storage_state_without_the_session_cookie
+    write_jar
+    write_storage_state([cookie('session-id', FUTURE)])
+    refute authenticated?
+  end
+
+  # -1 is Playwright's marker for a cookie that dies with the browser; it says
+  # nothing about a jar reloaded from disk.
+  def test_browser_session_cookie_is_not_proof
+    write_jar
+    write_storage_state([cookie('x-main', -1)])
+    refute authenticated?
+  end
+
+  def test_missing_expiry_field
+    write_jar
+    write_storage_state([{ 'name' => 'x-main', 'value' => 'v' }])
+    refute authenticated?
+  end
+
+  def test_no_jar_at_all
+    write_storage_state([cookie('x-main', FUTURE)])
+    refute authenticated?
+  end
+
+  def test_jar_without_x_main
+    File.write(@dir.join('cookies.json'), JSON.generate('session-id' => '131-000'))
+    write_storage_state([cookie('x-main', FUTURE)])
+    refute authenticated?
+  end
+
+  def test_corrupt_files_are_treated_as_no_session
+    File.write(@dir.join('cookies.json'), '{"x-main": trunc')
+    write_storage_state([cookie('x-main', FUTURE)])
+    refute authenticated?
+
+    write_jar
+    File.write(@dir.join('storage_state.json'), 'not json at all')
+    refute authenticated?
+  end
+
+  def test_unexpected_storage_state_shape
+    write_jar
+    File.write(@dir.join('storage_state.json'), JSON.generate('cookies' => 'nope'))
+    refute authenticated?
+  end
+end

@@ -103,27 +103,38 @@ module Amazon
         # A stale jar is worse than no jar: the placeholder password below would
         # reach a real `session.login()`, and repeated failed auth against a live
         # Amazon account is exactly what trips their captcha/lockout heuristics.
-        # So check that the session cookie is present *and* unexpired.
+        # So require the session cookie amazon-orders reads *and* confirm it
+        # hasn't expired.
         def cookies_authenticated?
-          path = Amazon::Config.cache_dir.join("cookies.json")
-          return false unless path.exist?
-          data = begin
-            JSON.parse(path.read)
-          rescue JSON::ParserError, SystemCallError
-            {}
-          end
-          return false unless data.key?("x-main")
-          !cookies_expired?(data)
+          jar = read_json(Amazon::Config.cache_dir.join("cookies.json"))
+          return false unless jar.is_a?(Hash) && jar.key?("x-main")
+          session_cookie_live?("x-main")
         end
 
-        # Playwright records expiry as a Unix timestamp; -1 means a session
-        # cookie. Treat an unparseable or missing expiry as "can't confirm it's
-        # live" and fall back to a real login.
-        def cookies_expired?(data)
-          expiry = data["expires"] || data.dig("x-main", "expires")
-          return true unless expiry.is_a?(Numeric)
+        # cookies.json is a flat name => value map with no timestamps in it, so
+        # the expiry has to come from the Playwright storage state `amazon
+        # login` writes beside it. Reading it from the jar meant the check never
+        # found an expiry and every sync fell through to a full login — the very
+        # thing it exists to avoid.
+        def session_cookie_live?(name)
+          state = read_json(Amazon::Config.cache_dir.join("storage_state.json"))
+          cookies = state.is_a?(Hash) ? state["cookies"] : nil
+          return false unless cookies.is_a?(Array)
+
+          cookie = cookies.find { |c| c.is_a?(Hash) && c["name"] == name }
+          expiry = cookie && cookie["expires"]
+          return false unless expiry.is_a?(Numeric)
+          # Playwright writes -1 for a session cookie, which dies with the
+          # browser and so proves nothing about a jar reloaded from disk.
           return false if expiry.negative?
-          Time.at(expiry) <= Time.now
+          Time.at(expiry) > Time.now
+        end
+
+        def read_json(path)
+          return nil unless path.exist?
+          JSON.parse(path.read)
+        rescue JSON::ParserError, SystemCallError
+          nil
         end
 
         def fetch_password(ref)
