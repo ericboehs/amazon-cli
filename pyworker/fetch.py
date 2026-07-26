@@ -37,6 +37,8 @@ from amazonorders.conf import AmazonOrdersConfig
 from amazonorders.session import AmazonSession, IODefault
 from amazonorders.orders import AmazonOrders
 
+from browser import session_rejected
+
 
 def emit(event: str, **fields: Any) -> None:
     sys.stdout.write(json.dumps({"event": event, **fields}, default=_json_default) + "\n")
@@ -247,6 +249,21 @@ def main() -> int:
         try:
             orders = api.get_order_history(year=int(year), full_details=False)
         except Exception as e:  # noqa: BLE001
+            # amazon-orders trusts the cookie jar on disk, so `session.login()`
+            # returns without a network call and the first real request is what
+            # discovers the session is dead. Its own message tells you to call
+            # AmazonSession.login() — useless advice from a CLI.
+            if session_rejected(e):
+                emit(
+                    "error",
+                    kind="not_logged_in",
+                    msg=(
+                        "Amazon rejected the saved session — it redirected to the "
+                        "login page. Cookie expiry can't detect this; the session "
+                        "was invalidated server-side. Run: amazon login"
+                    ),
+                )
+                return 1
             emit("error", msg=f"history fetch failed for {year}: {e}", trace=traceback.format_exc())
             return 1
 

@@ -109,6 +109,18 @@ def guard(page: Any) -> None:
         )
 
 
+# amazon-orders reads the cookie jar off disk, so its `session.login()` can
+# succeed without a network call and the first real request is what discovers
+# Amazon invalidated the session. Its own exception says to call
+# AmazonSession.login() — advice a CLI user can't act on.
+SESSION_REJECTED_MARKERS = ("redirected to login", "reauthenticate")
+
+
+def session_rejected(e: BaseException) -> bool:
+    """True when Amazon bounced us to the login page mid-request."""
+    return any(m in str(e).lower() for m in SESSION_REJECTED_MARKERS)
+
+
 def is_signin_page(page: Any) -> bool:
     try:
         url = page.url or ""

@@ -11,7 +11,14 @@ from contextlib import redirect_stdout
 from datetime import date
 
 import browser
-from browser import Blocked, NotLoggedIn, guard, is_signin_page, parse_money
+from browser import (
+    Blocked,
+    NotLoggedIn,
+    guard,
+    is_signin_page,
+    parse_money,
+    session_rejected,
+)
 from live import (
     extract_asin,
     parse_delivery_date,
@@ -304,3 +311,24 @@ class SigninPageTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionRejectedTest(unittest.TestCase):
+    """A dead session shows up as a mid-request redirect, not a login failure —
+    amazon-orders trusts the cookie jar and never calls out during login()."""
+
+    def test_recognizes_the_amazon_orders_message(self):
+        # Verbatim from a real run against an invalidated session.
+        e = Exception(
+            "Amazon redirected to login. Call AmazonSession.login() to "
+            "reauthenticate first."
+        )
+        self.assertTrue(session_rejected(e))
+
+    def test_case_insensitive(self):
+        self.assertTrue(session_rejected(Exception("Redirected To Login")))
+
+    def test_unrelated_failures_are_not_misread(self):
+        self.assertFalse(session_rejected(Exception("connection reset by peer")))
+        self.assertFalse(session_rejected(Exception("503 Service Unavailable")))
+        self.assertFalse(session_rejected(Exception("")))
