@@ -22,7 +22,11 @@ SimpleCov.start do
   enable_coverage :branch
   primary_coverage :line
   command_name 'web_test'
+  # Each suite gates only its own files; without this, running web_test and
+  # cli_test in sequence merges their results and each gate grades the union.
+  use_merging false
   add_filter '/test/'
+  add_filter '/lib/'
   minimum_coverage line: 95, branch: 95
 end
 

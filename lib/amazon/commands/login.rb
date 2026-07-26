@@ -32,7 +32,7 @@ module Amazon
         Open3.popen3(python, "login.py", chdir: PYWORKER) do |stdin, stdout, stderr, wait|
           stdin.close
           err_thread = Thread.new do
-            stderr.each_line { |l| warn(l.chomp) if @global[:verbose] }
+            stderr.each_line { |l| warn(l.chomp) if @global.verbose }
           rescue IOError
           end
           stdout.each_line do |line|
@@ -42,8 +42,8 @@ module Amazon
             next unless event
 
             case event["event"]
-            when "log"      then warn(event["msg"]) unless @global[:quiet]
-            when "navigate" then warn("→ #{event["url"]}") unless @global[:quiet]
+            when "log"      then warn(event["msg"]) unless @global.quiet
+            when "navigate" then warn("→ #{event["url"]}") unless @global.quiet
             when "done"
               warn("amazon: saved #{event["count"]} cookies to #{event["cookies_path"]}")
               warn("       run `amazon sync` to fetch orders.")

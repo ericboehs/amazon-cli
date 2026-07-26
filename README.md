@@ -1,35 +1,63 @@
 # amazon-cli
 
-A personal Amazon order-history archiver. Logs you in via a real browser
-(handles captcha + 2FA), pulls every order down into a local JSON store,
-and ships a CLI plus a small web app for browsing and search — fully
-offline once synced.
+Amazon from the terminal: a personal order-history archiver *and* live
+product lookup. Logs you in via a real browser (handles captcha + 2FA),
+pulls every order down into a local JSON store, and — because the same
+session works for product pages — answers "what does this cost right now,
+and when would it get here?" without opening a tab.
 
-There is no public Amazon API for this; the heavy lifting is done by
-[`amazon-orders`](https://pypi.org/project/amazon-orders/) (HTML scraping
-behind the authenticated session). This repo is the glue: a Ruby CLI, a
-Python worker, a Playwright login flow, and a single-file Sinatra web UI.
+There is no public Amazon API for either half. Order history is handled by
+[`amazon-orders`](https://pypi.org/project/amazon-orders/); live lookups are
+Playwright driving your signed-in session. This repo is the glue: a Ruby
+CLI, a Python worker, and a single-file Sinatra web UI.
+
+Live search knows what you've bought before:
 
 ```
-$ amazon list --year 2025 --limit 5
+$ amazon search "pla filament 1.75mm" --no-sponsored
+
+   $12.99  B0747R1M51  16-Color 320ft PLA 3D Pen Filament Refills - 1.75mm…
+           4.6★ · (4,640) · FREE delivery Tue, Jul 28
+           ↳ bought 2023-12-10 for $17.99  (-$5.00)
+
+   $41.24  B0DWK3YSVV  250g PLA Filament 1.75mm Bundle, SUNLU, 8 Rolls…
+           4.4★ · (1,275) · FREE delivery tomorrow
+```
+
+```
+$ amazon item B0747R1M51
+16-Color 320ft PLA 3D Pen Filament Refills - 1.75mm, Kids Safe, 250 Stencils eBook
+B0747R1M51  ·  https://www.amazon.com/dp/B0747R1M51
+
+  Price:     $12.99
+  Stock:     In Stock
+  Delivery:  FREE delivery Tue, Jul 28
+  Seller:    Dikale US
+  Rating:    4.6★ (4,640 ratings)
+
+You've bought this 1x
+  2023-12-10     $17.99  (-$5.00)  111-5881012-0199422
+```
+
+```
+$ amazon order list --year 2025 --limit 3
 date        order_id             total    status
 2025-12-28  113-...-...          $42.18
 2025-12-26  111-...-...          $19.99
 2025-12-22  002-...-...          $137.50
-2025-12-19  113-...-...          $8.49
-2025-12-18  111-...-...          $63.20
-
-$ amazon search filament
-2024-08-12  113-...-...  $24.99   PolyTerra PLA Filament 1.75mm Charcoal Black
-2023-11-03  111-...-...  $89.97   3-pack Hatchbox PLA 1.75mm
-...
 ```
 
 ## Features
 
 - **Real-browser login** — Playwright opens Chrome, pre-fills your email,
   you finish password + 2FA + captcha. Cookies persist; subsequent
-  syncs are silent.
+  syncs and lookups are silent.
+- **Live product lookup** — `amazon item` and `amazon search` hit Amazon
+  now, returning current price, stock, seller, rating, and a delivery-by
+  date personalized to your default address.
+- **Price memory** — live results are cross-referenced against your order
+  archive, so anything you've bought before shows the date and price you
+  paid, plus the delta.
 - **Incremental sync** — only fetches orders not already on disk. A `--full`
   flag re-fetches everything.
 - **Parallel detail fetches** — `ThreadPoolExecutor` with a tunable worker
@@ -37,8 +65,6 @@ $ amazon search filament
   rate limits.
 - **JSON-first storage** under XDG paths — easy to grep, jq, back up, or
   feed into other tools.
-- **CLI**: `sync`, `list`, `show`, `search`, `login`, `config`, plus a
-  stubbed `buy` for v2.
 - **Web UI** (`web.rb`) — single-file Sinatra app with light/dark mode,
   density modes, gallery view, refunds, search, and a 95% test
   coverage gate.
@@ -49,22 +75,37 @@ $ amazon search filament
 bin/amazon              Ruby entrypoint (subcommand dispatch)
 lib/amazon/
   cli.rb                arg parsing, dispatch
-  commands/             one class per subcommand
+  commands/
+    item.rb             live product detail
+    search.rb           live product search
+    order.rb            `amazon order …` dispatcher
+    order/              sync, list, show, search over the local archive
+    login.rb, config.rb, buy.rb
   config.rb             XDG paths, config load
-  store.rb              JSON read/write, index management
-  worker.rb             spawns Python worker, parses NDJSON over stdout
-  formatter.rb          tables, --json, color
+  store.rb              JSON read/write, index, ASIN purchase history
+  cache.rb              short-TTL disk cache for live lookups
+  worker.rb             spawns Python workers, parses NDJSON over stdout
+  formatter.rb          tables, live output, --json, color
 pyworker/
-  fetch.py              one-shot worker: drives amazon-orders, emits NDJSON
+  fetch.py              order history: drives amazon-orders, emits NDJSON
+  live.py               live product/search scraper
+  browser.py            shared Playwright session + selector fallbacks
   login.py              Playwright headed login, persists cookies
+  test_live.py          unittest for the parsing helpers (no browser needed)
   pyproject.toml        deps: amazon-orders, playwright
 web.rb                  single-file Sinatra browser
-test/web_test.rb        Minitest with 95% line + branch coverage gate
+test/web_test.rb        Minitest, 95% line + branch coverage gate
+test/cli_test.rb        Minitest, 98% line / 95% branch coverage gate
 ```
 
 Two-process design: Ruby owns the CLI/UX/storage; Python owns the scraping.
-The worker is a one-shot subprocess — no daemon. Communication is NDJSON
-over stdout; prompts (OTP, etc.) round-trip through the worker's stdin.
+Workers are one-shot subprocesses — no daemon. Communication is NDJSON over
+stdout; prompts (OTP, etc.) round-trip through the worker's stdin.
+
+`fetch.py` and `live.py` are separate entrypoints because they solve
+different problems: order history goes through `amazon-orders`, while live
+pages need a real browser to render the buybox and delivery block. Both
+reuse the session that `amazon login` persisted.
 
 ## Storage layout (XDG)
 
@@ -74,6 +115,7 @@ over stdout; prompts (OTP, etc.) round-trip through the worker's stdin.
 ~/.local/share/amazon/orders/<year>/<id>.json   # one file per order
 ~/.local/share/amazon/cache/cookies.json        # session reuse (mode 600)
 ~/.local/share/amazon/cache/storage_state.json  # full Playwright state
+~/.local/share/amazon/cache/live/{item,search}/ # 15-min live-lookup cache
 ~/.local/state/amazon/sync.log                  # sync history
 ```
 
@@ -119,19 +161,60 @@ The Python worker never logs the password.
 ## Use
 
 ```bash
-amazon login                  # one-time browser-based login (handles captcha + 2FA)
-amazon sync                   # default window (last 2 years)
-amazon sync --year 2018       # one specific year
-amazon sync --years 2010,2011 # several years
-amazon sync --full            # re-fetch everything (default skips known orders)
-
-amazon list --year 2025 --limit 25
-amazon show 111-2222222-3333333
-amazon search "raspberry pi"
-amazon list --json | jq '[.[] | .total | tonumber] | add'
-
-ruby web.rb                   # http://localhost:4567
+amazon login                  # one-time browser login (handles captcha + 2FA)
 ```
+
+### Live (queries Amazon now)
+
+```bash
+amazon search "raspberry pi"              # live listings
+amazon search "usb c cable" --limit 20 --no-sponsored
+amazon item B0747R1M51                    # live price / stock / delivery
+amazon item https://www.amazon.com/dp/B0747R1M51   # URLs work too
+amazon item B0747R1M51 --fresh            # bypass the 15-minute cache
+amazon item B0747R1M51 --json | jq .delivery_date
+```
+
+Live results are cached on disk for 15 minutes under
+`~/.local/share/amazon/cache/live/`, so re-running a search or piping the
+same lookup into `jq` twice doesn't re-hit Amazon. `--fresh` skips the read
+but still writes, so the next plain run gets the refreshed answer. Empty
+results are never cached — a lookup that found nothing is usually a blocked
+or half-loaded page, and caching it would pin the failure for 15 minutes.
+
+`--no-sponsored` drops listings Amazon tagged "Sponsored". When the tag
+can't be read at all, those listings are kept and a note is written to
+stderr — dropping unknowns would silently hide organic results.
+
+Delivery dates come from your signed-in session and reflect your default
+shipping address. If Amazon serves a captcha instead of the page, the CLI
+says so — re-run `amazon login` to refresh the session.
+
+### Your orders (local archive)
+
+```bash
+amazon order sync                   # default window (last 2 years)
+amazon order sync --year 2018       # one specific year
+amazon order sync --years 2010,2011 # several years
+amazon order sync --full            # re-fetch everything (default skips known)
+
+amazon order list --year 2025 --limit 25   # a "~" total is estimated, not charged
+amazon order show 111-2222222-3333333
+amazon order search "raspberry pi"  # searches history, not the live catalog
+amazon order list --json | jq '[.[] | .total | tonumber] | add'
+
+ruby web.rb                         # http://localhost:4567
+```
+
+Some older orders don't expose a grand total in Amazon's HTML. For those,
+the archive falls back to `total_before_tax` and then `subtotal`, records
+which field it used, and `order list` prefixes the number with `~` — an
+estimate that excludes tax (and, from a subtotal, shipping too).
+
+> **Note:** `search` is live. To search what you've already bought, use
+> `amazon order search`. The order commands used to live at the top level
+> (`amazon list`, `amazon sync`, …); they now require the `order` prefix,
+> and the old spellings print a pointer to the new one.
 
 ## Tuning sync speed
 
@@ -154,12 +237,28 @@ Bump `workers` up cautiously — Amazon starts handing back HTTP 503s above
 ## Testing
 
 ```bash
-ruby test/web_test.rb         # 95% line + branch coverage gate
+ruby test/web_test.rb                              # 95% line + branch gate
+ruby test/cli_test.rb                              # 98% line / 95% branch gate
+python -m unittest discover -s pyworker -v         # parsing helpers
 ```
 
-The CLI itself doesn't ship a test suite — the value is end-to-end against
-live Amazon, which is hard to mock usefully. The web app is well-tested
-because its inputs (the JSON store) are stable.
+`cli_test.rb` never touches the network: the NDJSON protocol in
+`worker.rb` is driven against a stub subprocess, and everything above it is
+exercised directly. Only the browser login and `order sync` — which drive a
+real Chrome window and shell out to `op` — are filtered out of the coverage
+gate and verified by running them for real.
+
+`pyworker/test_live.py` covers the fiddly pure functions — ASIN extraction
+from URL shapes, money parsing, and the delivery-date parser (Amazon omits
+the year, so December→January has to roll forward). It needs no browser.
+
+What isn't unit-tested is selector drift: Amazon A/B tests product-page
+markup constantly. Every field is looked up through a list of fallback
+selectors; optional fields that go missing degrade to `null`, and a page
+with no title at all is treated as "not a product page" and raises. When
+three or more of the six expected fields come back empty, the worker emits
+a `warn` log saying the markup may have changed — but a single blanked
+field can still slip through, and only a real run will show it.
 
 ## License
 

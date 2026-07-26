@@ -39,16 +39,45 @@ module Amazon
           level = event["level"] || "info"
           progress.clear
           warn("[worker:#{level}] #{event["msg"]}") if @verbose || level == "warn"
-        when "done"
-          progress.finish(event)
-          return orders
+        when "done"     then progress.finish(event)
         when "error"    then error_msg = event["msg"]
         end
       end
       progress.clear
       raise Error, error_msg if error_msg && orders.empty?
-      warn("amazon: partial sync — #{error_msg} (kept #{orders.size} orders fetched before failure)") if error_msg
+      @partial_error = error_msg
       orders
+    end
+
+    # Set when a sync ended early but kept the orders fetched before the
+    # failure. The caller has to decide what to do — silently exiting 0 makes a
+    # partial sync indistinguishable from a complete one to cron and `&&`.
+    attr_reader :partial_error
+
+    # Live product lookup. Raises Error with a nudge toward `amazon login` when
+    # the saved session is missing, has expired, or Amazon serves a captcha.
+    def item(asin)
+      data = nil
+      run({ action: "item", asin: asin }, script: "live.py") do |event|
+        case event["event"]
+        when "item"  then data = event["data"]
+        when "log"   then warn("[worker] #{event["msg"]}") if @verbose
+        when "error" then raise Error, live_error(event)
+        end
+      end
+      data
+    end
+
+    def search(query, limit: 10)
+      results = []
+      run({ action: "search", query: query, limit: limit }, script: "live.py") do |event|
+        case event["event"]
+        when "result" then results << event["data"]
+        when "log"    then warn("[worker] #{event["msg"]}") if @verbose
+        when "error"  then raise Error, live_error(event)
+        end
+      end
+      results
     end
 
     class Progress
@@ -133,8 +162,15 @@ module Amazon
 
     private
 
-    def run(request)
-      cmd = python_cmd
+    def live_error(event)
+      case event["kind"]
+      when "not_logged_in", "blocked" then event["msg"]
+      else "live lookup failed: #{event["msg"]}"
+      end
+    end
+
+    def run(request, script: "fetch.py")
+      cmd = python_cmd(script)
       Open3.popen3(*cmd, chdir: PYWORKER) do |stdin, stdout, stderr, wait|
         stdin.write(JSON.generate(request) + "\n")
         # Keep stdin open — worker may need to write OTP/prompt responses.
@@ -145,6 +181,7 @@ module Amazon
           # stderr was closed during shutdown; that's fine.
         end
 
+        saw_error = false
         stdout.each_line do |line|
           line = line.strip
           next if line.empty?
@@ -160,7 +197,11 @@ module Amazon
             stdin.write(answer + "\n")
           else
             yield event
-            return if event["event"] == "done" || event["event"] == "error"
+            saw_error = true if event["event"] == "error"
+            # `break`, not `return`: returning from here exits the popen3 block
+            # and skips the exit-status check below, so a worker that emitted
+            # `done` and then died during teardown looked like a clean success.
+            break if event["event"] == "done" || event["event"] == "error"
           end
         end
 
@@ -169,9 +210,17 @@ module Amazon
         rescue IOError, Errno::EPIPE
           # already closed
         end
+        # Drain whatever the worker wrote after `done` so it can't block on a
+        # full pipe while we wait for it to exit.
+        begin
+          stdout.read
+        rescue IOError
+          # already closed
+        end
         err_thread.join
         status = wait.value
-        unless status.success?
+        # An `error` event already carries a better message than the exit code.
+        if !status.success? && !saw_error
           raise Error, "python worker exited #{status.exitstatus}"
         end
       end
@@ -184,11 +233,11 @@ module Amazon
       nil
     end
 
-    def python_cmd
+    def python_cmd(script)
       # Prefer uv-managed venv if present; otherwise fall back to plain python3
       venv = File.join(PYWORKER, ".venv", "bin", "python")
-      return [venv, "fetch.py"] if File.executable?(venv)
-      ["python3", "fetch.py"]
+      return [venv, script] if File.executable?(venv)
+      ["python3", script]
     end
 
     def prompt_text(event)

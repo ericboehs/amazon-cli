@@ -5,6 +5,17 @@ require "date"
 
 module Amazon
   class Store
+    # RuntimeError so CLI#run's rescue turns it into a message, not a backtrace.
+    class Error < RuntimeError; end
+
+    # Preference order for an order's headline total. Only grand_total is the
+    # real amount charged: total_before_tax excludes tax, and subtotal excludes
+    # tax *and* shipping. Old orders that amazon-orders can't fully parse land
+    # with a null grand_total, so the fallbacks are load-bearing — but a number
+    # several dollars low looks entirely legitimate in a table, and sums across
+    # orders come out silently understated. Record which field was used.
+    TOTAL_FIELDS = %w[grand_total total_before_tax subtotal].freeze
+
     def initialize
       @orders_dir = Config.orders_dir
       @index_path = Config.index_path
@@ -16,6 +27,8 @@ module Amazon
       else
         { "last_sync" => nil, "orders" => {} }
       end
+    rescue JSON::ParserError => e
+      raise Error, "index at #{@index_path} is corrupt (#{e.message}) — re-run `amazon order sync --full`"
     end
 
     def write_order(order)
@@ -29,18 +42,28 @@ module Amazon
       File.write(file, JSON.pretty_generate(order) + "\n")
 
       relative = file.relative_path_from(Config.data_dir).to_s
+      source = TOTAL_FIELDS.find { |f| order[f] }
       index["orders"][id] = {
         "year" => year,
         "date" => order["order_placed"],
-        "total" => order["grand_total"] || order["total_before_tax"] || order["subtotal"],
+        "total" => source && order[source],
+        "total_source" => source,
         "file" => relative
       }
       file
     end
 
+    # True when the stored total isn't the amount actually charged.
+    def self.estimated_total?(meta)
+      source = meta["total_source"]
+      # Orders written before total_source existed: assume the good case rather
+      # than flagging every historical row.
+      !source.nil? && source != "grand_total"
+    end
+
     def commit_index!(synced_at: Time.now.utc.iso8601)
       index["last_sync"] = synced_at
-      File.write(@index_path, JSON.pretty_generate(index) + "\n")
+      write_json_atomic(@index_path, index)
     end
 
     def each_order(year: nil)
@@ -82,7 +105,64 @@ module Amazon
       hits.sort_by { |o| o["order_placed"].to_s }.reverse
     end
 
+    ASIN_RE = %r{/(?:dp|gp/product)/([A-Z0-9]{10})}
+
+    def self.asin_from(link)
+      link.to_s[ASIN_RE, 1]
+    end
+
+    # asin => [{date, price, order_id, title}, …], newest first. Used to annotate
+    # live results with what you paid last time. Walks every order file, so
+    # callers should build this once and reuse it.
+    def purchases_by_asin
+      @purchases_by_asin ||= begin
+        map = Hash.new { |h, k| h[k] = [] }
+        each_order do |id, meta, load|
+          order = begin
+            load.call
+          rescue JSON::ParserError, SystemCallError => e
+            # This walks every order file on disk, so one truncated file from an
+            # interrupted sync would otherwise take down an unrelated `amazon
+            # item` lookup.
+            warn "amazon: skipping unreadable order #{id} (#{e.class})"
+            next
+          end
+          (order["items"] || []).each do |item|
+            asin = Store.asin_from(item["link"])
+            next unless asin
+            map[asin] << {
+              "order_id" => id,
+              "date" => meta["date"],
+              "price" => item["price"],
+              "title" => item["title"]
+            }
+          end
+        end
+        map.each_value { |v| v.sort_by! { |p| p["date"].to_s }.reverse! }
+        map.default_proc = nil
+        map
+      end
+    end
+
+    # Most recent prior purchase of an ASIN, or nil.
+    def last_purchase(asin)
+      purchases_by_asin[asin]&.first
+    end
+
     private
+
+    # Write-then-rename: an interrupted sync leaves the previous index intact
+    # instead of a half-written one that fails to parse on the next run.
+    def write_json_atomic(path, data)
+      tmp = nil
+      FileUtils.mkdir_p(path.dirname)
+      tmp = path.dirname.join(".#{path.basename}.#{Process.pid}.tmp")
+      File.write(tmp, JSON.pretty_generate(data) + "\n")
+      File.rename(tmp, path)
+      tmp = nil
+    ensure
+      FileUtils.rm_f(tmp) if tmp
+    end
 
     def year_for(order)
       placed = order["order_placed"]
