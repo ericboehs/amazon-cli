@@ -2,6 +2,8 @@ module Amazon
   module Commands
     module Order
       class List
+        include Args
+
         def initialize(global)
           @global = global
         end
@@ -11,8 +13,8 @@ module Amazon
           limit = nil
           while (a = argv.shift)
             case a
-            when "--year"  then year = Integer(argv.shift)
-            when "--limit" then limit = Integer(argv.shift)
+            when "--year"  then year = integer_arg!("--year", argv.shift)
+            when "--limit" then limit = integer_arg!("--limit", argv.shift)
             when "-h", "--help"
               puts help_text
               return 0
@@ -25,7 +27,7 @@ module Amazon
           Amazon::Config.load # ensures dirs exist via load
           store = Amazon::Store.new
           rows = store.list(year: year, limit: limit)
-          Amazon::Formatter.new(json: @global[:json]).list(rows)
+          Amazon::Formatter.new(json: @global.json).list(rows)
           0
         end
 

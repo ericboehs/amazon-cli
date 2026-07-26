@@ -70,20 +70,59 @@ CAPTCHA_MARKERS = (
     "img[src*='captcha']",
 )
 
+# Amazon redirects here when the saved cookies have expired. The storage-state
+# file still exists on disk, so its presence alone proves nothing — without this
+# check an expired session surfaces as "no product found for <ASIN>".
+SIGNIN_URLS = ("/ap/signin", "/ap/cvf", "/ap/mfa")
+SIGNIN_MARKERS = ("#ap_email", "#ap_password", "form[name='signIn']")
+
 
 def guard(page: Any) -> None:
-    """Raise if the page is a robot check rather than real content."""
+    """Raise if the page is a robot check or a sign-in redirect, not content.
+
+    Fails closed. If every probe throws — navigating page, destroyed context,
+    locator timeout — we cannot distinguish a block from real content, so raise
+    rather than scrape a robot-check page as though it were a product.
+    """
+    probed = 0
     for sel in CAPTCHA_MARKERS:
         try:
-            if page.locator(sel).count() > 0:
-                raise Blocked(
-                    "Amazon served a captcha instead of the page. "
-                    "Run `amazon login` to refresh the session, then retry."
-                )
-        except Blocked:
-            raise
+            found = page.locator(sel).count() > 0
         except Exception:  # noqa: BLE001
             continue
+        probed += 1
+        if found:
+            raise Blocked(
+                "Amazon served a captcha instead of the page. "
+                "Run `amazon login` to refresh the session, then retry."
+            )
+    if probed == 0:
+        raise Blocked(
+            "could not determine whether Amazon served a captcha — no probe "
+            "completed. Retry, and run `amazon login` if it persists."
+        )
+
+    if is_signin_page(page):
+        raise NotLoggedIn(
+            "Amazon redirected to the sign-in page — the saved session has "
+            "expired. Run: amazon login"
+        )
+
+
+def is_signin_page(page: Any) -> bool:
+    try:
+        url = page.url or ""
+    except Exception:  # noqa: BLE001
+        url = ""
+    if any(marker in url for marker in SIGNIN_URLS):
+        return True
+    for sel in SIGNIN_MARKERS:
+        try:
+            if page.locator(sel).count() > 0:
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
 
 
 def text(scope: Any, *selectors: str) -> str | None:
@@ -116,7 +155,11 @@ def attr(scope: Any, selector: str, name: str) -> str | None:
 
 
 def parse_money(raw: str | None) -> float | None:
-    """"$1,234.56" -> 1234.56. Returns None for ranges, empty, or junk."""
+    """"$1,234.56" -> 1234.56. Returns None for empty or junk.
+
+    A range ("$10.00 - $20.00") yields its low end, not None — callers show it
+    as the "from" price.
+    """
     if not raw:
         return None
     cleaned = raw.replace(",", "").replace("$", "").strip()

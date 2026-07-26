@@ -19,8 +19,17 @@ module Amazon
       return puts("(no orders — run `amazon sync`)") if rows.empty?
 
       headers = %w[date order_id total status]
-      data = rows.map { |r| [r["date"], r["order_id"], format_money(r["total"]), r["status"] || ""] }
+      data = rows.map do |r|
+        # A "~" beats a number that silently excludes tax (or tax and shipping)
+        # looking exactly as authoritative as one that doesn't.
+        total = format_money(r["total"])
+        total = "~#{total}" if Store.estimated_total?(r) && !total.empty?
+        [r["date"], r["order_id"], total, r["status"] || ""]
+      end
       print_table(headers, data)
+      if rows.any? { |r| Store.estimated_total?(r) }
+        puts dim("~ total is estimated: Amazon didn't report a grand total, so this excludes tax (and, from a subtotal, shipping)")
+      end
     end
 
     def show(order)
@@ -175,7 +184,8 @@ module Amazon
     end
 
     def effective_total(order)
-      order["grand_total"] || order["total_before_tax"] || order["subtotal"]
+      field = Store::TOTAL_FIELDS.find { |f| order[f] }
+      field && order[field]
     end
 
     def print_table(headers, rows)

@@ -6,6 +6,8 @@ module Amazon
   module Commands
     module Order
       class Sync
+        include Args
+
         def initialize(global)
           @global = global
         end
@@ -16,8 +18,8 @@ module Amazon
           full_resync = false
           while (a = argv.shift)
             case a
-            when "--year"  then years = [Integer(argv.shift)]
-            when "--years" then years = argv.shift.split(",").map { |y| Integer(y) }
+            when "--year"  then years = [integer_arg!("--year", argv.shift)]
+            when "--years" then years = integer_list_arg!("--years", argv.shift)
             when "--no-full-details" then full_details = false
             when "--full"  then full_resync = true
             when "-h", "--help"
@@ -49,7 +51,7 @@ module Amazon
           known_ids = full_resync ? [] : store.index["orders"].keys
 
           log "syncing years: #{years.join(", ")}#{full_resync ? " (full re-sync)" : " (skipping #{known_ids.size} known)"}"
-          worker = Amazon::Worker.new(verbose: @global[:verbose], quiet: @global[:quiet])
+          worker = Amazon::Worker.new(verbose: @global.verbose, quiet: @global.quiet)
           orders = worker.sync(
             email: config.email,
             password: password,
@@ -63,11 +65,20 @@ module Amazon
           orders.each { |o| store.write_order(o) }
           store.commit_index!
 
-          append_sync_log(years, orders.size)
+          partial = worker.partial_error
+          append_sync_log(years, orders.size, partial: partial)
           log "wrote #{orders.size} orders to #{Amazon::Config.orders_dir}"
+          # A partial sync must not exit 0: cron jobs and `&&` chains have no
+          # other way to tell it apart from a complete one.
+          if partial
+            warn "amazon: partial sync — #{partial} (kept #{orders.size} orders fetched before the failure)"
+            return 1
+          end
           0
         rescue Amazon::Worker::Error => e
-          if e.message.include?("Captcha") || e.message.include?("CaptchaForm")
+          # Case-insensitive: amazon-orders raises "CaptchaForm", the live
+          # worker writes lowercase "captcha".
+          if e.message.match?(/captcha/i)
             warn "amazon: login blocked by Amazon CAPTCHA."
             warn "  amazon-orders can't solve image/JS captchas. To clear it:"
             warn "    1) Open https://www.amazon.com in a browser and log in manually."
@@ -89,11 +100,30 @@ module Amazon
           ((cur - n + 1)..cur).to_a
         end
 
+        # A stale jar is worse than no jar: the placeholder password below would
+        # reach a real `session.login()`, and repeated failed auth against a live
+        # Amazon account is exactly what trips their captcha/lockout heuristics.
+        # So check that the session cookie is present *and* unexpired.
         def cookies_authenticated?
           path = Amazon::Config.cache_dir.join("cookies.json")
           return false unless path.exist?
-          data = JSON.parse(path.read) rescue {}
-          data.key?("x-main")
+          data = begin
+            JSON.parse(path.read)
+          rescue JSON::ParserError, SystemCallError
+            {}
+          end
+          return false unless data.key?("x-main")
+          !cookies_expired?(data)
+        end
+
+        # Playwright records expiry as a Unix timestamp; -1 means a session
+        # cookie. Treat an unparseable or missing expiry as "can't confirm it's
+        # live" and fall back to a real login.
+        def cookies_expired?(data)
+          expiry = data["expires"] || data.dig("x-main", "expires")
+          return true unless expiry.is_a?(Numeric)
+          return false if expiry.negative?
+          Time.at(expiry) <= Time.now
         end
 
         def fetch_password(ref)
@@ -109,16 +139,19 @@ module Amazon
           "'" + s.gsub("'", "'\\''") + "'"
         end
 
-        def append_sync_log(years, count)
+        def append_sync_log(years, count, partial: nil)
           path = Amazon::Config.sync_log_path
           FileUtils.mkdir_p(File.dirname(path))
+          # Mark partial runs, so a truncated count isn't logged in the same
+          # shape as a complete one.
+          status = partial ? "  status=partial  error=#{partial.gsub(/\s+/, " ")}" : ""
           File.open(path, "a") do |f|
-            f.puts "#{Time.now.utc.iso8601}  years=#{years.join(",")}  count=#{count}"
+            f.puts "#{Time.now.utc.iso8601}  years=#{years.join(",")}  count=#{count}#{status}"
           end
         end
 
         def log(msg)
-          warn(msg) unless @global[:quiet]
+          warn(msg) unless @global.quiet
         end
 
         def help_text

@@ -2,9 +2,12 @@ require "pathname"
 require "optparse"
 
 module Amazon
-  class CLI
-    COMMANDS = %w[login search item order config buy help].freeze
+  # Flags every command understands. A Data object rather than a Hash so a
+  # typo like `@global.verbse` raises instead of quietly reading nil — which,
+  # for `quiet`, silently flipped behaviour rather than failing.
+  GlobalOptions = Data.define(:json, :quiet, :verbose)
 
+  class CLI
     def self.run(argv)
       new.run(argv)
     end
@@ -19,6 +22,9 @@ module Amazon
         puts help_text
         return 0
       when "login"  then Commands::Login.new(global).run(argv)
+      # `search` is both a top-level live command and an `order` subcommand, so
+      # it must be matched here, ahead of the moved-command branch below, or
+      # `amazon search` would resolve to the legacy redirect instead.
       when "search" then Commands::Search.new(global).run(argv)
       when "item"   then Commands::Item.new(global).run(argv)
       when "order"  then Commands::OrderNamespace.new(global).run(argv)
@@ -32,6 +38,10 @@ module Amazon
         warn help_text
         2
       end
+    rescue Commands::Args::BadArgument => e
+      # Usage errors exit 2, distinct from a runtime failure's 1.
+      warn "amazon: #{e.message}"
+      2
     rescue Worker::Error, RuntimeError => e
       warn "amazon: #{e.message}"
       1
@@ -40,19 +50,19 @@ module Amazon
     private
 
     def parse_global!(argv)
-      opts = { json: false, quiet: false, verbose: false }
+      json = quiet = verbose = false
       keep = []
       while (a = argv.shift)
         case a
-        when "--json"           then opts[:json] = true
-        when "-q", "--quiet"    then opts[:quiet] = true
-        when "-v", "--verbose"  then opts[:verbose] = true
+        when "--json"           then json = true
+        when "-q", "--quiet"    then quiet = true
+        when "-v", "--verbose"  then verbose = true
         else
           keep << a
         end
       end
       argv.replace(keep)
-      opts
+      GlobalOptions.new(json: json, quiet: quiet, verbose: verbose)
     end
 
     def help_text

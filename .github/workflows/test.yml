@@ -21,7 +21,7 @@ jobs:
           ruby-version: '3.3'
       - name: Run web_test (95% line + branch coverage gate)
         run: ruby test/web_test.rb
-      - name: Run cli_test (98% line / 95% branch coverage gate)
+      - name: Run cli_test (99% line / 95% branch coverage gate)
         run: ruby test/cli_test.rb
 
   python-test:

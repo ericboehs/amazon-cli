@@ -177,7 +177,14 @@ amazon item B0747R1M51 --json | jq .delivery_date
 
 Live results are cached on disk for 15 minutes under
 `~/.local/share/amazon/cache/live/`, so re-running a search or piping the
-same lookup into `jq` twice doesn't re-hit Amazon. `--fresh` bypasses it.
+same lookup into `jq` twice doesn't re-hit Amazon. `--fresh` skips the read
+but still writes, so the next plain run gets the refreshed answer. Empty
+results are never cached — a lookup that found nothing is usually a blocked
+or half-loaded page, and caching it would pin the failure for 15 minutes.
+
+`--no-sponsored` drops listings Amazon tagged "Sponsored". When the tag
+can't be read at all, those listings are kept and a note is written to
+stderr — dropping unknowns would silently hide organic results.
 
 Delivery dates come from your signed-in session and reflect your default
 shipping address. If Amazon serves a captcha instead of the page, the CLI
@@ -191,13 +198,18 @@ amazon order sync --year 2018       # one specific year
 amazon order sync --years 2010,2011 # several years
 amazon order sync --full            # re-fetch everything (default skips known)
 
-amazon order list --year 2025 --limit 25
+amazon order list --year 2025 --limit 25   # a "~" total is estimated, not charged
 amazon order show 111-2222222-3333333
 amazon order search "raspberry pi"  # searches history, not the live catalog
 amazon order list --json | jq '[.[] | .total | tonumber] | add'
 
 ruby web.rb                         # http://localhost:4567
 ```
+
+Some older orders don't expose a grand total in Amazon's HTML. For those,
+the archive falls back to `total_before_tax` and then `subtotal`, records
+which field it used, and `order list` prefixes the number with `~` — an
+estimate that excludes tax (and, from a subtotal, shipping too).
 
 > **Note:** `search` is live. To search what you've already bought, use
 > `amazon order search`. The order commands used to live at the top level
@@ -230,9 +242,11 @@ ruby test/cli_test.rb                              # 98% line / 95% branch gate
 python -m unittest discover -s pyworker -v         # parsing helpers
 ```
 
-`cli_test.rb` stubs the worker, so it never touches the network; the
-subprocess plumbing (`worker.rb`), the browser login, and `order sync` are
-filtered out of its coverage gate and verified by running them for real.
+`cli_test.rb` never touches the network: the NDJSON protocol in
+`worker.rb` is driven against a stub subprocess, and everything above it is
+exercised directly. Only the browser login and `order sync` — which drive a
+real Chrome window and shell out to `op` — are filtered out of the coverage
+gate and verified by running them for real.
 
 `pyworker/test_live.py` covers the fiddly pure functions — ASIN extraction
 from URL shapes, money parsing, and the delivery-date parser (Amazon omits
@@ -240,9 +254,11 @@ the year, so December→January has to roll forward). It needs no browser.
 
 What isn't unit-tested is selector drift: Amazon A/B tests product-page
 markup constantly. Every field is looked up through a list of fallback
-selectors, and a field that goes missing degrades to `null` rather than
-crashing — but a layout change can still quietly blank a field, and only a
-real run will show it.
+selectors; optional fields that go missing degrade to `null`, and a page
+with no title at all is treated as "not a product page" and raises. When
+three or more of the six expected fields come back empty, the worker emits
+a `warn` log saying the markup may have changed — but a single blanked
+field can still slip through, and only a real run will show it.
 
 ## License
 

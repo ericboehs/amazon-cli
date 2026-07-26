@@ -2,6 +2,8 @@ module Amazon
   module Commands
     module Order
       class Show
+        include Args
+
         def initialize(global)
           @global = global
         end
@@ -14,6 +16,7 @@ module Amazon
               puts "Usage: amazon order show <order-id> [--json]"
               return 0
             else
+              reject_unknown_flag!(a)
               order_id ||= a
             end
           end
@@ -26,7 +29,7 @@ module Amazon
           Amazon::Config.load
           store = Amazon::Store.new
           order = store.read(order_id)
-          Amazon::Formatter.new(json: @global[:json]).show(order)
+          Amazon::Formatter.new(json: @global.json).show(order)
           order ? 0 : 1
         end
       end

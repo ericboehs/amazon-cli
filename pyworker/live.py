@@ -40,7 +40,19 @@ from browser import (
     text,
 )
 
-ASIN_RE = re.compile(r"\b(B[0-9A-Z]{9}|\d{9}[\dX])\b")
+# The URL path is authoritative. Matching a bare token anywhere in the input
+# lets a slug word shadow the real ASIN (".../Bluetooth5-Speaker/dp/B0CH7T8QTR"
+# would yield BLUETOOTH5), and lets the ISBN form match a 10-digit "qid=" epoch
+# on a search URL that has no ASIN at all.
+ASIN_PATH_RE = re.compile(r"/(?:dp|gp/product|product)/([A-Z0-9]{10})(?:[/?#]|$)", re.IGNORECASE)
+# Only accepted when it is the entire input, i.e. typed on the command line.
+ASIN_BARE_RE = re.compile(r"^(B[0-9A-Z]{9}|\d{9}[\dX])$")
+
+# "4.6 out of 5 stars, 4,640 ratings" — the leading number is the rating, so the
+# count has to be anchored on its trailing noun rather than taken as the first
+# integer in the string.
+REVIEW_COUNT_RE = re.compile(r"([\d,]*\d)\s*(?:ratings?|reviews?)", re.IGNORECASE)
+RATING_PHRASE_RE = re.compile(r"out of\s+\d+(?:\.\d+)?\s+stars", re.IGNORECASE)
 
 # "FREE delivery Tuesday, July 28" / "Tomorrow, Jul 27" / "Tue, Jul 28"
 DATE_RE = re.compile(
@@ -54,10 +66,18 @@ MONTHS = {m: i for i, m in enumerate(
 
 
 def extract_asin(raw: str) -> str | None:
-    """Accept a bare ASIN, a /dp/ URL, a /gp/product/ URL, or a share link."""
+    """Accept a bare ASIN, a /dp/ URL, or a /gp/product/ URL.
+
+    Returns None rather than guessing when the input has neither shape — a URL
+    with no product path (a search page, a share link) has no ASIN to find.
+    """
     if not raw:
         return None
-    m = ASIN_RE.search(raw.upper())
+    raw = raw.strip()
+    m = ASIN_PATH_RE.search(raw)
+    if m:
+        return m.group(1).upper()
+    m = ASIN_BARE_RE.match(raw.upper())
     return m.group(1) if m else None
 
 
@@ -128,7 +148,7 @@ def scrape_item(page: Any, asin: str) -> dict[str, Any]:
     price = parse_money(price_raw)
     list_price = parse_money(list_raw)
 
-    return {
+    data = {
         "asin": asin,
         "url": f"https://www.amazon.com/dp/{asin}",
         "title": title,
@@ -141,11 +161,13 @@ def scrape_item(page: Any, asin: str) -> dict[str, Any]:
         "fastest_raw": fastest_raw,
         "seller": text(page, "#sellerProfileTriggerId", "#merchant-info", "#tabular-buybox"),
         "rating": _first_float(rating_raw),
-        "reviews": _first_int(reviews_raw),
+        "reviews": _review_count(reviews_raw),
         "coupon": text(page, "#promoPriceBlockMessage_feature_div", "#couponFeature"),
         "image": attr(page, "#landingImage, #imgBlkFront, #main-image", "src"),
         "_fetched_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
+    _warn_selector_rot(data)
+    return data
 
 
 def scrape_search(page: Any, query: str, limit: int) -> list[dict[str, Any]]:
@@ -182,8 +204,8 @@ def scrape_search(page: Any, query: str, limit: int) -> list[dict[str, Any]]:
                 "price_raw": price_raw,
                 "rating": _first_float(rating_raw),
                 # The visible text is rounded ("(4.6K)"); the aria-label has the
-                # exact count ("4,640 ratings").
-                "reviews": _first_int(
+                # exact count ("4.6 out of 5 stars, 4,640 ratings").
+                "reviews": _review_count(
                     attr(card, "a[aria-label*='ratings']", "aria-label")
                     or text(card, "[data-csa-c-slot-id=alf-reviews] span")
                 ),
@@ -196,11 +218,12 @@ def scrape_search(page: Any, query: str, limit: int) -> list[dict[str, Any]]:
     return out
 
 
-def _is_sponsored(card: Any) -> bool:
+def _is_sponsored(card: Any) -> bool | None:
+    """None means "couldn't tell" — callers must not read that as "organic"."""
     try:
         return card.locator("span:has-text('Sponsored')").count() > 0
     except Exception:  # noqa: BLE001
-        return False
+        return None
 
 
 def _first_float(raw: str | None) -> float | None:
@@ -213,8 +236,43 @@ def _first_float(raw: str | None) -> float | None:
 def _first_int(raw: str | None) -> int | None:
     if not raw:
         return None
-    m = re.search(r"[\d,]+", raw)
+    m = re.search(r"\d[\d,]*", raw)
     return int(m.group(0).replace(",", "")) if m else None
+
+
+def _review_count(raw: str | None) -> int | None:
+    """Review count from an aria-label or a bare "(391)" span."""
+    if not raw:
+        return None
+    m = REVIEW_COUNT_RE.search(raw)
+    if m:
+        return int(m.group(1).replace(",", ""))
+    # A bare rating with no count attached: report no count rather than the
+    # rating's leading digit.
+    if RATING_PHRASE_RE.search(raw):
+        return None
+    return _first_int(raw)
+
+
+# Fields a normal product page always renders. Several empty at once means a
+# selector chain has rotted, not that Amazon left them out — worth saying so,
+# since each field degrades to null independently and the output still looks
+# complete.
+EXPECTED_ITEM_FIELDS = ("price", "availability", "delivery_raw", "seller", "rating", "image")
+ROT_THRESHOLD = 3
+
+
+def _warn_selector_rot(data: dict[str, Any]) -> None:
+    missing = [f for f in EXPECTED_ITEM_FIELDS if not data.get(f)]
+    if len(missing) >= ROT_THRESHOLD:
+        emit(
+            "log",
+            level="warn",
+            msg=(
+                f"{len(missing)}/{len(EXPECTED_ITEM_FIELDS)} expected fields were empty "
+                f"({', '.join(missing)}) — Amazon's markup may have changed"
+            ),
+        )
 
 
 def main() -> int:
