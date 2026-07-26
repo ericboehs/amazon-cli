@@ -51,6 +51,32 @@ module Amazon
       orders
     end
 
+    # Live product lookup. Raises Error with a nudge toward `amazon login` when
+    # the saved session is missing or Amazon serves a captcha.
+    def item(asin)
+      data = nil
+      run({ action: "item", asin: asin }, script: "live.py") do |event|
+        case event["event"]
+        when "item"  then data = event["data"]
+        when "log"   then warn("[worker] #{event["msg"]}") if @verbose
+        when "error" then raise Error, live_error(event)
+        end
+      end
+      data
+    end
+
+    def search(query, limit: 10)
+      results = []
+      run({ action: "search", query: query, limit: limit }, script: "live.py") do |event|
+        case event["event"]
+        when "result" then results << event["data"]
+        when "log"    then warn("[worker] #{event["msg"]}") if @verbose
+        when "error"  then raise Error, live_error(event)
+        end
+      end
+      results
+    end
+
     class Progress
       BAR_WIDTH = 20
 
@@ -133,8 +159,15 @@ module Amazon
 
     private
 
-    def run(request)
-      cmd = python_cmd
+    def live_error(event)
+      case event["kind"]
+      when "not_logged_in", "blocked" then event["msg"]
+      else "live lookup failed: #{event["msg"]}"
+      end
+    end
+
+    def run(request, script: "fetch.py")
+      cmd = python_cmd(script)
       Open3.popen3(*cmd, chdir: PYWORKER) do |stdin, stdout, stderr, wait|
         stdin.write(JSON.generate(request) + "\n")
         # Keep stdin open — worker may need to write OTP/prompt responses.
@@ -184,11 +217,11 @@ module Amazon
       nil
     end
 
-    def python_cmd
+    def python_cmd(script)
       # Prefer uv-managed venv if present; otherwise fall back to plain python3
       venv = File.join(PYWORKER, ".venv", "bin", "python")
-      return [venv, "fetch.py"] if File.executable?(venv)
-      ["python3", "fetch.py"]
+      return [venv, script] if File.executable?(venv)
+      ["python3", script]
     end
 
     def prompt_text(event)

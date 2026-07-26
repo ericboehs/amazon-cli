@@ -1,0 +1,50 @@
+module Amazon
+  module Commands
+    # Live product detail: current price, stock, delivery estimate, seller.
+    class Item
+      def initialize(global)
+        @global = global
+      end
+
+      def run(argv)
+        target = nil
+        fresh = false
+        while (a = argv.shift)
+          case a
+          when "--fresh" then fresh = true
+          when "-h", "--help"
+            puts <<~HELP
+              Usage: amazon item <ASIN|url> [--fresh] [--json]
+
+              Looks up a product on Amazon right now — price, availability,
+              delivery estimate, seller, rating. Delivery dates are personalized
+              to the address on your signed-in account.
+
+              Options:
+                --fresh   Bypass the 15-minute local cache
+            HELP
+            return 0
+          else
+            target ||= a
+          end
+        end
+
+        unless target
+          warn "item: an ASIN or product URL is required"
+          return 2
+        end
+
+        Amazon::Config.load
+        worker = Amazon::Worker.new(verbose: @global[:verbose], quiet: @global[:quiet])
+        cache = Amazon::Cache.new("item", enabled: !fresh)
+        data = cache.fetch(target) { worker.item(target) }
+        return 1 unless data
+
+        store = Amazon::Store.new
+        data = data.merge("purchases" => store.purchases_by_asin[data["asin"]] || [])
+        Amazon::Formatter.new(json: @global[:json]).item(data)
+        0
+      end
+    end
+  end
+end

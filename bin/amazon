@@ -7,16 +7,20 @@ ROOT = Pathname(__dir__).join("..").realpath
 $LOAD_PATH.unshift(ROOT.join("lib").to_s)
 
 require "amazon/config"
+require "amazon/cache"
 require "amazon/store"
 require "amazon/worker"
 require "amazon/formatter"
 require "amazon/cli"
 require "amazon/commands/login"
-require "amazon/commands/sync"
-require "amazon/commands/list"
-require "amazon/commands/show"
-require "amazon/commands/search"
 require "amazon/commands/config"
 require "amazon/commands/buy"
+require "amazon/commands/item"
+require "amazon/commands/search"
+require "amazon/commands/order"
+require "amazon/commands/order/sync"
+require "amazon/commands/order/list"
+require "amazon/commands/order/show"
+require "amazon/commands/order/search"
 
 exit(Amazon::CLI.run(ARGV))

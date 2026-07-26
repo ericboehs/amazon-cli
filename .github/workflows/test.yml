@@ -5,13 +5,36 @@ on:
     branches: [main]
   pull_request:
 
+permissions: {} # default-deny; jobs request exactly what they need
+
 jobs:
-  web-test:
+  ruby-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only
     steps:
-      - uses: actions/checkout@v4
-      - uses: ruby/setup-ruby@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
         with:
           ruby-version: '3.3'
       - name: Run web_test (95% line + branch coverage gate)
         run: ruby test/web_test.rb
+      - name: Run cli_test (98% line / 95% branch coverage gate)
+        run: ruby test/cli_test.rb
+
+  python-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      # The parsing helpers under test are pure — no Playwright install needed.
+      - name: Run live worker parser tests
+        run: python -m unittest discover -s pyworker -p 'test_*.py' -v

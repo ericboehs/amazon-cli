@@ -3,7 +3,7 @@ require "optparse"
 
 module Amazon
   class CLI
-    COMMANDS = %w[login sync list show search config buy help].freeze
+    COMMANDS = %w[login search item order config buy help].freeze
 
     def self.run(argv)
       new.run(argv)
@@ -19,12 +19,14 @@ module Amazon
         puts help_text
         return 0
       when "login"  then Commands::Login.new(global).run(argv)
-      when "sync"   then Commands::Sync.new(global).run(argv)
-      when "list"   then Commands::List.new(global).run(argv)
-      when "show"   then Commands::Show.new(global).run(argv)
       when "search" then Commands::Search.new(global).run(argv)
+      when "item"   then Commands::Item.new(global).run(argv)
+      when "order"  then Commands::OrderNamespace.new(global).run(argv)
       when "config" then Commands::Config.new(global).run(argv)
       when "buy"    then Commands::Buy.new(global).run(argv)
+      when *Commands::OrderNamespace::SUBCOMMANDS
+        warn "amazon: `#{cmd}` moved to `amazon order #{cmd}`"
+        2
       else
         warn "unknown command: #{cmd}"
         warn help_text
@@ -57,12 +59,18 @@ module Amazon
       <<~HELP
         Usage: amazon <command> [options]
 
-        Commands:
+        Live (queries Amazon now):
+          search   Search Amazon listings; flags items you've bought before
+          item     Show live price, stock, and delivery date for an ASIN/URL
+
+        Your orders (local archive):
+          order sync     Pull orders from Amazon into the local store
+          order list     List orders
+          order show     Show one order in detail
+          order search   Search your order history
+
+        Other:
           login    Open a browser so you can sign in (handles captcha/2FA)
-          sync     Pull recent orders from Amazon into local store
-          list     List orders from local store
-          show     Show one order in detail
-          search   Search orders by item title / ASIN / order id
           config   Show or edit config
           buy      (not yet implemented)
           help     Show this help

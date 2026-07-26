@@ -82,6 +82,41 @@ module Amazon
       hits.sort_by { |o| o["order_placed"].to_s }.reverse
     end
 
+    ASIN_RE = %r{/(?:dp|gp/product)/([A-Z0-9]{10})}
+
+    def self.asin_from(link)
+      link.to_s[ASIN_RE, 1]
+    end
+
+    # asin => [{date, price, order_id, title}, …], newest first. Used to annotate
+    # live results with what you paid last time. Walks every order file, so
+    # callers should build this once and reuse it.
+    def purchases_by_asin
+      @purchases_by_asin ||= begin
+        map = Hash.new { |h, k| h[k] = [] }
+        each_order do |id, meta, load|
+          (load.call["items"] || []).each do |item|
+            asin = Store.asin_from(item["link"])
+            next unless asin
+            map[asin] << {
+              "order_id" => id,
+              "date" => meta["date"],
+              "price" => item["price"],
+              "title" => item["title"]
+            }
+          end
+        end
+        map.each_value { |v| v.sort_by! { |p| p["date"].to_s }.reverse! }
+        map.default_proc = nil
+        map
+      end
+    end
+
+    # Most recent prior purchase of an ASIN, or nil.
+    def last_purchase(asin)
+      purchases_by_asin[asin]&.first
+    end
+
     private
 
     def year_for(order)
