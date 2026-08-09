@@ -1177,10 +1177,29 @@ class CleanTextTest(unittest.TestCase):
         self.assertEqual(clean_text("  In\n  Stock \t"), "In Stock")
 
     def test_ordinary_copy_is_untouched(self):
-        # Braces and #hashes appear in real titles; only a selector *plus* a
-        # braced body is CSS, and neither of these is that.
-        for raw in ("Sold by Amazon.com", "Set of 4 {assorted} colors", "Filament #3 refill"):
+        # Braces and #hashes appear in real titles. What actually distinguishes
+        # a rule from copy here is not "selector plus braced body" — that was
+        # this comment's earlier claim and the regex never implemented it, which
+        # is how `Includes 3.5mm cable {black} and case` came back as
+        # `Includes 3 and case`. The rule is narrower: a rule has to *begin its
+        # own line*, and its selector has to stay on the same line as its brace.
+        # Every case below carries a dot-word, a brace, or both, mid-line.
+        for raw in (
+            "Sold by Amazon.com",
+            "Set of 4 {assorted} colors",
+            "Filament #3 refill",
+            "Includes 3.5mm cable {black} and case",
+            "Cable is 3.5mm; connector {TRRS} included",
+        ):
             self.assertEqual(clean_text(raw), raw)
+
+    def test_a_rule_that_does_not_start_its_own_line_is_left_alone(self):
+        # The other side of that bargain, stated so it isn't mistaken for a bug
+        # later: the anchor buys "never eat prose" at the price of "may miss a
+        # rule". Missing one prints visible junk; the alternative silently
+        # deletes real copy, and only one of those a user can see and report.
+        raw = "In Stock. .avail { color: red; }"
+        self.assertEqual(clean_text(raw), raw)
 
     def test_copy_is_untouched_even_with_a_style_block_below_it(self):
         # The case the test above cannot reach. "Amazon.com" contains a token
