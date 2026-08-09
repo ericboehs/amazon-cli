@@ -1980,6 +1980,22 @@ class ReviewsBurstSignalTest < Minitest::Test
     reviews = (1..20).map { |i| review(i, 'date' => 'last Tuesday') }
     assert_nil signal(analyze(reviews: reviews), 'burst')['points']
   end
+
+  def test_a_recency_sorted_sample_cannot_be_judged_on_timing
+    # Asking Amazon for the newest reviews and then flagging the sample for
+    # being new is circular: --sort recent clusters the dates by construction,
+    # so a healthy product with 20 reviews this week scores a full 20/20 for
+    # doing nothing but selling well.
+    reviews = (1..20).map { |i| review(i, 'date' => '2026-03-0%d' % (1 + (i % 3))) }
+    s = signal(analyze(reviews: reviews, 'reviews_sort' => 'recent'), 'burst')
+    assert_nil s['points']
+    assert_includes s['detail'], 'recent'
+  end
+
+  def test_the_default_sort_still_judges_timing
+    reviews = (1..20).map { |i| review(i, 'date' => '2026-03-0%d' % (1 + (i % 3))) }
+    assert_equal 20, signal(analyze(reviews: reviews, 'reviews_sort' => 'helpful'), 'burst')['points']
+  end
 end
 
 class ReviewsDuplicateSignalTest < Minitest::Test
@@ -2513,6 +2529,9 @@ class ReviewsCommandTest < Minitest::Test
     out, err = run_cli('reviews', 'B0HAPPY', '--critical', '--fresh', worker: happy)
     assert_includes err, 'no 1-3 star reviews'
     assert_includes err, '--pages 3'
+    # Not --sort recent: it would suppress the timing check on the very sample
+    # this advice is telling the user to go and fetch.
+    refute_includes err, '--sort recent'
     refute_includes out, 'Reviews ('
   end
 

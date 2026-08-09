@@ -61,8 +61,11 @@ module Amazon
           # listing with plenty of 1-3 star ratings can still have none of them
           # here. Printing nothing would read as "no complaints exist".
           if kept.empty? && !@global.json
+            # Deliberately not --sort recent: a date-ordered sample makes the
+            # timing check uninterpretable, so this would be advice that
+            # silently costs the user a check to gain a few reviews.
             warn "amazon: no 1-3 star reviews in this #{Array(data["reviews_sample"]).size}-review sample" \
-                 " — Amazon's product-page picks skew positive; try --pages 3 --sort recent"
+                 " — Amazon's product-page picks skew positive; try --pages 3"
           end
           data = data.merge("reviews_sample" => kept)
         end
@@ -107,7 +110,9 @@ module Amazon
           Options:
             --pages N    Also walk N pages of the full review listing (~10 each,
                          max #{MAX_PAGES}). One extra page load each; default 0
-            --sort S     helpful (default) or recent — applies to --pages
+            --sort S     helpful (default) or recent — applies to --pages.
+                         recent orders the sample by date, so the timing check
+                         cannot be run on it
             --verbatim   Print the review text, not just the analysis
             --critical   Print only 1-3 star reviews (implies --verbatim)
             --limit N    Cap how many reviews --verbatim prints
