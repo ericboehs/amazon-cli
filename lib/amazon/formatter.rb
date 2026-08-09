@@ -198,7 +198,15 @@ module Amazon
       puts
       puts bold("Rating distribution")
       5.downto(1) do |star|
-        pct = hist[star.to_s].to_i
+        # A drawn bar of 0% is a claim about the product. A row the scraper
+        # never read is not that claim, and printing it as one is how a
+        # half-read table came to look like a five-star wall.
+        pct = hist[star.to_s]
+        if pct.nil?
+          puts "  #{star}★ #{" " * HIST_WIDTH}   #{dim("?")}"
+          next
+        end
+        pct = pct.to_i
         bar = "█" * ((pct / 100.0) * HIST_WIDTH).round
         puts "  #{star}★ #{bar.ljust(HIST_WIDTH)} #{pct.to_s.rjust(3)}%"
       end

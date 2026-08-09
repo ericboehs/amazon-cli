@@ -213,12 +213,23 @@ def reviews_url(asin: str, page_number: int = 1, sort: str = "helpful") -> str:
     )
 
 
+STAR_ROWS = 5
+
+
 def scrape_histogram(page: Any) -> dict[str, int]:
     """Star -> percent of all ratings, e.g. {"5": 71, "4": 12, ...}.
 
     Percentages are what Amazon publishes; absolute per-star counts are not on
     the page. Returns {} when the table can't be found, which callers must treat
     as "unknown" rather than "no ratings".
+
+    A star distribution is five rows or it is not a distribution, so a selector
+    yielding fewer is treated as a partial read and the remaining selectors
+    still get their turn. Stopping at the first non-empty result let one
+    surviving row pass for the whole table, and downstream every star that
+    never arrived scored as 0% — turning routine selector drift into a
+    five-star wall with no middle and no tail, which is precisely the shape the
+    fraud model treats as damning.
     """
     out: dict[str, int] = {}
     for selector in (
@@ -234,7 +245,7 @@ def scrape_histogram(page: Any) -> dict[str, int]:
                     out.setdefault(str(parsed[0]), parsed[1])
         except Exception:  # noqa: BLE001
             continue
-        if out:
+        if len(out) == STAR_ROWS:
             return out
 
     # Fallback: no aria-labels, so read the rendered row text ("5 star  71%").
@@ -246,6 +257,15 @@ def scrape_histogram(page: Any) -> dict[str, int]:
                 out.setdefault(str(parsed[0]), parsed[1])
     except Exception:  # noqa: BLE001
         pass
+
+    # Nothing at all is a listing with no histogram, which is ordinary. Some of
+    # it is markup we no longer understand, and that is worth saying: the rows
+    # we did read still get shown, but nothing will be scored off them.
+    if out and len(out) < STAR_ROWS:
+        emit("log", level="warn", msg=(
+            f"read only {len(out)} of {STAR_ROWS} star rows from the rating histogram — "
+            "reporting the rows found and skipping the distribution check"
+        ))
     return out
 
 

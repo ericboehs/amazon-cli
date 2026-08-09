@@ -360,13 +360,26 @@ module Amazon
         (((share - floor) / (ceiling - floor)) * max).round
       end
 
+      # Amazon rounds every row to a whole percent, so a genuine histogram lands
+      # a point or two either side of 100. Anything outside this means we misread
+      # rows rather than that the product has an unusual distribution.
+      HISTOGRAM_SUM = (90..110)
+
+      # A distribution is five rows or it is nothing. Returning a partial one
+      # let each absent star read as `nil.to_i` = 0, so a listing that lost four
+      # rows to selector drift scored as a five-star wall with no middle and no
+      # tail — a confident accusation assembled entirely out of rows we never
+      # read. Refusing to score it puts the check back in the "couldn't run"
+      # column, which is the whole point of the nil-vs-zero rule above.
       def normalize_histogram(histogram)
         return {} unless histogram.is_a?(Hash)
-        histogram.each_with_object({}) do |(star, pct), out|
+        pct = histogram.each_with_object({}) do |(star, raw), out|
           key = Integer(star.to_s, exception: false)
-          value = Integer(pct.to_s, exception: false)
+          value = Integer(raw.to_s, exception: false)
           out[key] = value if key&.between?(1, 5) && value
         end
+        return {} unless pct.size == 5 && HISTOGRAM_SUM.cover?(pct.values.sum)
+        pct
       end
 
       def content_words(text)
