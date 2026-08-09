@@ -775,12 +775,12 @@ class ScrapeReviewsPaginationFailureTest(unittest.TestCase):
             {"[data-hook=reviewTitle]": FakeTextLocator(text="Works great")},
             attrs={"id": "customer_review-R1"},
         )
-        got, walked_all = scrape_reviews(self.Page([card]), "B0TEST00001", pages=3)
+        got, walk = scrape_reviews(self.Page([card]), "B0TEST00001", pages=3)
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0]["title"], "Works great")
-        # The caller has to be able to tell this apart from a complete walk, or
-        # the report will advise a deeper fetch that already failed.
-        self.assertFalse(walked_all)
+        # "failed", not "exhausted": the report must not tell the user this is
+        # everything Amazon would serve when the truth is the fetch broke.
+        self.assertEqual(walk, "failed")
 
 
 class ScrapeReviewsSessionFailureTest(unittest.TestCase):
@@ -826,11 +826,11 @@ class ScrapeReviewsSessionFailureTest(unittest.TestCase):
     def test_a_transport_failure_still_degrades_to_the_sample_in_hand(self):
         # The distinction that matters: a page that wouldn't load costs us depth
         # we can report around; a session that is gone costs us the answer.
-        got, walked_all = scrape_reviews(
+        got, walk = scrape_reviews(
             self.Page(RuntimeError("net::ERR_CONNECTION_RESET")), "B0TEST00001", pages=3
         )
         self.assertEqual(len(got), 1)
-        self.assertFalse(walked_all)
+        self.assertEqual(walk, "failed")
 
 
 class ScrapeReviewsDepthTest(unittest.TestCase):
@@ -867,15 +867,15 @@ class ScrapeReviewsDepthTest(unittest.TestCase):
     def test_a_walk_that_runs_out_early_is_reported_as_incomplete(self):
         # The real case: a 3,706-rating listing that stopped yielding new
         # reviews after page 1 of the 3 requested.
-        _, walked_all = scrape_reviews(self.Page(pages_available=1), "B0TEST00001", pages=3)
-        self.assertFalse(walked_all)
+        _, walk = scrape_reviews(self.Page(pages_available=1), "B0TEST00001", pages=3)
+        self.assertEqual(walk, "exhausted")
 
     def test_a_full_walk_is_reported_as_complete(self):
-        got, walked_all = scrape_reviews(self.Page(pages_available=5), "B0TEST00001", pages=3)
-        self.assertTrue(walked_all)
+        got, walk = scrape_reviews(self.Page(pages_available=5), "B0TEST00001", pages=3)
+        self.assertEqual(walk, "complete")
         self.assertEqual(len(got), 4)  # product page + 3 walked pages
 
     def test_asking_for_no_pages_is_a_complete_walk(self):
         # `--pages 0` got exactly the depth it requested; nothing was refused.
-        _, walked_all = scrape_reviews(self.Page(pages_available=0), "B0TEST00001", pages=0)
-        self.assertTrue(walked_all)
+        _, walk = scrape_reviews(self.Page(pages_available=0), "B0TEST00001", pages=0)
+        self.assertEqual(walk, "complete")

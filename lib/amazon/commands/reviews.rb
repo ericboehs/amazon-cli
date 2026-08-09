@@ -6,7 +6,10 @@ module Amazon
       include Args
 
       SORTS = %w[helpful recent].freeze
-      MAX_PAGES = 10
+      # Defined by Amazon::Reviews, which needs the ceiling to know when it has
+      # no deeper sample left to suggest. Aliased so the flag validation and the
+      # advice can never drift apart.
+      MAX_PAGES = Amazon::Reviews::MAX_PAGES
 
       def initialize(global)
         @global = global

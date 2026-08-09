@@ -33,6 +33,14 @@ module Amazon
     # keyword-stuffed title, so this only means anything across a deep sample —
     # and it is better to report "couldn't check" than to accuse a real listing.
     MISMATCH_MIN_SAMPLE = 25
+    # Each page is another round trip from the same session, which is the traffic
+    # pattern that gets a session captcha'd. Lives here rather than in the
+    # command because the report has to know where the ceiling is before it can
+    # advise a deeper walk. `Amazon::Commands::Reviews` aliases it.
+    MAX_PAGES = 10
+    # How much deeper to suggest going. Enough to move the timing and
+    # product-match checks off "couldn't run", small enough to stay polite.
+    PAGE_STEP = 3
     # Below this many content words, two reviews overlap by coincidence often
     # enough that Jaccard similarity stops meaning anything.
     DUPLICATE_MIN_WORDS = 6
@@ -80,17 +88,18 @@ module Amazon
         # "reviews" is the sitewide rating count; the sampled review objects
         # live under "reviews_sample".
         reviews = Array(data["reviews_sample"])
-        # Set when the walk asked Amazon for more pages and got nothing back, so
-        # the "go deeper" advice below can stop recommending a flag that has
-        # already been tried and refused.
-        exhausted = data["reviews_exhausted"] ? true : false
+        # How the walk ended and how deep it got, so the "go deeper" advice below
+        # can stop recommending a flag that has already been tried and refused —
+        # and can tell "Amazon has no more" apart from "we fell over".
+        walk = walk_state(data)
+        pages = Integer(data["review_pages"].to_s, exception: false) || 0
         signals = [
           histogram_signal(data["histogram"]),
           unverified_signal(reviews),
-          burst_signal(reviews, exhausted, data["reviews_sort"]),
+          burst_signal(reviews, walk, pages, data["reviews_sort"]),
           duplicate_signal(reviews),
           incentivized_signal(reviews),
-          mismatch_signal(data["title"], reviews, exhausted),
+          mismatch_signal(data["title"], reviews, walk, pages),
           repeat_reviewer_signal(reviews)
         ]
         scored = signals.select(&:computable?)
@@ -99,7 +108,8 @@ module Amazon
 
         {
           "sample_size" => reviews.size,
-          "exhausted" => exhausted,
+          "walk" => walk,
+          "pages" => pages,
           "score" => score,
           "level" => level_for(score),
           "confidence" => confidence_for(reviews, scored.size, signals.size),
@@ -230,7 +240,7 @@ module Amazon
 
       # Bought reviews arrive in batches, so they bunch into a few days. Needs a
       # deeper sample than one product page provides.
-      def burst_signal(reviews, exhausted = false, sort = nil)
+      def burst_signal(reviews, walk = "complete", pages = 0, sort = nil)
         # `--sort recent` asks Amazon for the newest reviews, which clusters the
         # dates by construction — a healthy product selling 20 units a week
         # scored a full 20/20 for nothing but selling well. Compensating would
@@ -245,7 +255,7 @@ module Amazon
         dates = reviews.filter_map { |r| parse_date(r["date"]) }.sort
         if dates.size < BURST_MIN_SAMPLE
           return na(:burst, "Review timing",
-                    "needs #{BURST_MIN_SAMPLE}+ dated reviews (have #{dates.size})#{deeper_hint(exhausted)}")
+                    "needs #{BURST_MIN_SAMPLE}+ dated reviews (have #{dates.size})#{deeper_hint(walk, pages)}")
         end
 
         best = dates.each_with_index.map { |start, i|
@@ -308,7 +318,7 @@ module Amazon
       # of mowing" vs "Heavy Duty Garden Loppers Steel Blade"), so anything less
       # than a near-total mismatch across a deep sample is noise, and noise here
       # would discredit every other signal in the list.
-      def mismatch_signal(title, reviews, exhausted = false)
+      def mismatch_signal(title, reviews, walk = "complete", pages = 0)
         subject = content_words(title).to_set
         bodies = reviews.filter_map do |r|
           words = content_words("#{r["title"]} #{r["body"]}")
@@ -317,7 +327,7 @@ module Amazon
         if subject.size < 3 || bodies.size < MISMATCH_MIN_SAMPLE
           return na(:mismatch, "Reviews match the product",
                     "needs a descriptive title and #{MISMATCH_MIN_SAMPLE}+ reviews with text " \
-                    "(have #{bodies.size})#{deeper_hint(exhausted)}")
+                    "(have #{bodies.size})#{deeper_hint(walk, pages)}")
         end
 
         unrelated = bodies.count { |b| (b & subject).empty? }
@@ -366,11 +376,32 @@ module Amazon
 
       private
 
+      # Reads the worker's three-state walk, falling back to the boolean it
+      # replaced so a cache entry written by the previous shape still analyzes
+      # rather than silently landing in the wrong branch. A "failed" walk has no
+      # boolean equivalent — that conflation is the bug this fixes — so old
+      # entries can only ever be complete or exhausted, which is what they meant.
+      def walk_state(data)
+        state = data["reviews_walk"].to_s
+        return state if %w[complete exhausted failed].include?(state)
+        data["reviews_exhausted"] ? "exhausted" : "complete"
+      end
+
       # Telling someone to run `--pages 3` after they ran `--pages 3` reads as
-      # the tool not listening. When Amazon has stopped handing over reviews,
-      # the honest thing to say is that the sample is as deep as it will get.
-      def deeper_hint(exhausted)
-        exhausted ? " — Amazon served no more for this session" : " — re-run with --pages 3"
+      # the tool not listening, so the suggestion has to clear the depth already
+      # walked. The other two states aren't depth problems at all: Amazon has no
+      # more to give, or the walk fell over and the depth is simply unknown —
+      # and saying "Amazon served no more" for the latter is a claim about the
+      # listing made out of our own network error, which talks the user out of
+      # the retry that would have worked.
+      def deeper_hint(walk, pages = 0)
+        case walk
+        when "exhausted" then " — Amazon served no more for this session"
+        when "failed" then " — the deeper walk did not finish, so retry to sample further"
+        else
+          deeper = [pages + PAGE_STEP, MAX_PAGES].min
+          deeper > pages ? " — re-run with --pages #{deeper}" : " — already at the deepest sample offered"
+        end
       end
 
       def na(key, label, why)

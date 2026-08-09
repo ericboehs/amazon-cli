@@ -2185,16 +2185,48 @@ class ReviewsScoringTest < Minitest::Test
   end
 
   def test_it_stops_advising_a_deeper_walk_once_amazon_has_refused_one
-    detail = analyze(reviews: sample(3), 'reviews_exhausted' => true)['signals']
+    detail = analyze(reviews: sample(3), 'reviews_walk' => 'exhausted')['signals']
                  .find { |s| s['key'] == 'burst' }['detail']
-    refute_includes detail, 're-run with --pages 3'
+    refute_includes detail, 're-run with --pages'
     assert_includes detail, 'Amazon served no more for this session'
   end
 
   def test_the_mismatch_signal_takes_the_same_advice
-    detail = analyze(reviews: sample(3), 'reviews_exhausted' => true)['signals']
+    detail = analyze(reviews: sample(3), 'reviews_walk' => 'exhausted')['signals']
                  .find { |s| s['key'] == 'mismatch' }['detail']
     assert_includes detail, 'Amazon served no more for this session'
+  end
+
+  def hint(**over) = analyze(reviews: sample(3), **over)['signals'].find { |s| s['key'] == 'burst' }['detail']
+
+  def test_a_walk_that_failed_says_so_rather_than_claiming_amazon_is_out
+    # "That is everything Amazon would serve" after a timeout is a claim the
+    # run has no basis for, and it suppresses the one useful instruction:
+    # try again. The old boolean could not tell the two apart.
+    detail = hint('reviews_walk' => 'failed')
+    refute_includes detail, 'Amazon served no more'
+    assert_includes detail, 'retry'
+  end
+
+  def test_a_complete_walk_suggests_a_depth_greater_than_the_one_already_run
+    # The original complaint, in its surviving form: a full `--pages 3` still
+    # advised `--pages 3`, because only an early stop was tracked.
+    assert_includes hint('reviews_walk' => 'complete', 'review_pages' => 0), '--pages 3'
+    assert_includes hint('reviews_walk' => 'complete', 'review_pages' => 3), '--pages 6'
+    assert_includes hint('reviews_walk' => 'complete', 'review_pages' => 8), '--pages 10'
+  end
+
+  def test_at_the_maximum_depth_there_is_no_deeper_to_advise
+    detail = hint('reviews_walk' => 'complete', 'review_pages' => 10)
+    refute_includes detail, '--pages'
+    assert_includes detail, 'deepest'
+  end
+
+  def test_a_cache_entry_written_before_the_three_states_still_reads
+    # `reviews_exhausted` was the old wire field; entries carrying it live in
+    # the cache for up to its TTL after an upgrade.
+    assert_includes hint('reviews_exhausted' => true), 'Amazon served no more for this session'
+    assert_includes hint('reviews_exhausted' => false), '--pages 3'
   end
 
   def test_handles_a_nil_payload
@@ -2424,14 +2456,24 @@ class ReviewsFormatterTest < Minitest::Test
   # The footer carried the same stale advice as the individual signals: it told
   # you to go deeper after Amazon had already refused to.
   def test_the_footer_stops_advising_a_deeper_walk_once_amazon_has_refused_one
-    out = render(data('reviews_exhausted' => true))
-    refute_includes out, 'Use --pages 3'
+    out = render(data('reviews_walk' => 'exhausted'))
+    refute_includes out, 'Use --pages'
     assert_includes out, 'everything Amazon would serve'
   end
 
   def test_the_footer_still_advises_a_deeper_walk_on_a_shallow_fetch
     out = render(data)
     assert_includes out, 'Use --pages 3'
+  end
+
+  def test_the_footer_asks_for_a_deeper_number_than_the_one_already_run
+    assert_includes render(data('reviews_walk' => 'complete', 'review_pages' => 3)), 'Use --pages 6'
+  end
+
+  def test_the_footer_reports_a_failed_walk_as_failed_not_as_exhausted
+    out = render(data('reviews_walk' => 'failed'))
+    refute_includes out, 'everything Amazon would serve'
+    assert_includes out, 'retry'
   end
 
   def test_verbatim_with_no_reviews_prints_no_section
