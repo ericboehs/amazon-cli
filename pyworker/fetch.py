@@ -203,13 +203,24 @@ class JarGuard:
 
     def __init__(self, cookies_path: Path) -> None:
         self.cookies_path = cookies_path
+        self.dead = False
         # Read before amazon-orders can touch the file. Held in memory only,
         # and written back solely to the file it came from.
         try:
             self.jar_before = cookies_path.read_text() if cookies_path.exists() else None
-        except OSError:
+        except OSError as e:
+            # Say so. `None` is also how "first-ever sync, nothing to protect"
+            # is spelled, so swallowing this left the two indistinguishable and
+            # turned the whole feature off without a word — the session then
+            # dies exactly as it did before the fix, and nothing in the output
+            # suggests the net was never strung up. Reachable through a jar
+            # written by an earlier run under sudo or launchd, an NFS
+            # `XDG_DATA_HOME` going stale, or EMFILE under load.
             self.jar_before = None
-        self.dead = False
+            emit("log", level="warn", msg=(
+                f"cannot read {cookies_path} ({e}) — if Amazon bounces this sync "
+                "it will leave the stripped jar there instead of putting yours back"
+            ))
 
     def restore(self, reason: str) -> bool:
         """Undo a strip, unless Amazon has told us there's nothing worth undoing."""

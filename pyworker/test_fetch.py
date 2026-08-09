@@ -235,6 +235,26 @@ class JarGuardTest(unittest.TestCase):
         guard, _ = self.guard(None)
         self.assertIsNone(guard.jar_before)
 
+    def test_an_unreadable_jar_says_the_net_is_down(self):
+        # `None` is also how "first-ever sync" is spelled, so a silent fallback
+        # left the two indistinguishable: the protection turned itself off and
+        # the session died exactly as it did before the fix, with nothing in
+        # the output to say the net was never strung up.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        unreadable = Path(d) / "cookies.json"
+        unreadable.mkdir()  # any OSError will do; this one needs no chmod games
+        events = emitted(lambda: JarGuard(unreadable))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["level"], "warn")
+        self.assertIn("cannot read", events[0]["msg"])
+
+    def test_a_first_ever_sync_is_not_warned_about(self):
+        # The other half: nothing to protect is normal, not a problem.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        self.assertEqual(emitted(lambda: JarGuard(Path(d) / "cookies.json")), [])
+
     def test_it_restores_a_stripped_jar(self):
         guard, path = self.guard()
         path.write_text(BOUNCED)
