@@ -1096,6 +1096,55 @@ class WorkerProtocolTest < Minitest::Test
     end
   end
 
+  # The regression: item/search dropped every log event unless -v was passed,
+  # so `live.py`'s selector-rot warning — which exists precisely to tell you the
+  # output you're reading is missing fields — could never reach anyone. Each
+  # field degrades to null on its own, so the report still looks complete.
+  def test_worker_warnings_reach_stderr_without_verbose
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'log', level: 'warn', msg: "4/6 expected fields were empty"}.to_json)
+      puts({event: 'log', level: 'info', msg: 'fetching B1'}.to_json)
+      puts({event: 'item', data: { 'asin' => 'B1' }}.to_json)
+      puts({event: 'done', count: 1}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      _, err = capture_io_streams { worker.item('B1') }
+      assert_includes err, '[worker:warn] 4/6 expected fields were empty'
+      # Routine progress still stays behind the flag.
+      refute_includes err, 'fetching B1'
+
+      _, err = capture_io_streams { worker(verbose: true).item('B1') }
+      assert_includes err, '[worker:info] fetching B1'
+    end
+  end
+
+  def test_search_warnings_reach_stderr_without_verbose
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'log', level: 'warn', msg: 'search markup may have changed'}.to_json)
+      puts({event: 'done', count: 0}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      _, err = capture_io_streams { worker.search('q') }
+      assert_includes err, '[worker:warn] search markup may have changed'
+    end
+  end
+
+  # A worker that omits `level` is emitting ordinary progress, not a warning —
+  # defaulting the other way would make every info line unsuppressable.
+  def test_a_level_less_log_is_treated_as_info
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'log', msg: 'no level here'}.to_json)
+      puts({event: 'done', count: 0}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      _, err = capture_io_streams { worker.search('q') }
+      assert_empty err
+    end
+  end
+
   def test_item_reads_the_item_event
     body = <<~SCRIPT
       STDIN.gets
