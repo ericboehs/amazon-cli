@@ -5,6 +5,7 @@ bounces to sign-in persists a stripped jar over a working one. These cover the
 decision about when to put the old jar back.
 """
 
+import io
 import json
 import os
 import subprocess
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -22,6 +24,7 @@ from fetch import (  # noqa: E402
     jar_cookie_names,
     jar_regressed,
     jar_without_auth,
+    restore_jar,
 )
 
 # Values here are meaningless fixtures — the code under test only reads names.
@@ -30,6 +33,20 @@ WIPED = json.dumps({})
 # What a sign-in bounce actually leaves: the anonymous cookies survive, the
 # authenticated ones are expired out.
 BOUNCED = json.dumps({"session-id": "v", "session-id-time": "v"})
+
+
+def emitted(fn):
+    """Run fn, returning the NDJSON events it wrote to stdout."""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        fn()
+    return [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+
+
+def silently(fn):
+    """Run fn for its return value, keeping its NDJSON out of the test output."""
+    with redirect_stdout(io.StringIO()):
+        return fn()
 
 
 class JarCookieNamesTest(unittest.TestCase):
@@ -75,35 +92,59 @@ class JarRegressedTest(unittest.TestCase):
             self.assertTrue(jar_regressed(before, BOUNCED), name)
 
 
-class RestoreJarBehaviorTest(unittest.TestCase):
+class RestoreJarTest(unittest.TestCase):
     """The write-back itself, exercised against a real file.
 
     jar_regressed is the decision; this is the part that has to not lose data.
+    These used to run against a hand-copied mirror of the closure inside
+    `main()`, which meant they could keep passing while the code they stood for
+    changed underneath them — the one failure mode a test cannot report.
     """
 
     def _restore(self, before_text, after_text):
-        """Mirror of the restore_jar closure in main(), against a temp file."""
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "cookies.json"
             path.write_text(after_text)
-            if jar_regressed(before_text, path.read_text()):
-                path.write_text(before_text)
-                os.chmod(path, 0o600)
-            return path.read_text(), path.stat().st_mode & 0o777
+            wrote = silently(lambda: restore_jar(path, before_text, "the test"))
+            return wrote, path.read_text(), path.stat().st_mode & 0o777
 
     def test_a_wiped_jar_is_restored_byte_for_byte(self):
-        text, _ = self._restore(GOOD, WIPED)
+        wrote, text, _ = self._restore(GOOD, WIPED)
+        self.assertTrue(wrote)
         self.assertEqual(text, GOOD)
 
     def test_restored_jars_stay_owner_only(self):
         # The jar holds live session cookies; restoring it must not widen it.
-        _, mode = self._restore(GOOD, WIPED)
+        _, _, mode = self._restore(GOOD, WIPED)
         self.assertEqual(mode, 0o600)
 
     def test_a_healthy_write_is_left_alone(self):
         fresher = json.dumps({"x-main": "v2", "at-main": "v2", "ubid-main": "v2"})
-        text, _ = self._restore(GOOD, fresher)
+        wrote, text, _ = self._restore(GOOD, fresher)
+        self.assertFalse(wrote)
         self.assertEqual(text, fresher)
+
+    def test_no_prior_snapshot_means_no_write(self):
+        wrote, text, _ = self._restore(None, WIPED)
+        self.assertFalse(wrote)
+        self.assertEqual(text, WIPED)
+
+    def test_a_missing_jar_is_restored_not_skipped(self):
+        # amazon-orders can unlink rather than truncate. "Gone" is the most
+        # complete regression there is, so it must not read as "nothing to do".
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cookies.json"
+            self.assertTrue(silently(lambda: restore_jar(path, GOOD, "the test")))
+            self.assertEqual(path.read_text(), GOOD)
+
+    def test_it_says_which_run_did_the_damage(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cookies.json"
+            path.write_text(WIPED)
+            events = emitted(lambda: restore_jar(path, GOOD, "the failed 2025 history fetch"))
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["level"], "warn")
+            self.assertIn("the failed 2025 history fetch", events[0]["msg"])
 
 
 class JarWithoutAuthTest(unittest.TestCase):
