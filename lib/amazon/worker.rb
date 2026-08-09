@@ -179,6 +179,12 @@ module Amazon
     # looks complete because every field fails to null independently. Hiding
     # that behind -v means the person who needs it is the one who never sees
     # it. `info` is routine progress and stays behind the flag.
+    #
+    # Deliberately does not consult `@quiet`. -q suppresses non-essential
+    # output, and by the argument above a warn is the essential case; the item,
+    # search, and reviews paths used to pass `quiet:` in here anyway, where it
+    # reached nothing but read as though it did. `@quiet` now belongs to
+    # `Progress` alone, which only the sync path builds.
     def log_event(event)
       level = event["level"] || "info"
       return unless @verbose || level == "warn"

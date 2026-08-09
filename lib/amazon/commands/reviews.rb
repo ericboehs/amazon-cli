@@ -45,7 +45,7 @@ module Amazon
         end
 
         Amazon::Config.load
-        worker = Amazon::Worker.new(verbose: @global.verbose, quiet: @global.quiet)
+        worker = Amazon::Worker.new(verbose: @global.verbose)
         cache = Amazon::Cache.new("reviews", read: !fresh)
         data = cache.fetch("#{target}|pages=#{pages}|sort=#{sort}") do
           worker.item(target, reviews: true, review_pages: pages, sort: sort)
