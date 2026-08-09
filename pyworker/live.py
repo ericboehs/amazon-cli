@@ -500,6 +500,9 @@ def scrape_item(
         # "this is everything Amazon will hand over" — advice you can act on
         # versus advice you have already taken.
         data["reviews_exhausted"] = not walked_all
+        # The timing check cannot mean anything on a sample Amazon ordered by
+        # date for us, so it has to know how the sample was chosen.
+        data["reviews_sort"] = sort
         if not sample:
             emit("log", level="warn", msg=f"no reviews found for {asin}")
 

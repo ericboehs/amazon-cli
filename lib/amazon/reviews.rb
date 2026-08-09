@@ -87,7 +87,7 @@ module Amazon
         signals = [
           histogram_signal(data["histogram"]),
           unverified_signal(reviews),
-          burst_signal(reviews, exhausted),
+          burst_signal(reviews, exhausted, data["reviews_sort"]),
           duplicate_signal(reviews),
           incentivized_signal(reviews),
           mismatch_signal(data["title"], reviews, exhausted),
@@ -230,7 +230,18 @@ module Amazon
 
       # Bought reviews arrive in batches, so they bunch into a few days. Needs a
       # deeper sample than one product page provides.
-      def burst_signal(reviews, exhausted = false)
+      def burst_signal(reviews, exhausted = false, sort = nil)
+        # `--sort recent` asks Amazon for the newest reviews, which clusters the
+        # dates by construction — a healthy product selling 20 units a week
+        # scored a full 20/20 for nothing but selling well. Compensating would
+        # need the listing's age and true review velocity, neither of which is
+        # on the page, so the honest answer is that this sample can't say.
+        if sort.to_s == "recent"
+          return na(:burst, "Review timing",
+                    "a --sort recent sample is ordered by date, so clustering says " \
+                    "nothing about it — re-run without --sort to judge timing")
+        end
+
         dates = reviews.filter_map { |r| parse_date(r["date"]) }.sort
         if dates.size < BURST_MIN_SAMPLE
           return na(:burst, "Review timing",
