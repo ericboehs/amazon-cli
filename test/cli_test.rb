@@ -816,6 +816,13 @@ class LiveCommandsTest < Minitest::Test
     out, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[search --help]) }
     assert_includes out, 'amazon order search'
   end
+
+  def test_search_rejects_a_limit_below_one
+    # Merely useless here rather than fatal, but a flag that silently accepts
+    # a value it cannot honour is worth closing at the same time as reviews'.
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[search filament --limit 0]) }
+    assert_includes err, '--limit must be 1 or more'
+  end
 end
 
 # --- Config / misc commands -------------------------------------------
@@ -2544,6 +2551,17 @@ class ReviewsCommandTest < Minitest::Test
 
     _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[reviews B1 --pages -1]) }
     assert_includes err, 'between 0 and 10'
+  end
+
+  def test_rejects_a_limit_below_one
+    # `reviews.first(-1)` raises ArgumentError, which is not a RuntimeError and
+    # so escaped the CLI's rescue as a backtrace. --pages right beside it has
+    # validated its range all along; --limit never did.
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[reviews B1 --verbatim --limit -1]) }
+    assert_includes err, '--limit must be 1 or more'
+
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[reviews B1 --verbatim --limit 0]) }
+    assert_includes err, '--limit must be 1 or more'
   end
 
   def test_rejects_bad_flag_values

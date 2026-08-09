@@ -18,7 +18,7 @@ module Amazon
         hide_sponsored = false
         while (a = argv.shift)
           case a
-          when "--limit" then limit = integer_arg!("--limit", argv.shift)
+          when "--limit" then limit = positive_arg!("--limit", argv.shift)
           when "--fresh" then fresh = true
           when "--no-sponsored" then hide_sponsored = true
           when "-h", "--help"
