@@ -1303,6 +1303,30 @@ class WorkerProtocolTest < Minitest::Test
     end
   end
 
+  # `Thread#join` re-raises into the main thread, and it did so *before* the
+  # exit-status check — so a failure while writing the diagnostics down
+  # replaced the failure they described, and pointed the caller at the logging
+  # path instead of at the worker. The forwarding channel must never preempt
+  # the thing it forwards.
+  def test_a_broken_reader_thread_does_not_replace_the_workers_own_error
+    body = <<~SCRIPT
+      STDIN.gets
+      STDERR.puts 'the real diagnostics'
+      STDERR.flush
+      exit 2
+    SCRIPT
+    with_python_cmd(body) do
+      w = worker
+      w.define_singleton_method(:forward_stderr) { |*| raise Errno::EIO, 'the pipe went away' }
+      raised = nil
+      _, err = capture_io_streams do
+        raised = assert_raises(Amazon::Worker::Error) { w.search('q') }
+      end
+      assert_includes raised.message, 'exited 2'
+      assert_includes err, "forwarding the worker's stderr failed"
+    end
+  end
+
   def test_item_reads_the_item_event
     body = <<~SCRIPT
       STDIN.gets

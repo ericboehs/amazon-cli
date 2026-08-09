@@ -218,18 +218,19 @@ module Amazon
         stdin.write(JSON.generate(request) + "\n")
         # Keep stdin open — worker may need to write OTP/prompt responses.
 
+        reader_error = nil
         err_thread = Thread.new do
-          stderr.each_line do |l|
-            line = l.chomp
-            # Tagged like every other line this class writes: under -v these
-            # interleave with the progress bar, and an untagged stream in a
-            # pasted log is one nobody can attribute.
-            warn("[worker:stderr] #{line}") if @verbose
-            tail << line
-            tail.shift while tail.size > STDERR_TAIL_LINES
-          end
+          stderr.each_line { |l| forward_stderr(tail, l.chomp) }
         rescue IOError
           # stderr was closed during shutdown; that's fine.
+        rescue StandardError => e
+          # Recorded rather than raised. `Thread#join` re-raises into the main
+          # thread, and it does so *before* the exit-status check below — so a
+          # failure while writing the diagnostics down replaced the failure
+          # they were describing, and handed the caller an exception pointing
+          # at the logging path. The forwarding channel must never preempt the
+          # thing it forwards.
+          reader_error = e
         end
 
         begin
@@ -274,6 +275,13 @@ module Amazon
             # already closed
           end
           err_thread.join
+          # Said before the status check rather than instead of it, so it reads
+          # as context for whichever way the run ends: the stderr tail below is
+          # short by however much the reader missed.
+          if reader_error
+            warn("[worker:stderr] forwarding the worker's stderr failed: " \
+                 "#{reader_error.class}: #{reader_error.message}")
+          end
           status = wait.value
           # An `error` event already carries a better message than the exit code.
           if !status.success? && !saw_error
@@ -303,6 +311,15 @@ module Amazon
       report = stderr_report(tail)
       raise if report.empty?
       raise Error, "#{e.message}#{report}"
+    end
+
+    # Tagged like every other line this class writes: under -v these interleave
+    # with the progress bar, and an untagged stream in a pasted log is one
+    # nobody can attribute.
+    def forward_stderr(tail, line)
+      warn("[worker:stderr] #{line}") if @verbose
+      tail << line
+      tail.shift while tail.size > STDERR_TAIL_LINES
     end
 
     def stderr_report(tail)
