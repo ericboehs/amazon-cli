@@ -355,6 +355,14 @@ def scrape_reviews(
             page.goto(reviews_url(asin, n, sort), wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(1200)
             guard(page)
+        except (Blocked, NotLoggedIn):
+            # Not a depth problem — the session itself is gone, or Amazon is
+            # serving a robot check. Both subclass RuntimeError, so the handler
+            # below used to swallow them and hand back a complete-looking fraud
+            # report built on the ~8 product-page reviews, exit 0, with the one
+            # actionable message ("Run: amazon login") never reaching the user.
+            # guard() fails closed on purpose; catching it here undid that.
+            raise
         except Exception as exc:  # noqa: BLE001
             # /product-reviews/ demands a signed-in session even when /dp/ will
             # still render for a stale one, so this leg fails on its own. The
