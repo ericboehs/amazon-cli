@@ -1349,6 +1349,47 @@ class WorkerProtocolTest < Minitest::Test
     end
   end
 
+  # Progress only redraws on a terminal, so this is the one place the suite
+  # needs stderr to claim it is one.
+  class FakeTty < StringIO
+    def tty? = true
+  end
+
+  def with_tty_stderr
+    old = $stderr
+    $stderr = FakeTty.new
+    yield
+    $stderr.string
+  ensure
+    $stderr = old
+  end
+
+  # `progress.clear` ran before anything knew whether the log event would print
+  # anything. `fetch.py` emits info logs throughout the detail loop, so without
+  # -v the bar was erased and redrawn with nothing in between: flicker for no
+  # reason. The visibility decision moved into `log_event` and the side effect
+  # that depends on it stayed outside.
+  def test_a_log_that_prints_nothing_does_not_erase_the_progress_bar
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'total', year: 2026, count: 2}.to_json)
+      puts({event: 'progress', year: 2026, i: 1, n: 2, order_id: 'ORD-A'}.to_json)
+      puts({event: 'log', level: 'info', msg: 'routine'}.to_json)
+      puts({event: 'progress', year: 2026, i: 2, n: 2, order_id: 'ORD-B'}.to_json)
+      puts({event: 'done', count: 2, skipped: 0}.to_json)
+    SCRIPT
+    ENV['COLUMNS'] = '200'
+    with_python_cmd(body) do
+      out = with_tty_stderr { worker.sync(email: 'e', password: 'p', years: [2026]) }
+      between = out[out.index('ORD-A')...out.index('ORD-B')]
+      # One, and only one: the erase that belongs to the second bar's own
+      # redraw. A second one is the invisible message erasing the first bar.
+      assert_equal 1, between.scan("\e[2K").size, between.inspect
+    end
+  ensure
+    ENV.delete('COLUMNS')
+  end
+
   def test_item_reads_the_item_event
     body = <<~SCRIPT
       STDIN.gets

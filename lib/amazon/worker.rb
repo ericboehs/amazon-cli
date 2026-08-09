@@ -43,7 +43,11 @@ module Amazon
         when "total"    then progress.start(event)
         when "progress" then progress.tick(event)
         when "log"
-          progress.clear
+          # Only erase the bar for a message that is actually going to land on
+          # top of it. Same predicate `log_event` decides with, because the
+          # side effect and the decision drifting apart is what produced a bar
+          # erased and redrawn with nothing in between.
+          progress.clear if printable?(event)
           log_event(event)
         when "done"     then progress.finish(event)
         when "error"    then error_msg = event["msg"]
@@ -186,9 +190,12 @@ module Amazon
     # reached nothing but read as though it did. `@quiet` now belongs to
     # `Progress` alone, which only the sync path builds.
     def log_event(event)
-      level = event["level"] || "info"
-      return unless @verbose || loud?(level)
-      warn("[worker:#{level}] #{event["msg"]}")
+      return unless printable?(event)
+      warn("[worker:#{event["level"] || "info"}] #{event["msg"]}")
+    end
+
+    def printable?(event)
+      @verbose || loud?(event["level"] || "info")
     end
 
     # Levels quiet enough to hide behind -v. Everything else prints, which is
