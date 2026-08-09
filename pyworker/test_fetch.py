@@ -25,6 +25,7 @@ from fetch import (  # noqa: E402
     jar_regressed,
     jar_without_auth,
     restore_jar,
+    write_jar,
 )
 
 # Values here are meaningless fixtures — the code under test only reads names.
@@ -213,6 +214,45 @@ class ClearDeadSessionTest(unittest.TestCase):
         # reaches the expiry check, so the next run signs in for real.
         _, text, _ = self._clear(GOOD)
         self.assertNotIn("x-main", json.loads(text))
+
+
+class WriteJarTest(unittest.TestCase):
+    """The jar's only writer. Both callers exist to keep a bad jar off disk."""
+
+    def test_it_lands_complete_and_0600(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cookies.json"
+            write_jar(path, GOOD)
+            self.assertEqual(path.read_text(), GOOD)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_a_failed_write_leaves_the_previous_jar_intact(self):
+        # `write_text` truncates first, so a crash mid-write used to leave a
+        # half-written jar — surfacing much later as unparseable JSON, blaming
+        # whichever command happened to read it next.
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cookies.json"
+            write_jar(path, GOOD)
+            with self.assertRaises(TypeError):
+                write_jar(path, None)  # type: ignore[arg-type]
+            self.assertEqual(path.read_text(), GOOD)
+
+    def test_it_leaves_no_temp_file_behind(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cookies.json"
+            with self.assertRaises(TypeError):
+                write_jar(path, None)  # type: ignore[arg-type]
+            self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_overwriting_never_widens_the_mode(self):
+        # The old order was write-then-chmod, leaving the file briefly 0644
+        # with live session cookies in it.
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cookies.json"
+            path.write_text("old")
+            os.chmod(path, 0o644)
+            write_jar(path, GOOD)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
 class BareInterpreterImportTest(unittest.TestCase):
