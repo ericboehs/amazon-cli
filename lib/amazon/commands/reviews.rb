@@ -22,7 +22,7 @@ module Amazon
         while (a = argv.shift)
           case a
           when "--pages" then pages = pages_arg!(argv.shift)
-          when "--limit" then limit = integer_arg!("--limit", argv.shift)
+          when "--limit" then limit = positive_arg!("--limit", argv.shift)
           when "--sort" then sort = sort_arg!(argv.shift)
           when "--verbatim" then verbatim = true
           when "--critical" then critical = verbatim = true

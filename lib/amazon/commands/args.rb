@@ -17,6 +17,15 @@ module Amazon
         raise BadArgument, "#{flag} needs a number, got #{raw.inspect}"
       end
 
+      # For counts, where zero and below are not smaller requests but nonsense.
+      # `--limit -1` used to reach Array#first, whose ArgumentError is not a
+      # RuntimeError and so escaped the CLI's rescue as a raw backtrace.
+      def positive_arg!(flag, raw)
+        n = integer_arg!(flag, raw)
+        raise BadArgument, "#{flag} must be 1 or more" unless n.positive?
+        n
+      end
+
       def integer_list_arg!(flag, raw)
         raise BadArgument, "#{flag} needs a comma-separated list of numbers" if raw.nil?
         parts = raw.split(",").map(&:strip).reject(&:empty?)
