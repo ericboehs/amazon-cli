@@ -185,6 +185,44 @@ def restore_jar(cookies_path: Path, jar_before: str | None, reason: str) -> bool
     return True
 
 
+class JarGuard:
+    """Owns the cookie jar for the length of one sync.
+
+    It holds three things that have to stay together: the pre-run snapshot, the
+    write-back that undoes damage, and a one-way latch saying Amazon has
+    declared this session dead.
+
+    The latch is the part that isn't optional. Restoring and clearing are exact
+    opposites, and the run that clears is followed by the same cleanup as every
+    other run — so without it, `clear()` strips `x-main` and the restore on the
+    way out reads that as a regression and puts it straight back. That is
+    finding 1 reappearing through the door marked "cleanup", which is precisely
+    the kind of bug that survives being fixed once. Once `clear()` has been
+    called, no restore can run.
+    """
+
+    def __init__(self, cookies_path: Path) -> None:
+        self.cookies_path = cookies_path
+        # Read before amazon-orders can touch the file. Held in memory only,
+        # and written back solely to the file it came from.
+        try:
+            self.jar_before = cookies_path.read_text() if cookies_path.exists() else None
+        except OSError:
+            self.jar_before = None
+        self.dead = False
+
+    def restore(self, reason: str) -> bool:
+        """Undo a strip, unless Amazon has told us there's nothing worth undoing."""
+        if self.dead:
+            return False
+        return restore_jar(self.cookies_path, self.jar_before, reason)
+
+    def clear(self) -> bool:
+        """Latch the session dead and drop its cookies. Never reversible."""
+        self.dead = True
+        return clear_dead_session(self.cookies_path)
+
+
 def emit(event: str, **fields: Any) -> None:
     sys.stdout.write(json.dumps({"event": event, **fields}, default=_json_default) + "\n")
     sys.stdout.flush()
@@ -384,15 +422,7 @@ def main() -> int:
     config_dir.mkdir(parents=True, exist_ok=True)
 
     cookies_path = cache_dir / "cookies.json"
-    # Read the jar before amazon-orders can touch it. Held in memory only, and
-    # written back solely to the file it came from.
-    try:
-        jar_before = cookies_path.read_text() if cookies_path.exists() else None
-    except OSError:
-        jar_before = None
-
-    def restore(reason: str) -> None:
-        restore_jar(cookies_path, jar_before, reason)
+    guard = JarGuard(cookies_path)
 
     config = AmazonOrdersConfig(
         config_path=str(config_dir / "amazon-orders.yml"),
@@ -417,94 +447,98 @@ def main() -> int:
     )
 
     try:
-        session.login()
-    except Exception as e:  # noqa: BLE001 — surface any auth failure to parent
-        restore("the login attempt")
-        emit("error", msg=f"login failed: {e}")
-        return 1
-
-    api = AmazonOrders(session, config=config)
-
-    total = 0
-    skipped = 0
-    for year in years:
-        emit("log", level="info", msg=f"fetching year {year} (history page)")
         try:
-            orders = api.get_order_history(year=int(year), full_details=False)
-        except Exception as e:  # noqa: BLE001
-            # amazon-orders trusts the cookie jar on disk, so `session.login()`
-            # returns without a network call and the first real request is what
-            # discovers the session is dead. Its own message tells you to call
-            # AmazonSession.login() — useless advice from a CLI.
-            if session_rejected(e):
-                # Not a restore. Amazon has just proven these cookies are dead,
-                # and putting them back is what leaves `cookies_authenticated?`
-                # answering yes forever — see `clear_dead_session`.
-                clear_dead_session(cookies_path)
-                emit(
-                    "error",
-                    kind="not_logged_in",
-                    msg=(
-                        "Amazon rejected the saved session — it redirected to the "
-                        "login page. Cookie expiry can't detect this; the session "
-                        "was invalidated server-side. The dead sign-in cookies have "
-                        "been cleared so the next run signs in properly. "
-                        "Run: amazon login"
-                    ),
-                )
-                return 1
-            restore(f"the failed {year} history fetch")
-            emit("error", msg=f"history fetch failed for {year}: {e}", trace=traceback.format_exc())
+            session.login()
+        except Exception as e:  # noqa: BLE001 — surface any auth failure to parent
+            guard.restore("the login attempt")
+            emit("error", msg=f"login failed: {e}")
             return 1
 
-        n = len(orders)
-        new_orders = [o for o in orders if o.order_number not in known_order_ids]
-        new_n = len(new_orders)
-        cached_count = n - new_n
-        emit("total", year=int(year), count=new_n, new=new_n, cached=cached_count)
-        if cached_count:
-            emit("log", level="info", msg=f"year {year}: skipping {cached_count} already-stored orders")
+        api = AmazonOrders(session, config=config)
 
-        if not full_details:
-            for i, order in enumerate(new_orders, start=1):
-                _emit_progress(year, i, new_n, order)
-                emit("order", data=order_to_dict(order, _ao_mod.__version__))
-                total += 1
-            continue
+        total = 0
+        skipped = 0
+        for year in years:
+            emit("log", level="info", msg=f"fetching year {year} (history page)")
+            try:
+                orders = api.get_order_history(year=int(year), full_details=False)
+            except Exception as e:  # noqa: BLE001
+                # amazon-orders trusts the cookie jar on disk, so `session.login()`
+                # returns without a network call and the first real request is what
+                # discovers the session is dead. Its own message tells you to call
+                # AmazonSession.login() — useless advice from a CLI.
+                if session_rejected(e):
+                    # Not a restore. Amazon has just proven these cookies are dead,
+                    # and putting them back is what leaves `cookies_authenticated?`
+                    # answering yes forever — see `clear_dead_session`.
+                    guard.clear()
+                    emit(
+                        "error",
+                        kind="not_logged_in",
+                        msg=(
+                            "Amazon rejected the saved session — it redirected to the "
+                            "login page. Cookie expiry can't detect this; the session "
+                            "was invalidated server-side. The dead sign-in cookies have "
+                            "been cleared so the next run signs in properly. "
+                            "Run: amazon login"
+                        ),
+                    )
+                    return 1
+                guard.restore(f"the failed {year} history fetch")
+                emit("error", msg=f"history fetch failed for {year}: {e}", trace=traceback.format_exc())
+                return 1
 
-        # Parallel detail fetches with throttled submission.
-        completed = 0
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {}
-            for order in new_orders:
-                fut = pool.submit(_fetch_with_retry, api, order, retry_backoff, emit)
-                futures[fut] = order
-                if detail_delay > 0:
-                    sleep_for = detail_delay + random.uniform(-detail_jitter, detail_jitter)
-                    if sleep_for > 0:
-                        time.sleep(sleep_for)
-            for fut in as_completed(futures):
-                completed += 1
-                original = futures[fut]
-                fetched = None
-                try:
-                    fetched = fut.result()
-                except Exception as e:  # noqa: BLE001
-                    emit("log", level="warn",
-                         msg=f"detail fetch raised for {original.order_number}: {e}")
-                order = fetched or original
-                _emit_progress(year, completed, new_n, order)
-                emit("order", data=order_to_dict(order, _ao_mod.__version__))
-                total += 1
+            n = len(orders)
+            new_orders = [o for o in orders if o.order_number not in known_order_ids]
+            new_n = len(new_orders)
+            cached_count = n - new_n
+            emit("total", year=int(year), count=new_n, new=new_n, cached=cached_count)
+            if cached_count:
+                emit("log", level="info", msg=f"year {year}: skipping {cached_count} already-stored orders")
 
-    # Detail-fetch failures are caught per-order and only logged, so a run that
-    # got bounced part-way through can strip the jar and still exit 0, never
-    # touching an error path. A run that genuinely worked never ends holding
-    # fewer sign-in cookies than it started with, so this is safe to assert.
-    restore("this sync")
+            if not full_details:
+                for i, order in enumerate(new_orders, start=1):
+                    _emit_progress(year, i, new_n, order)
+                    emit("order", data=order_to_dict(order, _ao_mod.__version__))
+                    total += 1
+                continue
 
-    emit("done", count=total, skipped=skipped)
-    return 0
+            # Parallel detail fetches with throttled submission.
+            completed = 0
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {}
+                for order in new_orders:
+                    fut = pool.submit(_fetch_with_retry, api, order, retry_backoff, emit)
+                    futures[fut] = order
+                    if detail_delay > 0:
+                        sleep_for = detail_delay + random.uniform(-detail_jitter, detail_jitter)
+                        if sleep_for > 0:
+                            time.sleep(sleep_for)
+                for fut in as_completed(futures):
+                    completed += 1
+                    original = futures[fut]
+                    fetched = None
+                    try:
+                        fetched = fut.result()
+                    except Exception as e:  # noqa: BLE001
+                        emit("log", level="warn",
+                             msg=f"detail fetch raised for {original.order_number}: {e}")
+                    order = fetched or original
+                    _emit_progress(year, completed, new_n, order)
+                    emit("order", data=order_to_dict(order, _ao_mod.__version__))
+                    total += 1
+
+        emit("done", count=total, skipped=skipped)
+        return 0
+    finally:
+        # Not a list of known failures — the ones that matter are the ones
+        # nobody enumerated. A long full-details sync is interrupted by hand
+        # constantly, and Ctrl-C during `as_completed` unwinds straight past
+        # every explicit call site above, leaving a stripped jar on disk:
+        # this fix's own bug, on its most likely path. Restoring is
+        # idempotent — with nothing to undo it writes nothing and says
+        # nothing — so the backstop costs a no-op on the happy path.
+        guard.restore("this sync")
 
 
 if __name__ == "__main__":

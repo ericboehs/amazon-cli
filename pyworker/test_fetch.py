@@ -8,6 +8,7 @@ decision about when to put the old jar back.
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fetch import (  # noqa: E402
     AUTH_COOKIE_NAMES,
+    JarGuard,
     clear_dead_session,
     jar_cookie_names,
     jar_regressed,
@@ -214,6 +216,56 @@ class ClearDeadSessionTest(unittest.TestCase):
         # reaches the expiry check, so the next run signs in for real.
         _, text, _ = self._clear(GOOD)
         self.assertNotIn("x-main", json.loads(text))
+
+
+class JarGuardTest(unittest.TestCase):
+    def guard(self, text=GOOD):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = Path(d) / "cookies.json"
+        if text is not None:
+            path.write_text(text)
+        return JarGuard(path), path
+
+    def test_it_snapshots_what_was_there(self):
+        guard, _ = self.guard()
+        self.assertEqual(guard.jar_before, GOOD)
+
+    def test_a_first_ever_sync_has_nothing_to_snapshot(self):
+        guard, _ = self.guard(None)
+        self.assertIsNone(guard.jar_before)
+
+    def test_it_restores_a_stripped_jar(self):
+        guard, path = self.guard()
+        path.write_text(BOUNCED)
+        self.assertTrue(silently(lambda: guard.restore("the test")))
+        self.assertEqual(path.read_text(), GOOD)
+
+    def test_clearing_latches_the_session_dead(self):
+        # The interaction that makes the latch necessary rather than tidy: the
+        # rejected path clears, and then the same cleanup every other run gets
+        # would read that as a strip and put `x-main` straight back — finding 1
+        # returning through the door marked "cleanup".
+        guard, path = self.guard()
+        silently(guard.clear)
+        self.assertNotIn("x-main", json.loads(path.read_text()))
+        self.assertFalse(silently(lambda: guard.restore("the test")))
+        self.assertNotIn("x-main", json.loads(path.read_text()))
+
+    def test_the_latch_is_one_way(self):
+        guard, path = self.guard()
+        silently(guard.clear)
+        for _ in range(3):
+            silently(lambda: guard.restore("the test"))
+        self.assertNotIn("x-main", json.loads(path.read_text()))
+
+    def test_restoring_twice_is_a_no_op_the_second_time(self):
+        # `finally` restores on top of the explicit call sites, so a second
+        # restore has to be silent — not a warn line per failure path.
+        guard, path = self.guard()
+        path.write_text(BOUNCED)
+        silently(lambda: guard.restore("the test"))
+        self.assertEqual(emitted(lambda: guard.restore("the test")), [])
 
 
 class WriteJarTest(unittest.TestCase):
