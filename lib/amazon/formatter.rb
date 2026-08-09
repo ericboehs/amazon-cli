@@ -220,8 +220,12 @@ module Amazon
           puts "    #{mark}  #{s["label"]}: #{s["detail"]}#{weight}"
         end
       end
-      puts dim("    Heuristics on a #{analysis["sample_size"]}-review sample, not a verdict. " \
-               "Use --pages 3 for a deeper sample.")
+      deeper = if analysis["exhausted"]
+                 "That is everything Amazon would serve for this listing."
+               else
+                 "Use --pages 3 for a deeper sample."
+               end
+      puts dim("    Heuristics on a #{analysis["sample_size"]}-review sample, not a verdict. #{deeper}")
     end
 
     def level_phrase(analysis)

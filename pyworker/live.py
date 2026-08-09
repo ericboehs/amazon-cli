@@ -313,15 +313,22 @@ def scrape_review_cards(scope: Any) -> list[dict[str, Any]]:
     return out
 
 
-def scrape_reviews(page: Any, asin: str, pages: int = 0, sort: str = "helpful") -> list[dict[str, Any]]:
+def scrape_reviews(
+    page: Any, asin: str, pages: int = 0, sort: str = "helpful"
+) -> tuple[list[dict[str, Any]], bool]:
     """Reviews already on the loaded product page, plus `pages` more from
     /product-reviews/.
 
     Assumes `page` is sitting on the product page. Deduplicates by review id
     because the product page's top reviews reappear on the full listing.
+
+    Returns the reviews and whether the walk got everything it asked for. That
+    second value is what stops the report from telling someone who just ran
+    `--pages 3` to go and run `--pages 3`.
     """
     collected = scrape_review_cards(page)
     seen = {r["id"] for r in collected if r["id"]}
+    walked_all = True
 
     for n in range(1, max(pages, 0) + 1):
         try:
@@ -335,18 +342,31 @@ def scrape_reviews(page: Any, asin: str, pages: int = 0, sort: str = "helpful") 
             # what `--pages 0` would have returned — reporting on it beats
             # discarding a good partial answer over the depth we couldn't get.
             emit("log", level="warn", msg=f"could not load review page {n} ({exc}) — reporting on {len(collected)} from the product page")
+            walked_all = False
             break
         batch = [r for r in scrape_review_cards(page) if not r["id"] or r["id"] not in seen]
         if not batch:
-            # Amazon caps review pagination and serves the last page repeatedly
-            # past the end; stopping here avoids burning loads on duplicates.
-            emit("log", level="info", msg=f"no new reviews on page {n} — stopping")
+            # Amazon serves the same page over again rather than 404ing past the
+            # end, so duplicates are the only "no more" signal there is. It does
+            # the same thing when it simply won't paginate for this session, and
+            # the two are indistinguishable from here — which is why stopping on
+            # page 1 of a product with thousands of ratings is worth saying out
+            # loud rather than logging as routine.
+            walked_all = False
+            if n < pages:
+                emit("log", level="warn", msg=(
+                    f"Amazon served no new reviews past page {n} of the {pages} requested — "
+                    f"analyzing the {len(collected)} it did give up. Either it caps this "
+                    "listing, or it won't paginate reviews for this session."
+                ))
+            else:
+                emit("log", level="info", msg=f"no new reviews on page {n} — stopping")
             break
         seen.update(r["id"] for r in batch if r["id"])
         collected.extend(batch)
         emit("log", level="info", msg=f"review page {n}: +{len(batch)} ({len(collected)} total)")
 
-    return collected
+    return collected, walked_all
 
 
 def _review_id(card: Any) -> str | None:
@@ -436,8 +456,13 @@ def scrape_item(
         # Not "reviews" — that key is already the sitewide rating *count* that
         # `item` and `search` render.
         data["histogram"] = scrape_histogram(page)
-        data["reviews_sample"] = scrape_reviews(page, asin, pages=review_pages, sort=sort)
-        if not data["reviews_sample"]:
+        sample, walked_all = scrape_reviews(page, asin, pages=review_pages, sort=sort)
+        data["reviews_sample"] = sample
+        # Lets the report distinguish "your sample is thin, go deeper" from
+        # "this is everything Amazon will hand over" — advice you can act on
+        # versus advice you have already taken.
+        data["reviews_exhausted"] = not walked_all
+        if not sample:
             emit("log", level="warn", msg=f"no reviews found for {asin}")
 
     return data

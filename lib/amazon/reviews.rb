@@ -80,13 +80,17 @@ module Amazon
         # "reviews" is the sitewide rating count; the sampled review objects
         # live under "reviews_sample".
         reviews = Array(data["reviews_sample"])
+        # Set when the walk asked Amazon for more pages and got nothing back, so
+        # the "go deeper" advice below can stop recommending a flag that has
+        # already been tried and refused.
+        exhausted = data["reviews_exhausted"] ? true : false
         signals = [
           histogram_signal(data["histogram"]),
           unverified_signal(reviews),
-          burst_signal(reviews),
+          burst_signal(reviews, exhausted),
           duplicate_signal(reviews),
           incentivized_signal(reviews),
-          mismatch_signal(data["title"], reviews),
+          mismatch_signal(data["title"], reviews, exhausted),
           repeat_reviewer_signal(reviews)
         ]
         scored = signals.select(&:computable?)
@@ -95,6 +99,7 @@ module Amazon
 
         {
           "sample_size" => reviews.size,
+          "exhausted" => exhausted,
           "score" => score,
           "level" => level_for(score),
           "confidence" => confidence_for(reviews, scored.size, signals.size),
@@ -208,11 +213,11 @@ module Amazon
 
       # Bought reviews arrive in batches, so they bunch into a few days. Needs a
       # deeper sample than one product page provides.
-      def burst_signal(reviews)
+      def burst_signal(reviews, exhausted = false)
         dates = reviews.filter_map { |r| parse_date(r["date"]) }.sort
         if dates.size < BURST_MIN_SAMPLE
           return na(:burst, "Review timing",
-                    "needs #{BURST_MIN_SAMPLE}+ dated reviews (have #{dates.size}) — re-run with --pages 3")
+                    "needs #{BURST_MIN_SAMPLE}+ dated reviews (have #{dates.size})#{deeper_hint(exhausted)}")
         end
 
         best = dates.each_with_index.map { |start, i|
@@ -275,7 +280,7 @@ module Amazon
       # of mowing" vs "Heavy Duty Garden Loppers Steel Blade"), so anything less
       # than a near-total mismatch across a deep sample is noise, and noise here
       # would discredit every other signal in the list.
-      def mismatch_signal(title, reviews)
+      def mismatch_signal(title, reviews, exhausted = false)
         subject = content_words(title).to_set
         bodies = reviews.filter_map do |r|
           words = content_words("#{r["title"]} #{r["body"]}")
@@ -284,7 +289,7 @@ module Amazon
         if subject.size < 3 || bodies.size < MISMATCH_MIN_SAMPLE
           return na(:mismatch, "Reviews match the product",
                     "needs a descriptive title and #{MISMATCH_MIN_SAMPLE}+ reviews with text " \
-                    "(have #{bodies.size}) — re-run with --pages 3")
+                    "(have #{bodies.size})#{deeper_hint(exhausted)}")
         end
 
         unrelated = bodies.count { |b| (b & subject).empty? }
@@ -332,6 +337,13 @@ module Amazon
       end
 
       private
+
+      # Telling someone to run `--pages 3` after they ran `--pages 3` reads as
+      # the tool not listening. When Amazon has stopped handing over reviews,
+      # the honest thing to say is that the sample is as deep as it will get.
+      def deeper_hint(exhausted)
+        exhausted ? " — Amazon served no more for this session" : " — re-run with --pages 3"
+      end
 
       def na(key, label, why)
         Signal.new(key: key, label: label, points: nil, max: 0, detail: why)

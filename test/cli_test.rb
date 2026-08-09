@@ -2082,6 +2082,27 @@ class ReviewsScoringTest < Minitest::Test
                                    'histogram' => { '5' => 58, '4' => 19, '3' => 9, '2' => 5, '1' => 9 })['confidence']
   end
 
+  # Observed on a real 3,706-rating listing: `--pages 3` stopped yielding new
+  # reviews after page 1, and the report answered by advising `--pages 3`.
+  def test_a_thin_sample_advises_going_deeper
+    detail = analyze(reviews: sample(3))['signals']
+                 .find { |s| s['key'] == 'burst' }['detail']
+    assert_includes detail, 're-run with --pages 3'
+  end
+
+  def test_it_stops_advising_a_deeper_walk_once_amazon_has_refused_one
+    detail = analyze(reviews: sample(3), 'reviews_exhausted' => true)['signals']
+                 .find { |s| s['key'] == 'burst' }['detail']
+    refute_includes detail, 're-run with --pages 3'
+    assert_includes detail, 'Amazon served no more for this session'
+  end
+
+  def test_the_mismatch_signal_takes_the_same_advice
+    detail = analyze(reviews: sample(3), 'reviews_exhausted' => true)['signals']
+                 .find { |s| s['key'] == 'mismatch' }['detail']
+    assert_includes detail, 'Amazon served no more for this session'
+  end
+
   def test_handles_a_nil_payload
     result = Amazon::Reviews.analyze(nil)
     assert_equal 0, result['sample_size']
@@ -2289,6 +2310,19 @@ class ReviewsFormatterTest < Minitest::Test
     out = render(data('reviews_sample' => bare), verbatim: true)
     assert_includes out, '?★'
     assert_includes out, 'Terse'
+  end
+
+  # The footer carried the same stale advice as the individual signals: it told
+  # you to go deeper after Amazon had already refused to.
+  def test_the_footer_stops_advising_a_deeper_walk_once_amazon_has_refused_one
+    out = render(data('reviews_exhausted' => true))
+    refute_includes out, 'Use --pages 3'
+    assert_includes out, 'everything Amazon would serve'
+  end
+
+  def test_the_footer_still_advises_a_deeper_walk_on_a_shallow_fetch
+    out = render(data)
+    assert_includes out, 'Use --pages 3'
   end
 
   def test_verbatim_with_no_reviews_prints_no_section
