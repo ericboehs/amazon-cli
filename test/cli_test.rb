@@ -1884,6 +1884,50 @@ class ReviewsUnverifiedSignalTest < Minitest::Test
     assert_includes s['detail'], '8/10'
   end
 
+  def test_a_sample_with_no_verified_badge_anywhere_is_read_as_rot_not_fraud
+    # Amazon renames data hooks routinely, and a renamed badge looks exactly
+    # like a review farm: every card probes clean, so every review reads
+    # unverified. Across a sample this size the renaming is far likelier, and
+    # accusing the listing on the strength of a selector we can't confirm is
+    # the failure mode this whole module is built to avoid.
+    reviews = sample(30).map { |r| r.merge('verified' => false) }
+    s = signal(analyze(reviews: reviews), 'unverified')
+    assert_nil s['points']
+    assert_includes s['detail'], 'badge'
+    refute_includes s['detail'], '30/30'
+  end
+
+  def test_a_single_verified_review_proves_the_badge_still_reads
+    # ...and the signal goes back to work, at full strength.
+    reviews = sample(30).each_with_index.map { |r, i| r.merge('verified' => i.zero?) }
+    s = signal(analyze(reviews: reviews), 'unverified')
+    assert_equal 20, s['points']
+    assert_includes s['detail'], '29/30'
+  end
+
+  def test_a_small_all_unverified_sample_still_scores
+    # The rot reading only becomes the likelier one across a real population.
+    # A handful of unverified reviews is ordinary and must still count.
+    reviews = sample(8).map { |r| r.merge('verified' => false) }
+    assert_equal 20, signal(analyze(reviews: reviews), 'unverified')['points']
+  end
+
+  def test_reviews_whose_badge_could_not_be_read_leave_the_denominator
+    # nil is "the probe never completed", which is not evidence either way.
+    # Counting it as unverified turned a detached card into an accusation.
+    reviews = sample(10).each_with_index.map { |r, i| i < 5 ? r.merge('verified' => nil) : r }
+    s = signal(analyze(reviews: reviews), 'unverified')
+    assert_equal 0, s['points']
+    assert_includes s['detail'], 'all 5 sampled reviews are verified'
+  end
+
+  def test_a_sample_read_thin_by_unknowns_is_not_computable
+    # Seven of ten unreadable leaves three to judge on — below the floor the
+    # signal already refuses to work under.
+    reviews = sample(10).each_with_index.map { |r, i| i < 7 ? r.merge('verified' => nil) : r }
+    assert_nil signal(analyze(reviews: reviews), 'unverified')['points']
+  end
+
   def test_glowing_unverified_reviews_are_called_out
     reviews = sample(10).each_with_index.map { |r, i| r.merge('verified' => i < 5) }
     assert_includes signal(analyze(reviews: reviews), 'unverified')['detail'], '5 of them 4★ or better'

@@ -406,14 +406,24 @@ def _review_id(card: Any) -> str | None:
     return raw.split("-")[-1] if raw else None
 
 
-def _has(scope: Any, *selectors: str) -> bool:
+def _has(scope: Any, *selectors: str) -> bool | None:
+    """True / False / None, where None means "couldn't tell".
+
+    Same contract as _is_sponsored, and for the same reason: this feeds the
+    verified-purchase check, the heaviest signal in the trust model, where a
+    missing badge is read as evidence of a review farm. Returning False for a
+    probe that never completed made a detached card look like an accusation.
+    """
+    probed = 0
     for sel in selectors:
         try:
-            if scope.locator(sel).count() > 0:
-                return True
+            found = scope.locator(sel).count() > 0
         except Exception:  # noqa: BLE001
             continue
-    return False
+        probed += 1
+        if found:
+            return True
+    return False if probed else None
 
 
 def scrape_item(
