@@ -74,6 +74,58 @@ def jar_regressed(before: str | None, after: str | None) -> bool:
     return bool(had - jar_cookie_names(after))
 
 
+def jar_without_auth(raw: str | None) -> str | None:
+    """The jar minus its sign-in cookies, or None when there's nothing to write.
+
+    None covers both "already has none" and "can't be parsed": neither is a jar
+    this can safely rewrite, and the caller's fallback in both cases is to leave
+    the file exactly as it found it.
+    """
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    kept = {k: v for k, v in data.items() if k not in AUTH_COOKIE_NAMES}
+    return json.dumps(kept) if len(kept) != len(data) else None
+
+
+def clear_dead_session(cookies_path: Path) -> bool:
+    """Drop the sign-in cookies Amazon has just told us are dead. True if it wrote.
+
+    The exact inverse of restoring the jar, and the distinction is the whole
+    point. A stripped jar after a *transient* failure is damage to undo. A jar
+    Amazon rejected mid-request is a session that is provably gone, and putting
+    it back leaves `sync.rb`'s `cookies_authenticated?` seeing `x-main` with a
+    live expiry — so every later sync takes the "we already have cookies" branch
+    and posts the literal placeholder `unused-have-cookies` at Amazon's password
+    form. Wedged, permanently, with the fix (`amazon login`) being the one thing
+    the tool has stopped being able to recommend, because it believes it is
+    already logged in.
+
+    Only the auth cookies go. Amazon's anonymous cookies are what the next
+    sign-in continues from; deleting the file turns a re-auth into a
+    fresh-device challenge. `storage_state.json` is deliberately untouched — it
+    is a separate Playwright session that `amazon item` still uses, and it is
+    where `sync.rb` reads session expiry from.
+    """
+    try:
+        if not cookies_path.exists():
+            return False
+        cleared = jar_without_auth(cookies_path.read_text())
+        if cleared is None:
+            return False
+        cookies_path.write_text(cleared)
+        os.chmod(cookies_path, 0o600)
+    except OSError as e:
+        emit("log", level="warn", msg=f"could not clear the dead session's cookies: {e}")
+        return False
+    return True
+
+
 def emit(event: str, **fields: Any) -> None:
     sys.stdout.write(json.dumps({"event": event, **fields}, default=_json_default) + "\n")
     sys.stdout.flush()
@@ -346,14 +398,19 @@ def main() -> int:
             # discovers the session is dead. Its own message tells you to call
             # AmazonSession.login() — useless advice from a CLI.
             if session_rejected(e):
-                restore_jar("the rejected request")
+                # Not a restore. Amazon has just proven these cookies are dead,
+                # and putting them back is what leaves `cookies_authenticated?`
+                # answering yes forever — see `clear_dead_session`.
+                clear_dead_session(cookies_path)
                 emit(
                     "error",
                     kind="not_logged_in",
                     msg=(
                         "Amazon rejected the saved session — it redirected to the "
                         "login page. Cookie expiry can't detect this; the session "
-                        "was invalidated server-side. Run: amazon login"
+                        "was invalidated server-side. The dead sign-in cookies have "
+                        "been cleared so the next run signs in properly. "
+                        "Run: amazon login"
                     ),
                 )
                 return 1
