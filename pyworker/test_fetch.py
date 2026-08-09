@@ -880,6 +880,20 @@ class WorkerRunTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("222", self.kinds(events, "error")[0]["msg"])
 
+    def test_a_config_that_asks_for_no_retries_gets_none(self):
+        # `[]` is an answer, not a missing value. Read as absent it becomes the
+        # three-attempt default: three and a half minutes of sleeping per order,
+        # on the run its owner configured to give up immediately.
+        def get_order(number, clone):
+            raise RuntimeError("503 Service Unavailable")
+
+        with mock.patch.object(fetch.time, "sleep") as slept:
+            code, _, _ = self.run_worker(
+                orders=[FakeOrder("111")], get_order=get_order, retry_backoff=[]
+            )
+        self.assertEqual(code, 1)
+        slept.assert_not_called()
+
     def test_a_partial_run_reports_what_it_did_keep(self):
         # `skipped` was made real so the user could see the shape of a partial
         # run; the run where that matters most was the one that never printed it.
