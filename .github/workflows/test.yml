@@ -38,3 +38,37 @@ jobs:
       # The parsing helpers under test are pure — no Playwright install needed.
       - name: Run live worker parser tests
         run: python -m unittest discover -s pyworker -p 'test_*.py' -v
+
+  # The job above is the fast path, and it runs on a bare interpreter on
+  # purpose: the workers import their dependencies lazily so the tests stay
+  # collectable without them. The cost is that every test asserting something
+  # about amazon-orders itself skips there — `PackageAssumptionsTest` checks
+  # that `x-main` is still the cookie the library authenticates on and that the
+  # exception classes `classify_failure` names still exist, and both of those
+  # skip on the only machine that gates a merge. A dependency bump could rename
+  # a class, silently un-match it, and land green.
+  #
+  # So the same suite runs a second time with the locked dependencies actually
+  # installed. `--frozen` is what makes it meaningful: it resolves to uv.lock,
+  # so the job that fails is the one bumping the lock.
+  python-deps-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install the locked dependencies
+        working-directory: pyworker
+        # --no-install-project: the workers are plain modules run by path, and
+        # building the package adds a toolchain for nothing.
+        run: |
+          python -m pip install --quiet uv
+          uv sync --frozen --no-install-project
+      - name: Run the worker tests against the real packages
+        working-directory: pyworker
+        run: .venv/bin/python -m unittest discover -s . -p 'test_*.py' -v
