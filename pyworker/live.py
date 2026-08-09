@@ -135,6 +135,45 @@ SELLER_SELECTORS = (
     "#buybox .tabular-buybox-text[tabular-attribute-name='Sold by']",
 )
 
+# Amazon's layouts disagree about whether the seller cell holds a name or a
+# sentence: the accordion rows above yield "Amazon.com", while the classic
+# `#merchant-info` block reads "Sold by Amazon Resale and Fulfilled by Amazon."
+# Two callers already assume a name — `formatter.rb` prints it after "Seller:",
+# and `web.rb`'s search does `i['seller'].to_s.downcase.include?(q)`, so a
+# search for "amazon" hits the sentence form and a search for "resale" hits
+# only the sentence form. Same seller, different answer, decided by which A/B
+# layout Amazon served that minute.
+#
+# Neither surviving selector produces the sentence shape on either captured
+# fixture — RealMarkupSellerTest pins both to bare names — so this is a guard
+# on a path nothing takes today. It is here because the shape is not something
+# a selector promises: `#merchant-info` was in this chain one commit ago, and
+# the tabular selector's shape has never been observed at all.
+SELLER_PREFIX_RE = re.compile(r"^(?:ships? from and sold by|sold by)\s+", re.I)
+SELLER_SUFFIX_RE = re.compile(r"\s+and (?:fulfill?ed|shipped) by\b.*$", re.I)
+
+# What a seller name should never still contain once those are stripped:
+# Amazon's own fulfilment wording, so a sentence we *didn't* recognize is
+# reported rather than stored as a name...
+SELLER_PROSE_RE = re.compile(r"\b(?:sold by|ships? from|fulfill?ed by|dispatched from)\b", re.I)
+# ...and CSS punctuation. `CSS_RULE_RE` deliberately leaves a visible selector
+# fragment behind rather than risk eating prose (see browser.py); this is what
+# turns that honest residue into something that actually gets reported.
+SELLER_JUNK_RE = re.compile(r"[{}]|^[.#][\w-]")
+
+
+def normalize_seller(raw: str | None) -> str | None:
+    """Reduce whatever the seller cell held to a bare merchant name.
+
+    Returns None, not "", for nothing at all: `text()` returns None for a chain
+    that matched nothing and `_missing_seller_warning` keys off exactly that.
+    """
+    if not raw:
+        return None
+    val = SELLER_SUFFIX_RE.sub("", SELLER_PREFIX_RE.sub("", raw.strip())).strip()
+    # The trailing period belongs to the sentence, not to the name.
+    return val.rstrip(".").strip() or None
+
 
 def extract_asin(raw: str) -> str | None:
     """Accept a bare ASIN, a /dp/ URL, or a /gp/product/ URL.
@@ -584,7 +623,7 @@ def scrape_item(
         "delivery_raw": delivery_raw,
         "delivery_date": parse_delivery_date(delivery_raw or fastest_raw),
         "fastest_raw": fastest_raw,
-        "seller": text(page, *SELLER_SELECTORS),
+        "seller": normalize_seller(text(page, *SELLER_SELECTORS)),
         "rating": _first_float(rating_raw),
         "reviews": _review_count(reviews_raw),
         "coupon": text(page, "#promoPriceBlockMessage_feature_div", "#couponFeature"),
@@ -751,10 +790,45 @@ def _missing_seller_warning(data: dict[str, Any]) -> str | None:
     )
 
 
+def _seller_shape_warning(data: dict[str, Any]) -> str | None:
+    """Say so when the seller came back as something other than a name.
+
+    The other half of `_missing_seller_warning`: that one covers a chain that
+    matched nothing, this one covers a chain that matched the wrong thing. A
+    non-empty field passes every check we have — the rot threshold counts it as
+    present — so a selector that starts returning its container instead of its
+    cell says nothing at all, and the user reads the result as an answer. This
+    repo has already shipped a seller field that was confidently wrong once.
+    """
+    seller = data.get("seller")
+    if not seller:
+        return None
+    if not SELLER_PROSE_RE.search(seller) and not SELLER_JUNK_RE.search(seller):
+        return None
+    return (
+        f"the seller field does not look like a seller name ({seller!r}) — a "
+        "#buybox selector may now be matching a container rather than the "
+        "merchant cell; treat it as unverified"
+    )
+
+
+# Order is the order they're reported in, live and from cache alike.
+_WARNING_CHECKS = (_selector_rot_warning, _missing_seller_warning, _seller_shape_warning)
+
+
+def _warnings(data: dict[str, Any]) -> list[str]:
+    """Every rot signal the finished payload carries.
+
+    One list read by both the live emitter and `degradations`, so the warning
+    printed while the scrape runs and the one replayed out of the cache cannot
+    drift apart — before this they were two hand-maintained tuples.
+    """
+    return [msg for check in _WARNING_CHECKS if (msg := check(data))]
+
+
 def _warn_selector_rot(data: dict[str, Any]) -> None:
-    for msg in (_selector_rot_warning(data), _missing_seller_warning(data)):
-        if msg:
-            emit("log", level="warn", msg=msg)
+    for msg in _warnings(data):
+        emit("log", level="warn", msg=msg)
 
 
 def degradations(data: dict[str, Any]) -> list[str]:
@@ -771,10 +845,7 @@ def degradations(data: dict[str, Any]) -> list[str]:
     the same string that was emitted, from the same function, so the live
     warning and the replayed one can't drift apart.
     """
-    out = []
-    for msg in (_selector_rot_warning(data), _missing_seller_warning(data)):
-        if msg:
-            out.append(msg)
+    out = _warnings(data)
     # A table we only half-read, which is not the same as a listing with no
     # ratings — plenty of those exist, and calling them degraded cries wolf.
     histogram = data.get("histogram")

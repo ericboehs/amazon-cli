@@ -25,6 +25,7 @@ from browser import (
 from live import (
     SELLER_SELECTORS,
     extract_asin,
+    normalize_seller,
     parse_delivery_date,
     parse_helpful_votes,
     parse_histogram_label,
@@ -321,6 +322,88 @@ class MissingSellerWarningTest(unittest.TestCase):
             "no seller",
             " ".join(degradations(data)),
         )
+
+
+class NormalizeSellerTest(unittest.TestCase):
+    """`seller` has to be a name, because two callers already assume it is.
+
+    `formatter.rb` prints it after "Seller:" and `web.rb` substring-matches the
+    search box against it, so "Sold by Amazon Resale and Fulfilled by Amazon."
+    both reads as scraper output and makes a search for "amazon resale" behave
+    differently depending on which layout Amazon happened to serve.
+    """
+
+    def test_a_bare_name_is_returned_unchanged(self):
+        # Both captured fixtures produce this shape, so this is the case that
+        # actually runs today. Everything below is the guard, not the path.
+        for name in ("Amazon.com", "ELEGOO Official US", "Amazon.com Services LLC"):
+            self.assertEqual(normalize_seller(name), name)
+
+    def test_the_classic_merchant_info_sentence_is_reduced_to_the_name(self):
+        # Verbatim from #merchant-info on B0DT8PV51T's used-offer row.
+        self.assertEqual(
+            normalize_seller("Sold by Amazon Resale and Fulfilled by Amazon."),
+            "Amazon Resale",
+        )
+
+    def test_the_fulfiller_prefix_is_dropped_too(self):
+        self.assertEqual(
+            normalize_seller("Ships from and sold by Amazon.com."), "Amazon.com"
+        )
+
+    def test_a_name_containing_by_is_not_mistaken_for_prose(self):
+        # The reason the prefix pattern is anchored and the suffix pattern
+        # requires Amazon's own wording: "by" is a perfectly ordinary word in a
+        # store name, and a looser rule would truncate this to "Books".
+        self.assertEqual(normalize_seller("Books by Bob"), "Books by Bob")
+
+    def test_nothing_is_still_nothing(self):
+        # Not "" — `text()` returns None for a chain that matched nothing, and
+        # _missing_seller_warning keys off exactly that.
+        self.assertIsNone(normalize_seller(None))
+        self.assertIsNone(normalize_seller("   "))
+
+
+class SellerShapeWarningTest(unittest.TestCase):
+    """A seller that came back as something other than a name.
+
+    Distinct from the missing-seller warning: this one fires when the chain
+    *did* match, which is the case that otherwise passes every check we have —
+    the field is non-empty, so the rot threshold counts it as present.
+    """
+
+    # The exact string the whole merchant-info container yields when a selector
+    # matches the block instead of the cell inside it — the shape that made
+    # `Seller: Ships from Amazon` in the first place.
+    CONTAINER = "Ships from Amazon.com Sold by ELEGOO Official US"
+
+    def test_prose_that_normalization_did_not_recognize_is_announced(self):
+        data = dict(SelectorRotTest.FULL, seller=self.CONTAINER)
+        msgs = [e["msg"] for e in emitted(lambda: _warn_selector_rot(data))]
+        self.assertTrue([m for m in msgs if "does not look like a seller name" in m], msgs)
+
+    def test_the_offending_value_is_quoted_back(self):
+        # A rot warning that doesn't say what it saw can't be acted on.
+        data = dict(SelectorRotTest.FULL, seller=self.CONTAINER)
+        msgs = [e["msg"] for e in emitted(lambda: _warn_selector_rot(data))]
+        self.assertTrue([m for m in msgs if self.CONTAINER in m], msgs)
+
+    def test_leftover_css_is_caught(self):
+        # CSS_RULE_RE deliberately leaves a visible ".a," behind rather than
+        # risk eating prose (browser.py). This is what makes that residue
+        # visible instead of merely honest.
+        data = dict(SelectorRotTest.FULL, seller=".a-section, ELEGOO Official US")
+        msgs = [e["msg"] for e in emitted(lambda: _warn_selector_rot(data))]
+        self.assertTrue([m for m in msgs if "does not look like a seller name" in m], msgs)
+
+    def test_a_plain_name_says_nothing(self):
+        for name in ("Amazon.com", "ELEGOO Official US", "Books by Bob"):
+            data = dict(SelectorRotTest.FULL, seller=name)
+            self.assertEqual(emitted(lambda: _warn_selector_rot(data)), [], name)
+
+    def test_it_survives_the_cache(self):
+        data = dict(SelectorRotTest.FULL, seller="Ships from and sold by Widgets Ltd")
+        self.assertIn("does not look like a seller name", " ".join(degradations(data)))
 
 
 class DegradationsTest(unittest.TestCase):
@@ -1255,6 +1338,16 @@ class RealMarkupSellerTest(unittest.TestCase):
         # Resale"; reporting that would be the original bug.
         page = DomPage.from_fixture("buybox_third_party.html")
         self.assertEqual(text(page, *SELLER_SELECTORS), "ELEGOO Official US")
+
+    def test_normalization_is_a_no_op_on_both_captured_layouts(self):
+        # The claim the SELLER_PREFIX_RE comment makes, kept honest: on the
+        # markup Amazon actually serves through these two selectors the cell is
+        # already a bare name, so normalize_seller is a guard against a shape no
+        # current path produces. If this ever starts failing, the guard has
+        # become load-bearing and the comment above it is out of date.
+        for name in ("buybox_amazon_sold.html", "buybox_third_party.html"):
+            raw = text(DomPage.from_fixture(name), *SELLER_SELECTORS)
+            self.assertEqual(normalize_seller(raw), raw, name)
 
     def test_the_used_offer_block_lives_inside_the_buybox(self):
         # The fact that motivates every selector below the first, and the one
