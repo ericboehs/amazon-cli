@@ -1162,6 +1162,27 @@ class WorkerProtocolTest < Minitest::Test
     end
   end
 
+  # -q is documented as suppressing *non-essential* output, and a warning that
+  # the data you are reading is incomplete is the essential case. Pinned as a
+  # test because the opposite reading is the tempting one: `quiet:` used to be
+  # passed in here and did nothing, so the obvious tidy-up was to wire it into
+  # log_event — which would have re-hidden exactly the warning this path exists
+  # to surface.
+  def test_quiet_does_not_suppress_a_worker_warning
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'log', level: 'warn', msg: "4/6 expected fields were empty"}.to_json)
+      puts({event: 'log', level: 'info', msg: 'fetching B1'}.to_json)
+      puts({event: 'item', data: { 'asin' => 'B1' }}.to_json)
+      puts({event: 'done', count: 1}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      _, err = capture_io_streams { worker(quiet: true).item('B1') }
+      assert_includes err, '[worker:warn] 4/6 expected fields were empty'
+      refute_includes err, 'fetching B1'
+    end
+  end
+
   def test_search_warnings_reach_stderr_without_verbose
     body = <<~SCRIPT
       STDIN.gets

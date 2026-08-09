@@ -48,7 +48,7 @@ module Amazon
         end
 
         Amazon::Config.load
-        worker = Amazon::Worker.new(verbose: @global.verbose, quiet: @global.quiet)
+        worker = Amazon::Worker.new(verbose: @global.verbose)
         cache = Amazon::Cache.new("search", read: !fresh)
         results = cache.fetch([query, limit].join(" ")) { worker.search(query, limit: limit) }
 

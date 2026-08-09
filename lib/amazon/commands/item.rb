@@ -43,7 +43,7 @@ module Amazon
         end
 
         Amazon::Config.load
-        worker = Amazon::Worker.new(verbose: @global.verbose, quiet: @global.quiet)
+        worker = Amazon::Worker.new(verbose: @global.verbose)
         # Separate cache namespaces: a plain lookup and a --reviews lookup return
         # different payloads, so one must never be served from the other's entry.
         cache = Amazon::Cache.new(reviews ? "item-reviews" : "item", read: !fresh)
