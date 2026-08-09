@@ -1327,6 +1327,28 @@ class WorkerProtocolTest < Minitest::Test
     end
   end
 
+  # `fetch.py` captures a full traceback on its error paths and puts it on the
+  # event as `trace`. Nothing read it — `sync` takes `msg`, `live_error` takes
+  # `kind` and `msg` — so the stack naming which parser broke was serialized,
+  # piped, parsed and dropped, at every verbosity: -v wasn't even an escape
+  # hatch. A diagnostic that exists but cannot be reached is worse than none,
+  # because the next person to debug this assumes it was never captured.
+  def test_an_error_events_traceback_is_not_thrown_away
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error',
+            msg: "history fetch failed for 2024: 'NoneType' object has no attribute 'text'",
+            trace: "Traceback (most recent call last):\\n  File \\"orders.py\\", line 91\\nAttributeError"}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      _, err = capture_io_streams do
+        assert_raises(Amazon::Worker::Error) { worker.search('q') }
+      end
+      assert_includes err, '[worker:trace] Traceback (most recent call last):'
+      assert_includes err, '[worker:trace]   File "orders.py", line 91'
+    end
+  end
+
   def test_item_reads_the_item_event
     body = <<~SCRIPT
       STDIN.gets
