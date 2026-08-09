@@ -152,24 +152,37 @@ module Amazon
       # A genuine product's ratings are J-shaped: a 5-star pile, a real 1-star
       # tail, and a thin middle. A wall of 5s with *neither* a middle nor a tail
       # is the shape review farms produce, because nobody buys 2-star reviews.
+      #
+      # Calibrated against real listings, not intuition. Four unrelated and
+      # apparently legitimate products — including a 30k-rating Anker charger —
+      # all sat at 79-83% five-star with a 13-18% middle and a 3-4% one-star
+      # tail. That is simply the Amazon baseline for consumer goods, so a
+      # threshold anywhere near it fires on everything and teaches the reader
+      # to ignore the whole report. Only a shape well past the baseline scores.
       def histogram_signal(histogram)
         pct = normalize_histogram(histogram)
         return na(:histogram, "Rating distribution", "Amazon didn't render the star histogram") if pct.empty?
 
         five = pct[5].to_i
         middle = pct[2].to_i + pct[3].to_i + pct[4].to_i
+        tail = pct[1].to_i
         points = 0
-        points += 12 if five >= 90
-        points += 7 if five >= 80 && five < 90
-        points += 8 if middle <= 5
-        points += 4 if middle > 5 && middle <= 10
+        points += 12 if five >= 95
+        points += 7 if five >= 90 && five < 95
+        points += 8 if middle <= 3
+        points += 4 if middle > 3 && middle <= 7
+        # The missing tail is the real giveaway. Farms buy 5s and nobody buys
+        # 2s, so a product with this many delighted buyers and no duds at all
+        # is a shape organic sales don't produce.
+        points += 5 if five >= 85 && tail <= 1
         points = [points, 20].min
 
         detail =
           if points.zero?
-            "#{five}% five-star with a #{middle}% middle — a normal spread"
+            "#{five}% five-star, #{middle}% two-to-four-star, #{tail}% one-star — a normal spread"
           else
-            "#{five}% five-star and only #{middle}% two-to-four-star; organic ratings keep a fatter middle"
+            "#{five}% five-star with only #{middle}% two-to-four-star and a #{tail}% one-star tail; " \
+              "organic ratings keep a fatter middle"
           end
         Signal.new(key: :histogram, label: "Rating distribution", points: points, max: 20, detail: detail)
       end

@@ -55,7 +55,17 @@ module Amazon
         # Analysis runs on the whole sample; --critical narrows only what gets
         # printed. Scoring a hand-picked subset would be meaningless.
         analysis = Amazon::Reviews.analyze(data)
-        data = data.merge("reviews_sample" => critical_only(data)) if critical
+        if critical
+          kept = critical_only(data)
+          # Amazon's product-page sample skews to helpful-and-positive, so a
+          # listing with plenty of 1-3 star ratings can still have none of them
+          # here. Printing nothing would read as "no complaints exist".
+          if kept.empty? && !@global.json
+            warn "amazon: no 1-3 star reviews in this #{Array(data["reviews_sample"]).size}-review sample" \
+                 " — Amazon's product-page picks skew positive; try --pages 3 --sort recent"
+          end
+          data = data.merge("reviews_sample" => kept)
+        end
         Amazon::Formatter.new(json: @global.json).reviews(data, analysis, verbatim: verbatim, limit: limit)
         0
       end
