@@ -22,6 +22,7 @@ $XDG_DATA_HOME/amazon/cache/ so subsequent runs skip 2FA.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import random
@@ -74,6 +75,35 @@ def jar_regressed(before: str | None, after: str | None) -> bool:
     return bool(had - jar_cookie_names(after))
 
 
+def write_jar(cookies_path: Path, content: str) -> None:
+    """Replace the jar with `content`, atomically and never world-readable.
+
+    Both writers here exist to stop a bad jar reaching disk, so neither can
+    afford to be a way one gets there. `write_text` truncates first: a crash
+    between truncate and write leaves a half-written jar, and the damage then
+    surfaces on some later command as unparseable JSON, pointing at the reader
+    rather than at the run that broke it. chmod-after-write has the same shape
+    in the other dimension — the file is briefly 0644 with live session cookies
+    in it, on a path any local process can read.
+
+    Writing a private temp file and renaming it over the target closes both:
+    `os.replace` is atomic, so a reader sees the old jar or the new one, and the
+    mode is set before the content is reachable under the real name.
+    """
+    tmp = cookies_path.with_name(cookies_path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, cookies_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def jar_without_auth(raw: str | None) -> str | None:
     """The jar minus its sign-in cookies, or None when there's nothing to write.
 
@@ -118,8 +148,7 @@ def clear_dead_session(cookies_path: Path) -> bool:
         cleared = jar_without_auth(cookies_path.read_text())
         if cleared is None:
             return False
-        cookies_path.write_text(cleared)
-        os.chmod(cookies_path, 0o600)
+        write_jar(cookies_path, cleared)
     except OSError as e:
         emit("log", level="warn", msg=f"could not clear the dead session's cookies: {e}")
         return False
@@ -140,8 +169,7 @@ def restore_jar(cookies_path: Path, jar_before: str | None, reason: str) -> bool
         after = cookies_path.read_text() if cookies_path.exists() else None
         if not jar_regressed(jar_before, after):
             return False
-        cookies_path.write_text(jar_before)
-        os.chmod(cookies_path, 0o600)
+        write_jar(cookies_path, jar_before)
     except OSError as e:
         emit("log", level="warn", msg=f"could not restore the cookie jar: {e}")
         return False
