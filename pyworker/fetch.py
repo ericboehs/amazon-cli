@@ -23,6 +23,7 @@ $XDG_DATA_HOME/amazon/cache/ so subsequent runs skip 2FA.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import random
@@ -239,9 +240,18 @@ def restore_jar(cookies_path: Path, jar_before: str | None, reason: str) -> bool
 class JarGuard:
     """Owns the cookie jar for the length of one sync.
 
-    It holds three things that have to stay together: the pre-run snapshot, the
-    write-back that undoes damage, and a one-way latch saying Amazon has
-    declared this session dead.
+    Owns, exclusively: everything below assumes the file only changes because
+    of this run. Two syncs at once — a cron job and a hand-run one, which is
+    the ordinary way this happens — each snapshot the jar and each write their
+    snapshot back, so the one that finishes second reverts the other's work.
+    The claim is an `flock` on a sidecar, taken before the snapshot and held to
+    the end of the run; a run that can't take it does nothing at all. The lock
+    can't outlive the process that took it, so a killed sync leaves nothing to
+    clean up.
+
+    It holds three more things that have to stay together: the pre-run
+    snapshot, the write-back that undoes damage, and a one-way latch saying
+    Amazon has declared this session dead.
 
     The latch is the part that isn't optional. Restoring and clearing are exact
     opposites, and the run that clears is followed by the same cleanup as every
@@ -255,9 +265,45 @@ class JarGuard:
     def __init__(self, cookies_path: Path) -> None:
         self.cookies_path = cookies_path
         self.dead = False
-        # Read before amazon-orders can touch the file. Held in memory only,
-        # and written back solely to the file it came from.
-        self.jar_before = self._snapshot()
+        self._lock_fd: int | None = None
+        self.locked = self._claim()
+        # Read under the claim, before amazon-orders can touch the file. Held
+        # in memory only, and written back solely to the file it came from.
+        self.jar_before = self._snapshot() if self.locked else None
+
+    def _claim(self) -> bool:
+        """Whether this run owns the jar. False only when another run does.
+
+        The lock lives on a sidecar rather than on the jar itself: `write_jar`
+        replaces the file by rename, so a lock held on the jar's inode would
+        stop being the lock the next process finds.
+        """
+        lock_path = self.cookies_path.with_name(self.cookies_path.name + ".lock")
+        try:
+            fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        except OSError as e:
+            # Not being able to check is not a reason to refuse to sync. Say
+            # the check is off and carry on: the collision it guards against is
+            # rare, and a sync that won't run is a certainty.
+            emit("log", level="warn", msg=(
+                f"cannot open {lock_path} ({e}) — two syncs at once would race "
+                "over the cookie jar"
+            ))
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._lock_fd = fd
+        return True
+
+    def close(self) -> None:
+        """Drop the claim. Idempotent; the OS would do it at exit anyway."""
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)  # releases the flock
+            self._lock_fd = None
+        self.locked = False
 
     def resnapshot(self) -> None:
         """Start protecting the jar as it stands now.
@@ -294,12 +340,14 @@ class JarGuard:
 
     def restore(self, reason: str) -> bool:
         """Undo a strip, unless Amazon has told us there's nothing worth undoing."""
-        if self.dead:
+        if self.dead or not self.locked:
             return False
         return restore_jar(self.cookies_path, self.jar_before, reason)
 
     def clear(self) -> bool:
         """Latch the session dead and drop its cookies. Never reversible."""
+        if not self.locked:
+            return False
         self.dead = True
         return clear_dead_session(self.cookies_path)
 
@@ -504,6 +552,12 @@ def main() -> int:
 
     cookies_path = cache_dir / "cookies.json"
     guard = JarGuard(cookies_path)
+    if not guard.locked:
+        emit("error", msg=(
+            "another `amazon order sync` is already running — it owns the cookie "
+            f"jar at {cookies_path}. Nothing was fetched. Wait for it to finish "
+            "and try again."))
+        return 1
 
     config = AmazonOrdersConfig(
         config_path=str(config_dir / "amazon-orders.yml"),
@@ -651,6 +705,7 @@ def main() -> int:
         # idempotent — with nothing to undo it writes nothing and says
         # nothing — so the backstop costs a no-op on the happy path.
         guard.restore("this sync")
+        guard.close()
 
 
 if __name__ == "__main__":
