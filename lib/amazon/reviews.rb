@@ -24,8 +24,12 @@ module Amazon
       end
     end
 
-    # Below this many sampled reviews, the per-review signals are noise: one
-    # coincidence in a sample of five swings the score by 20 points.
+    # Below this many sampled reviews, the per-review signals are noise. The
+    # three checks gated here are the share-based ones, and at a sample of five
+    # a single coincidence carries most of their range: two shoppers who happen
+    # to share a first name take the repeat-reviewer check straight to its full
+    # 5/5, and one review mentioning a free unit takes the compensation check to
+    # 7 of 10.
     MIN_SAMPLE = 5
     BURST_MIN_SAMPLE = 15
     BURST_WINDOW_DAYS = 7
@@ -72,7 +76,7 @@ module Amazon
     ].to_set
 
     WORD_RE = /[a-z][a-z'-]*/
-    # Anything shorter carries no topical meaning, and the stoplist below can't
+    # Anything shorter carries no topical meaning, and the stoplist above can't
     # be relied on to catch them all.
     MIN_WORD_LENGTH = 3
     # Splits a body into clauses. Digits count as breaks, not just punctuation:

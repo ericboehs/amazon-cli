@@ -109,7 +109,8 @@ module Amazon
           not be run on the sample available. It is a research aid, not a verdict.
 
           By default only the ~8 reviews on the product page are sampled, which
-          is too thin for the timing and duplicate checks. Use --pages for those.
+          is too thin for the timing check (needs 15 dated reviews) and the
+          product-match check (needs 25 with text). Use --pages for those.
 
           Options:
             --pages N    Also walk N pages of the full review listing (~10 each,
