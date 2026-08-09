@@ -563,6 +563,13 @@ def scrape_item(
         if not sample:
             emit("log", level="warn", msg=f"no reviews found for {asin}")
 
+    # Last, so it sees the finished payload. Omitted when whole, to keep the
+    # key's absence meaning "nothing to report" rather than padding every
+    # --json result with an empty list.
+    degraded = degradations(data)
+    if degraded:
+        data["_degraded"] = degraded
+
     return data
 
 
@@ -658,17 +665,52 @@ EXPECTED_ITEM_FIELDS = ("price", "availability", "delivery_raw", "seller", "rati
 ROT_THRESHOLD = 3
 
 
-def _warn_selector_rot(data: dict[str, Any]) -> None:
+def _selector_rot_warning(data: dict[str, Any]) -> str | None:
     missing = [f for f in EXPECTED_ITEM_FIELDS if not data.get(f)]
-    if len(missing) >= ROT_THRESHOLD:
-        emit(
-            "log",
-            level="warn",
-            msg=(
-                f"{len(missing)}/{len(EXPECTED_ITEM_FIELDS)} expected fields were empty "
-                f"({', '.join(missing)}) — Amazon's markup may have changed"
-            ),
+    if len(missing) < ROT_THRESHOLD:
+        return None
+    return (
+        f"{len(missing)}/{len(EXPECTED_ITEM_FIELDS)} expected fields were empty "
+        f"({', '.join(missing)}) — Amazon's markup may have changed"
+    )
+
+
+def _warn_selector_rot(data: dict[str, Any]) -> None:
+    msg = _selector_rot_warning(data)
+    if msg:
+        emit("log", level="warn", msg=msg)
+
+
+def degradations(data: dict[str, Any]) -> list[str]:
+    """Ways this scrape came back less than whole, recorded on the payload.
+
+    Every one of these is already announced live while the scrape runs — and
+    then the result is written to the cache for the TTL. Every run after that
+    renders the same partial data with none of the warnings that came with it,
+    so the run that looks clean is the run where the user has no way of knowing
+    it isn't. Reading them back off the payload is what closes that.
+
+    Derived from the finished payload rather than accumulated as we go, so it
+    cannot disagree with what was actually returned. The selector-rot line is
+    the same string that was emitted, from the same function, so the live
+    warning and the replayed one can't drift apart.
+    """
+    out = []
+    rot = _selector_rot_warning(data)
+    if rot:
+        out.append(rot)
+    # A table we only half-read, which is not the same as a listing with no
+    # ratings — plenty of those exist, and calling them degraded cries wolf.
+    histogram = data.get("histogram")
+    if histogram and len(histogram) < STAR_ROWS:
+        out.append(
+            f"read only {len(histogram)} of {STAR_ROWS} star rows from the rating histogram"
         )
+    # `in` rather than truthiness: `amazon item` without --reviews has no
+    # sample by design, and that is not a scrape that came back short.
+    if "reviews_sample" in data and not data["reviews_sample"]:
+        out.append("no reviews were found for this listing")
+    return out
 
 
 def main() -> int:

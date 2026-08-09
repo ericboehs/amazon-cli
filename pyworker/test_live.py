@@ -38,6 +38,7 @@ from live import (
     _review_count,
     _review_id,
     _warn_selector_rot,
+    degradations,
 )
 
 
@@ -272,6 +273,44 @@ class SelectorRotTest(unittest.TestCase):
         events = emitted(lambda: _warn_selector_rot({}))
         self.assertEqual(len(events), 1)
         self.assertIn("6/6", events[0]["msg"])
+
+
+class DegradationsTest(unittest.TestCase):
+    """What a partial scrape has to carry with it into the cache.
+
+    Every one of these is announced live while the scrape runs, and then the
+    result is written to disk for the TTL. Every run after that renders the
+    same partial data with none of the warnings — so the run that looks clean
+    is the run where the user has no way of knowing it isn't.
+    """
+
+    def test_a_whole_scrape_records_nothing(self):
+        data = dict(SelectorRotTest.FULL, histogram={str(s): 20 for s in range(1, 6)})
+        self.assertEqual(degradations(data), [])
+
+    def test_selector_rot_is_recorded_in_the_same_words_it_was_announced_in(self):
+        data = dict(SelectorRotTest.FULL, seller=None, rating=None, image=None)
+        announced = emitted(lambda: _warn_selector_rot(dict(data)))
+        self.assertEqual(degradations(data), [announced[0]["msg"]])
+
+    def test_a_half_read_histogram_is_recorded(self):
+        data = dict(SelectorRotTest.FULL, histogram={"5": 79, "4": 10})
+        self.assertEqual(len(degradations(data)), 1)
+        self.assertIn("2 of 5", degradations(data)[0])
+
+    def test_a_listing_with_no_histogram_at_all_is_ordinary(self):
+        # Distinct from a table we half-read: plenty of listings have no
+        # ratings, and calling that degraded would cry wolf on every one.
+        self.assertEqual(degradations(dict(SelectorRotTest.FULL, histogram={})), [])
+
+    def test_an_empty_review_sample_is_recorded(self):
+        data = dict(SelectorRotTest.FULL, reviews_sample=[])
+        self.assertEqual(len(degradations(data)), 1)
+        self.assertIn("no reviews", degradations(data)[0])
+
+    def test_reviews_that_were_never_asked_for_are_not_missing(self):
+        # `amazon item` without --reviews has no sample by design.
+        self.assertEqual(degradations(dict(SelectorRotTest.FULL)), [])
 
 
 class GuardTest(unittest.TestCase):
