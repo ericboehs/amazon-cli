@@ -591,7 +591,12 @@ def main() -> int:
     # Rate-limit knobs (seconds). Conservative defaults so Amazon doesn't 503.
     detail_delay = float(req.get("detail_delay", 0.05))
     detail_jitter = float(req.get("detail_jitter", 0.05))
-    retry_backoff = [float(x) for x in (req.get("retry_backoff") or [30, 60, 120])]
+    # `or` would read an explicit `[]` — a config saying "don't retry" — as
+    # absent and hand back the three-attempt default, which is over three
+    # minutes of sleeping per order the user asked not to wait on.
+    raw_backoff = req.get("retry_backoff")
+    retry_backoff = ([float(x) for x in raw_backoff] if isinstance(raw_backoff, list)
+                     else [30.0, 60.0, 120.0])
     workers = int(req.get("workers", 7))
 
     if not email or not password:
