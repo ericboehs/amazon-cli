@@ -768,6 +768,56 @@ class ScrapeReviewsPaginationFailureTest(unittest.TestCase):
         self.assertFalse(walked_all)
 
 
+class ScrapeReviewsSessionFailureTest(unittest.TestCase):
+    """A captcha or a dead session mid-walk must not be reported as a result.
+
+    Both subclass RuntimeError, so the blanket `except Exception` around the
+    pagination leg used to swallow them: the walk degraded to the product-page
+    sample, the top-level handlers never emitted kind:"blocked"/"not_logged_in",
+    and the user got a complete-looking fraud report built on ~8 reviews with
+    exit 0 and no way to learn that `amazon login` was the fix. guard()'s own
+    contract is to fail closed rather than scrape a robot check as a product;
+    catching it one level up reopened exactly that hole.
+    """
+
+    class Page:
+        def __init__(self, exc):
+            self._exc = exc
+
+        def locator(self, sel):
+            if sel == "[data-hook=review], [data-hook=cmps-review]":
+                return FakeCardList([
+                    FakeScope(
+                        {"[data-hook=reviewTitle]": FakeTextLocator(text="Works great")},
+                        attrs={"id": "customer_review-R1"},
+                    )
+                ])
+            return FakeTextLocator(count=0)
+
+        def goto(self, *_a, **_kw):
+            raise self._exc
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    def test_a_captcha_mid_walk_propagates(self):
+        with self.assertRaises(Blocked):
+            scrape_reviews(self.Page(Blocked("captcha")), "B0TEST00001", pages=3)
+
+    def test_an_expired_session_mid_walk_propagates(self):
+        with self.assertRaises(NotLoggedIn):
+            scrape_reviews(self.Page(NotLoggedIn("session expired")), "B0TEST00001", pages=3)
+
+    def test_a_transport_failure_still_degrades_to_the_sample_in_hand(self):
+        # The distinction that matters: a page that wouldn't load costs us depth
+        # we can report around; a session that is gone costs us the answer.
+        got, walked_all = scrape_reviews(
+            self.Page(RuntimeError("net::ERR_CONNECTION_RESET")), "B0TEST00001", pages=3
+        )
+        self.assertEqual(len(got), 1)
+        self.assertFalse(walked_all)
+
+
 class ScrapeReviewsDepthTest(unittest.TestCase):
     """Whether the walk got everything it asked Amazon for."""
 
