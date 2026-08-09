@@ -33,11 +33,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from amazonorders.conf import AmazonOrdersConfig
-from amazonorders.session import AmazonSession, IODefault
-from amazonorders.orders import AmazonOrders
-
 from browser import session_rejected
+
+# amazon-orders is imported inside `main()`, not here. CI runs the pyworker
+# tests on a bare interpreter with no dependency install, so anything imported
+# at module scope has to exist in an empty environment or the whole test file
+# becomes uncollectable — `live.py` defers playwright for the same reason. The
+# cost is confined to `main()`, which cannot run without the package anyway.
 
 # Cookies Amazon only sets for a signed-in session. amazon-orders rewrites the
 # whole jar after every request (session.py:213), so when Amazon bounces a
@@ -83,8 +85,13 @@ def _json_default(obj: Any) -> Any:
     raise TypeError(f"not serializable: {type(obj).__name__}")
 
 
-class WorkerIO(IODefault):
-    """Bridge amazon-orders prompts to the Ruby parent over stdin/stdout."""
+class WorkerIO:
+    """Bridge amazon-orders prompts to the Ruby parent over stdin/stdout.
+
+    `IODefault` is the natural base and is bolted on by `worker_io()` instead of
+    in this class statement, because a base class is resolved at import time and
+    that is the one thing this module must not need amazon-orders for.
+    """
 
     def echo(self, msg: str, **kwargs: Any) -> None:
         emit("log", level="info", msg=str(msg))
@@ -102,6 +109,20 @@ class WorkerIO(IODefault):
         if not line:
             raise EOFError("parent closed stdin while prompting")
         return line.rstrip("\n")
+
+
+def worker_io() -> Any:
+    """A `WorkerIO` that amazon-orders will accept.
+
+    Inherits rather than duck-types because amazon-orders calls IO methods this
+    module doesn't override, and `IODefault` is where their defaults live.
+    """
+    from amazonorders.session import IODefault
+
+    class _WorkerIO(WorkerIO, IODefault):
+        pass
+
+    return _WorkerIO()
 
 
 def xdg_path(env: str, default_subpath: str) -> Path:
@@ -216,6 +237,15 @@ def main() -> int:
         emit("error", msg=f"unsupported action: {action!r}")
         return 2
 
+    try:
+        import amazonorders as _ao_mod
+        from amazonorders.conf import AmazonOrdersConfig
+        from amazonorders.orders import AmazonOrders
+        from amazonorders.session import AmazonSession
+    except ImportError as e:
+        emit("error", msg=f"amazon-orders not installed: {e}")
+        return 2
+
     email = req.get("email")
     password = req.get("password")
     years = req.get("years") or [date.today().year]
@@ -290,7 +320,7 @@ def main() -> int:
     session = AmazonSession(
         username=email,
         password=password,
-        io=WorkerIO(),
+        io=worker_io(),
         config=config,
         otp_secret_key=otp_secret,
     )
@@ -303,8 +333,6 @@ def main() -> int:
         return 1
 
     api = AmazonOrders(session, config=config)
-
-    import amazonorders as _ao_mod
 
     total = 0
     skipped = 0
