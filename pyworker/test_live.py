@@ -22,10 +22,20 @@ from browser import (
 from live import (
     extract_asin,
     parse_delivery_date,
+    parse_helpful_votes,
+    parse_histogram_label,
+    parse_review_country,
+    parse_review_date,
+    reviews_url,
+    scrape_histogram,
+    scrape_review_cards,
+    strip_star_prefix,
     _first_float,
     _first_int,
+    _has,
     _is_sponsored,
     _review_count,
+    _review_id,
     _warn_selector_rot,
 )
 
@@ -332,3 +342,310 @@ class SessionRejectedTest(unittest.TestCase):
         self.assertFalse(session_rejected(Exception("connection reset by peer")))
         self.assertFalse(session_rejected(Exception("503 Service Unavailable")))
         self.assertFalse(session_rejected(Exception("")))
+
+
+# --- review scraping ---------------------------------------------------
+
+
+class FakeTextLocator:
+    """Stand-in for a Playwright locator that also yields text and attributes."""
+
+    def __init__(self, count=1, text="", attrs=None, raises=False):
+        self._count = count
+        self._text = text
+        self._attrs = attrs or {}
+        self._raises = raises
+
+    @property
+    def first(self):
+        return self
+
+    def nth(self, _i):
+        return self
+
+    def count(self):
+        if self._raises:
+            raise RuntimeError("execution context was destroyed")
+        return self._count
+
+    def inner_text(self):
+        if self._raises:
+            raise RuntimeError("execution context was destroyed")
+        return self._text
+
+    def get_attribute(self, name):
+        if self._raises:
+            raise RuntimeError("execution context was destroyed")
+        return self._attrs.get(name)
+
+
+class FakeScope:
+    """selector -> FakeTextLocator. Unknown selectors match nothing."""
+
+    def __init__(self, mapping=None, attrs=None, raises=False):
+        self._mapping = mapping or {}
+        self._attrs = attrs or {}
+        self._raises = raises
+
+    def locator(self, sel):
+        if self._raises:
+            raise RuntimeError("detached")
+        found = self._mapping.get(sel)
+        if found is None:
+            return FakeTextLocator(count=0)
+        return found
+
+    def get_attribute(self, name):
+        return self._attrs.get(name)
+
+
+class FakeCardList:
+    """A locator standing in for N review cards."""
+
+    def __init__(self, cards):
+        self._cards = cards
+
+    def count(self):
+        return len(self._cards)
+
+    def nth(self, i):
+        return self._cards[i]
+
+
+class ParseReviewDateTest(unittest.TestCase):
+    def test_us_ordering(self):
+        self.assertEqual(
+            parse_review_date("Reviewed in the United States on July 26, 2025"), "2025-07-26"
+        )
+
+    def test_international_day_first_ordering(self):
+        # Must not be read as month-first; there is no 26th month.
+        self.assertEqual(parse_review_date("Reviewed in Canada on 26 July 2025"), "2025-07-26")
+
+    def test_abbreviated_month(self):
+        self.assertEqual(parse_review_date("Reviewed on Jan 3, 2026"), "2026-01-03")
+
+    def test_impossible_date_is_rejected_not_clamped(self):
+        self.assertIsNone(parse_review_date("Reviewed on February 30, 2025"))
+
+    def test_no_date_and_empty(self):
+        self.assertIsNone(parse_review_date("Reviewed in the United States"))
+        self.assertIsNone(parse_review_date(""))
+        self.assertIsNone(parse_review_date(None))
+
+
+class ParseReviewCountryTest(unittest.TestCase):
+    def test_strips_leading_article(self):
+        self.assertEqual(
+            parse_review_country("Reviewed in the United States on July 26, 2025"),
+            "United States",
+        )
+
+    def test_plain_country(self):
+        self.assertEqual(parse_review_country("Reviewed in Canada on 26 July 2025"), "Canada")
+
+    def test_unparseable(self):
+        self.assertIsNone(parse_review_country("Top review from the United States"))
+        self.assertIsNone(parse_review_country(""))
+        self.assertIsNone(parse_review_country(None))
+
+
+class ParseHelpfulVotesTest(unittest.TestCase):
+    def test_plural(self):
+        self.assertEqual(parse_helpful_votes("12 people found this helpful"), 12)
+
+    def test_thousands_separator(self):
+        self.assertEqual(parse_helpful_votes("1,234 people found this helpful"), 1234)
+
+    def test_the_word_one(self):
+        self.assertEqual(parse_helpful_votes("One person found this helpful"), 1)
+
+    def test_absent(self):
+        self.assertIsNone(parse_helpful_votes(""))
+        self.assertIsNone(parse_helpful_votes(None))
+        self.assertIsNone(parse_helpful_votes("Helpful"))
+
+
+class StripStarPrefixTest(unittest.TestCase):
+    def test_removes_the_rating_line(self):
+        self.assertEqual(strip_star_prefix("5.0 out of 5 stars\nWorks great"), "Works great")
+
+    def test_leaves_a_clean_title_alone(self):
+        self.assertEqual(strip_star_prefix("Works great"), "Works great")
+
+    def test_prefix_only_yields_none(self):
+        self.assertIsNone(strip_star_prefix("4.0 out of 5 stars"))
+        self.assertIsNone(strip_star_prefix(""))
+        self.assertIsNone(strip_star_prefix(None))
+
+
+class ParseHistogramLabelTest(unittest.TestCase):
+    def test_aria_label_form(self):
+        self.assertEqual(parse_histogram_label("5 stars represent 71% of rating"), (5, 71))
+
+    def test_bare_row_text(self):
+        self.assertEqual(parse_histogram_label("4 star 12%"), (4, 12))
+
+    def test_percent_first_ordering(self):
+        self.assertEqual(parse_histogram_label("71% of reviews have 5 stars"), (5, 71))
+
+    def test_percent_over_100_is_not_a_histogram_row(self):
+        self.assertIsNone(parse_histogram_label("5 stars out of 900% growth"))
+
+    def test_unparseable(self):
+        self.assertIsNone(parse_histogram_label("See all reviews"))
+        self.assertIsNone(parse_histogram_label(""))
+        self.assertIsNone(parse_histogram_label(None))
+
+
+class ReviewsUrlTest(unittest.TestCase):
+    def test_defaults_to_helpful_page_one(self):
+        url = reviews_url("B0747R1M51")
+        self.assertIn("/product-reviews/B0747R1M51", url)
+        self.assertIn("pageNumber=1", url)
+        self.assertIn("sortBy=helpful", url)
+
+    def test_recent_sort_and_page(self):
+        url = reviews_url("B0747R1M51", 3, "recent")
+        self.assertIn("pageNumber=3", url)
+        self.assertIn("sortBy=recent", url)
+
+    def test_unknown_sort_falls_back_rather_than_injecting_it(self):
+        self.assertIn("sortBy=helpful", reviews_url("B1", 1, "bogus"))
+
+
+class ScrapeHistogramTest(unittest.TestCase):
+    def test_reads_aria_labels(self):
+        rows = FakeTextLocator(count=1, attrs={"aria-label": "5 stars represent 71% of rating"})
+        page = FakeScope({"#histogramTable a[aria-label]": rows})
+        self.assertEqual(scrape_histogram(page), {"5": 71})
+
+    def test_falls_back_to_row_text_when_no_aria_labels(self):
+        rows = FakeTextLocator(count=1, text="3 star   9%")
+        page = FakeScope({"#histogramTable .a-histogram-row, .a-histogram-row": rows})
+        self.assertEqual(scrape_histogram(page), {"3": 9})
+
+    def test_missing_table_reports_unknown_not_zero(self):
+        # {} must mean "couldn't read it", never "no ratings" — the Ruby side
+        # drops the whole signal on {} rather than scoring a perfect record.
+        self.assertEqual(scrape_histogram(FakeScope()), {})
+
+    def test_survives_a_detached_page(self):
+        self.assertEqual(scrape_histogram(FakeScope(raises=True)), {})
+
+
+class ReviewIdTest(unittest.TestCase):
+    def test_strips_the_product_page_prefix(self):
+        self.assertEqual(_review_id(FakeScope(attrs={"id": "customer_review-R1A2B3"})), "R1A2B3")
+
+    def test_bare_id_passes_through(self):
+        self.assertEqual(_review_id(FakeScope(attrs={"id": "R1A2B3"})), "R1A2B3")
+
+    def test_missing_id(self):
+        self.assertIsNone(_review_id(FakeScope()))
+
+    def test_detached_card(self):
+        class Boom:
+            def get_attribute(self, _name):
+                raise RuntimeError("detached")
+
+        self.assertIsNone(_review_id(Boom()))
+
+
+class HasTest(unittest.TestCase):
+    def test_true_when_any_selector_matches(self):
+        scope = FakeScope({"[data-hook=avp-badge]": FakeTextLocator(count=1)})
+        self.assertTrue(_has(scope, "[data-hook=nope]", "[data-hook=avp-badge]"))
+
+    def test_false_when_none_match(self):
+        self.assertFalse(_has(FakeScope(), "[data-hook=avp-badge]"))
+
+    def test_a_throwing_probe_is_skipped_not_fatal(self):
+        scope = FakeScope({"a": FakeTextLocator(raises=True), "b": FakeTextLocator(count=1)})
+        self.assertTrue(_has(scope, "a", "b"))
+
+
+class ScrapeReviewCardsTest(unittest.TestCase):
+    def card(self, **overrides):
+        mapping = {
+            "[data-hook=review-title] span:last-child": FakeTextLocator(text="Works great"),
+            "[data-hook=review-star-rating]": FakeTextLocator(text="5.0 out of 5 stars"),
+            "[data-hook=review-date]": FakeTextLocator(
+                text="Reviewed in the United States on July 26, 2025"
+            ),
+            "[data-hook=review-body]": FakeTextLocator(text="Solid little thing."),
+            "[data-hook=avp-badge]": FakeTextLocator(count=1),
+            ".a-profile-name": FakeTextLocator(text="Jamie"),
+            "[data-hook=helpful-vote-statement]": FakeTextLocator(
+                text="12 people found this helpful"
+            ),
+        }
+        mapping.update(overrides)
+        return FakeScope(mapping, attrs={"id": "customer_review-R1"})
+
+    def scrape(self, cards):
+        scope = FakeScope({"[data-hook=review], [data-hook=cmps-review]": FakeCardList(cards)})
+        return scrape_review_cards(scope)
+
+    def test_full_card(self):
+        (r,) = self.scrape([self.card()])
+        self.assertEqual(r["id"], "R1")
+        self.assertEqual(r["title"], "Works great")
+        self.assertEqual(r["rating"], 5.0)
+        self.assertEqual(r["date"], "2025-07-26")
+        self.assertEqual(r["country"], "United States")
+        self.assertTrue(r["verified"])
+        self.assertFalse(r["vine"])
+        self.assertEqual(r["author"], "Jamie")
+        self.assertEqual(r["helpful_votes"], 12)
+        self.assertEqual(r["body"], "Solid little thing.")
+
+    def test_unverified_and_vine_are_separate_flags(self):
+        card = self.card(
+            **{
+                "[data-hook=avp-badge]": FakeTextLocator(count=0),
+                "[data-hook=review-vine-badge]": FakeTextLocator(count=1),
+            }
+        )
+        (r,) = self.scrape([card])
+        self.assertFalse(r["verified"])
+        self.assertTrue(r["vine"])
+
+    def test_individually_missing_fields_degrade_to_none(self):
+        card = self.card(
+            **{
+                "[data-hook=review-date]": FakeTextLocator(count=0),
+                ".a-profile-name": FakeTextLocator(count=0),
+                "[data-hook=helpful-vote-statement]": FakeTextLocator(count=0),
+            }
+        )
+        (r,) = self.scrape([card])
+        self.assertEqual(r["title"], "Works great")
+        self.assertIsNone(r["date"])
+        self.assertIsNone(r["country"])
+        self.assertIsNone(r["author"])
+        self.assertIsNone(r["helpful_votes"])
+
+    def test_a_wholly_empty_card_is_dropped_not_counted(self):
+        # An unreadable card yields all-None, which is indistinguishable from a
+        # real review. Keeping it would add a phantom unverified review to the
+        # sample and inflate the manipulation score downstream.
+        self.assertEqual(self.scrape([FakeScope({}, attrs={"id": "R9"})]), [])
+
+    def test_no_review_container_at_all(self):
+        self.assertEqual(scrape_review_cards(FakeScope()), [])
+
+    def test_a_detached_scope_yields_nothing_rather_than_raising(self):
+        self.assertEqual(scrape_review_cards(FakeScope(raises=True)), [])
+
+    def test_one_broken_card_does_not_lose_the_rest(self):
+        class Boom:
+            def locator(self, _sel):
+                raise RuntimeError("detached mid-read")
+
+            def get_attribute(self, _name):
+                raise RuntimeError("detached mid-read")
+
+        results = self.scrape([Boom(), self.card()])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], "R1")

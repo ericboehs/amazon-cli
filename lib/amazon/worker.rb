@@ -55,9 +55,15 @@ module Amazon
 
     # Live product lookup. Raises Error with a nudge toward `amazon login` when
     # the saved session is missing, has expired, or Amazon serves a captcha.
-    def item(asin)
+    #
+    # `reviews:` folds the rating histogram and the product page's own review
+    # block into the same page load. `review_pages:` walks /product-reviews/ for
+    # more, at one page load each.
+    def item(asin, reviews: false, review_pages: 0, sort: "helpful")
       data = nil
-      run({ action: "item", asin: asin }, script: "live.py") do |event|
+      request = { action: "item", asin: asin }
+      request.merge!(reviews: true, review_pages: review_pages, sort: sort) if reviews
+      run(request, script: "live.py") do |event|
         case event["event"]
         when "item"  then data = event["data"]
         when "log"   then log_event(event)
