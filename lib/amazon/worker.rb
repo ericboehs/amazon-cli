@@ -36,9 +36,8 @@ module Amazon
         when "total"    then progress.start(event)
         when "progress" then progress.tick(event)
         when "log"
-          level = event["level"] || "info"
           progress.clear
-          warn("[worker:#{level}] #{event["msg"]}") if @verbose || level == "warn"
+          log_event(event)
         when "done"     then progress.finish(event)
         when "error"    then error_msg = event["msg"]
         end
@@ -61,7 +60,7 @@ module Amazon
       run({ action: "item", asin: asin }, script: "live.py") do |event|
         case event["event"]
         when "item"  then data = event["data"]
-        when "log"   then warn("[worker] #{event["msg"]}") if @verbose
+        when "log"   then log_event(event)
         when "error" then raise Error, live_error(event)
         end
       end
@@ -73,7 +72,7 @@ module Amazon
       run({ action: "search", query: query, limit: limit }, script: "live.py") do |event|
         case event["event"]
         when "result" then results << event["data"]
-        when "log"    then warn("[worker] #{event["msg"]}") if @verbose
+        when "log"    then log_event(event)
         when "error"  then raise Error, live_error(event)
         end
       end
@@ -161,6 +160,17 @@ module Amazon
     end
 
     private
+
+    # A worker `warn` is the only signal that a selector chain has rotted or
+    # that a page silently degraded — exactly the cases where the output still
+    # looks complete because every field fails to null independently. Hiding
+    # that behind -v means the person who needs it is the one who never sees
+    # it. `info` is routine progress and stays behind the flag.
+    def log_event(event)
+      level = event["level"] || "info"
+      return unless @verbose || level == "warn"
+      warn("[worker:#{level}] #{event["msg"]}")
+    end
 
     def live_error(event)
       case event["kind"]
