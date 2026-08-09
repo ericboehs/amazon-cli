@@ -1120,7 +1120,9 @@ class WorkerProtocolTest < Minitest::Test
   def worker(**kw) = Amazon::Worker.new(**kw)
 
   # Playwright and friends print to stdout uninvited; a stray line must not
-  # abort the run, and it's only worth surfacing under -v.
+  # abort the run. It is still said out loud, because the parent cannot tell a
+  # chatty library apart from a worker cut off mid-`emit`, and only one of
+  # those is harmless.
   def test_non_json_stdout_is_skipped
     body = <<~SCRIPT
       STDIN.gets
@@ -1135,7 +1137,7 @@ class WorkerProtocolTest < Minitest::Test
       assert_includes err, 'non-JSON output: Downloading Chromium'
 
       _, err = capture_io_streams { worker.item('B1') }
-      assert_empty err
+      assert_includes err, 'non-JSON output: Downloading Chromium'
     end
   end
 
@@ -1225,6 +1227,61 @@ class WorkerProtocolTest < Minitest::Test
         _, err = capture_io_streams { worker.search('q') }
         assert_includes err, "[worker:#{level}] the parser is gone"
       end
+    end
+  end
+
+  # A half-written line is what a worker killed mid-`emit` leaves behind, which
+  # makes it the highest-information moment on the channel — and it was gated
+  # behind -v, a flag you can only set on the run before the one that failed.
+  # The channel breaking is not a log level the worker chose, so verbosity has
+  # no business being able to turn it off.
+  def test_a_half_written_event_is_reported_without_verbose
+    body = <<~SCRIPT
+      STDIN.gets
+      print '{"event":"order","data":{"id"'
+      STDOUT.flush
+      exit 1
+    SCRIPT
+    with_python_cmd(body) do
+      _, err = capture_io_streams do
+        assert_raises(Amazon::Worker::Error) { worker.search('q') }
+      end
+      assert_includes err, 'non-JSON output: {"event":"order","data":{"id"'
+    end
+  end
+
+  # By the time the run ends, the broken line has scrolled past everything the
+  # worker printed on its way down, and a bare "exited 1" reads as a failure
+  # the worker chose and described. It didn't: we lost events.
+  def test_a_run_that_lost_events_says_so_at_exit
+    body = <<~SCRIPT
+      STDIN.gets
+      print '{"event":"order","data":{"id"'
+      STDOUT.flush
+      exit 1
+    SCRIPT
+    with_python_cmd(body) do
+      err = nil
+      capture_io_streams do
+        err = assert_raises(Amazon::Worker::Error) { worker.search('q') }
+      end
+      assert_includes err.message, 'exited 1'
+      assert_includes err.message, '1 unparseable line on the event channel'
+    end
+  end
+
+  # Reporting the break must not become the failure: the truncated head of a
+  # very large event is exactly the shape this prints.
+  def test_a_vast_junk_line_is_reported_in_bounded_form
+    body = <<~SCRIPT
+      STDIN.gets
+      puts '{' + ('x' * 100_000)
+      puts({event: 'done', count: 0}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      _, err = capture_io_streams { assert_empty worker.search('q') }
+      assert_includes err, '100001 chars'
+      assert_operator err.length, :<, 500
     end
   end
 
@@ -1325,7 +1382,7 @@ class WorkerProtocolTest < Minitest::Test
     end
   end
 
-  def test_non_json_lines_are_skipped_and_logged_when_verbose
+  def test_non_json_lines_are_skipped_and_always_logged
     body = <<~SCRIPT
       STDIN.gets
       puts 'this is not json'
@@ -1336,7 +1393,7 @@ class WorkerProtocolTest < Minitest::Test
       assert_includes err, 'non-JSON output'
 
       _, err = capture_io_streams { assert_empty worker.search('q') }
-      refute_includes err, 'non-JSON output'
+      assert_includes err, 'non-JSON output'
     end
   end
 
@@ -1469,7 +1526,9 @@ class WorkerHelpersTest < Minitest::Test
 
   def test_parse_event_returns_nil_on_junk
     w = Amazon::Worker.new
-    assert_nil w.send(:parse_event, 'not json')
+    # Captured because the junk line now prints unconditionally, and a test
+    # that scribbles on the real stderr reads as a failure in the suite.
+    capture_io_streams { assert_nil w.send(:parse_event, 'not json') }
     assert_equal({ 'event' => 'done' }, w.send(:parse_event, '{"event":"done"}'))
   end
 

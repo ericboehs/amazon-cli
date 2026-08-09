@@ -231,11 +231,15 @@ module Amazon
 
         begin
           saw_error = false
+          malformed = 0
           stdout.each_line do |line|
             line = line.strip
             next if line.empty?
             event = parse_event(line)
-            next unless event
+            if event.nil?
+              malformed += 1
+              next
+            end
 
             case event["event"]
             when "otp_required"
@@ -270,7 +274,7 @@ module Amazon
           status = wait.value
           # An `error` event already carries a better message than the exit code.
           if !status.success? && !saw_error
-            raise Error, "python worker exited #{status.exitstatus}"
+            raise Error, "python worker exited #{status.exitstatus}#{malformed_note(malformed)}"
           end
         ensure
           # The callers raise from inside the yielded block, which unwinds
@@ -303,11 +307,34 @@ module Amazon
       "\nworker stderr (last #{tail.size} line#{"s" unless tail.size == 1}):\n#{tail.join("\n")}"
     end
 
+    # Unconditional, unlike `log_event`, and deliberately not a log level: this
+    # is the event channel itself breaking. A half-written line is what a worker
+    # killed mid-`emit` leaves behind, so it is the highest-information moment
+    # there is — and -v is a flag you can only set on the run before the one
+    # that failed. Stray stdout from a chatty library still doesn't abort the
+    # run; it just says so once.
     def parse_event(line)
       JSON.parse(line)
     rescue JSON::ParserError
-      warn("[worker] non-JSON output: #{line}") if @verbose
+      warn("[worker] non-JSON output: #{bounded(line)}")
       nil
+    end
+
+    # A truncated event can be the head of a very large one. Same reasoning as
+    # STDERR_TAIL_LINES: reporting the break must not become the failure.
+    JUNK_LINE_LIMIT = 200
+
+    def bounded(line)
+      return line if line.length <= JUNK_LINE_LIMIT
+      "#{line[0, JUNK_LINE_LIMIT]}… (#{line.length} chars)"
+    end
+
+    # Named at exit as well as where it happened, because by then the broken
+    # line has scrolled past everything the worker printed on its way down, and
+    # a bare "exited 1" reads as a failure the worker chose and described.
+    def malformed_note(count)
+      return "" if count.zero?
+      " after #{count} unparseable line#{"s" unless count == 1} on the event channel"
     end
 
     def python_cmd(script)
