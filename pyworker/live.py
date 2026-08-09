@@ -335,20 +335,29 @@ def scrape_review_cards(scope: Any) -> list[dict[str, Any]]:
 
 def scrape_reviews(
     page: Any, asin: str, pages: int = 0, sort: str = "helpful"
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], str]:
     """Reviews already on the loaded product page, plus `pages` more from
     /product-reviews/.
 
     Assumes `page` is sitting on the product page. Deduplicates by review id
     because the product page's top reviews reappear on the full listing.
 
-    Returns the reviews and whether the walk got everything it asked for. That
-    second value is what stops the report from telling someone who just ran
-    `--pages 3` to go and run `--pages 3`.
+    Returns the reviews and how the walk ended, one of:
+
+      "complete"  — every page asked for was read
+      "exhausted" — Amazon stopped serving new reviews before that
+      "failed"    — a page load fell over, so depth is unknown
+
+    Three states, not the boolean this used to be. "Didn't finish" was doing
+    double duty for "there is no more" and "we couldn't get at it", and the
+    report turned that into advice: a crashed pagination leg told the user
+    "Amazon served no more for this session" — a confident statement about the
+    listing, made out of our own network error, and one that talks them out of
+    the retry that would have worked.
     """
     collected = scrape_review_cards(page)
     seen = {r["id"] for r in collected if r["id"]}
-    walked_all = True
+    walk = "complete"
 
     for n in range(1, max(pages, 0) + 1):
         try:
@@ -370,7 +379,7 @@ def scrape_reviews(
             # what `--pages 0` would have returned — reporting on it beats
             # discarding a good partial answer over the depth we couldn't get.
             emit("log", level="warn", msg=f"could not load review page {n} ({exc}) — reporting on {len(collected)} from the product page")
-            walked_all = False
+            walk = "failed"
             break
         batch = [r for r in scrape_review_cards(page) if not r["id"] or r["id"] not in seen]
         if not batch:
@@ -380,7 +389,7 @@ def scrape_reviews(
             # the two are indistinguishable from here — which is why stopping on
             # page 1 of a product with thousands of ratings is worth saying out
             # loud rather than logging as routine.
-            walked_all = False
+            walk = "exhausted"
             if n < pages:
                 emit("log", level="warn", msg=(
                     f"Amazon served no new reviews past page {n} of the {pages} requested — "
@@ -394,7 +403,7 @@ def scrape_reviews(
         collected.extend(batch)
         emit("log", level="info", msg=f"review page {n}: +{len(batch)} ({len(collected)} total)")
 
-    return collected, walked_all
+    return collected, walk
 
 
 def _review_id(card: Any) -> str | None:
@@ -494,12 +503,17 @@ def scrape_item(
         # Not "reviews" — that key is already the sitewide rating *count* that
         # `item` and `search` render.
         data["histogram"] = scrape_histogram(page)
-        sample, walked_all = scrape_reviews(page, asin, pages=review_pages, sort=sort)
+        sample, walk = scrape_reviews(page, asin, pages=review_pages, sort=sort)
         data["reviews_sample"] = sample
         # Lets the report distinguish "your sample is thin, go deeper" from
-        # "this is everything Amazon will hand over" — advice you can act on
-        # versus advice you have already taken.
-        data["reviews_exhausted"] = not walked_all
+        # "this is everything Amazon will hand over" from "we fell over, try
+        # again" — three different pieces of advice, and only one of them is
+        # advice the user has already taken.
+        data["reviews_walk"] = walk
+        # How deep this sample actually went, so the report can suggest a number
+        # larger than the one already run instead of parroting `--pages 3` back
+        # at someone who just used it.
+        data["review_pages"] = review_pages
         # The timing check cannot mean anything on a sample Amazon ordered by
         # date for us, so it has to know how the sample was chosen.
         data["reviews_sort"] = sort

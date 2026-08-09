@@ -228,12 +228,21 @@ module Amazon
           puts "    #{mark}  #{s["label"]}: #{s["detail"]}#{weight}"
         end
       end
-      deeper = if analysis["exhausted"]
-                 "That is everything Amazon would serve for this listing."
-               else
-                 "Use --pages 3 for a deeper sample."
-               end
-      puts dim("    Heuristics on a #{analysis["sample_size"]}-review sample, not a verdict. #{deeper}")
+      puts dim("    Heuristics on a #{analysis["sample_size"]}-review sample, not a verdict. #{footer_advice(analysis)}")
+    end
+
+    # Same three states as the per-signal hints, and for the same reason: a walk
+    # that crashed is not a listing that ran dry, and only one of the two is
+    # worth retrying.
+    def footer_advice(analysis)
+      case analysis["walk"]
+      when "exhausted" then "That is everything Amazon would serve for this listing."
+      when "failed" then "The deeper walk did not finish — retry to sample further."
+      else
+        pages = analysis["pages"].to_i
+        deeper = [pages + Amazon::Reviews::PAGE_STEP, Amazon::Reviews::MAX_PAGES].min
+        deeper > pages ? "Use --pages #{deeper} for a deeper sample." : "This is the deepest sample offered."
+      end
     end
 
     def level_phrase(analysis)
