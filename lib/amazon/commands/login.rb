@@ -18,8 +18,12 @@ module Amazon
               Usage: amazon login
 
               Opens a real browser window so you can log in to Amazon manually
-              (solving any captcha or 2FA). Cookies are saved so subsequent
-              `amazon sync` calls skip the login flow.
+              (solving any captcha or 2FA), then waits until your order history
+              loads before saving anything — Amazon guards orders separately, so
+              a session that greets you by name still can't read them.
+
+              Cookies are saved so subsequent `amazon order sync` calls skip the
+              login flow.
             HELP
             return 0
           end
@@ -46,7 +50,7 @@ module Amazon
             when "navigate" then warn("→ #{event["url"]}") unless @global.quiet
             when "done"
               warn("amazon: saved #{event["count"]} cookies to #{event["cookies_path"]}")
-              warn("       run `amazon sync` to fetch orders.")
+              warn("       run `amazon order sync` to fetch orders.")
             when "error"
               warn("amazon login: #{event["msg"]}")
             end

@@ -5,9 +5,11 @@ Opens a real (headed) Chromium window pointed at amazon.com sign-in. The user
 logs in themselves — including any captcha, 2FA, or "verify it's you" prompts
 that the headless `amazon-orders` flow can't handle.
 
-Once authenticated (Amazon home page shows the signed-in nav), we dump the
-session cookies into amazon-orders' `cookie_jar_path` format so a subsequent
-`amazon sync` skips the login flow entirely.
+Success means one specific thing: the order-history page renders. Amazon will
+happily hand a "recognized" session the homepage and product pages while
+bouncing it from orders, so anything weaker than loading that page saves
+cookies `amazon order sync` will be rejected with. Once it loads, the session
+cookies are dumped into amazon-orders' `cookie_jar_path` format.
 
 Output format on stdout (NDJSON):
     {"event":"log","msg":"..."}
@@ -53,16 +55,68 @@ def load_email() -> str | None:
         return None
 
 
-SIGN_IN_URL = (
-    "https://www.amazon.com/ap/signin"
-    "?openid.pape.max_auth_age=0"
-    "&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F"
-    "&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select"
-    "&openid.assoc_handle=usflex"
-    "&openid.mode=checkid_setup"
-    "&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select"
-    "&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0"
+# Start at order history rather than a bare sign-in URL. Amazon tiers its
+# sessions: a "recognized" one renders product pages fine but is bounced from
+# order history with `openid.pape.max_auth_age=0`, meaning it wants the password
+# again no matter what cookies you hold. Landing here makes Amazon serve
+# whichever challenge is actually required, and makes the success condition the
+# same thing `amazon order sync` needs — so a session that can't read orders can
+# no longer be saved as if it could.
+ORDERS_URL = "https://www.amazon.com/your-orders/orders"
+
+# Amazon's sign-in lives under /ap/ (signin, mfa, challenge, forgotpassword).
+SIGNIN_PATHS = ("/ap/signin", "/ap/mfa", "/ap/challenge", "/ap/cvf")
+
+# Markers that the order list itself rendered. Several, because this layout is
+# A/B tested like the rest of the site and a single miss here costs the user ten
+# minutes of silence followed by a timeout.
+ORDER_MARKERS = (
+    ".order-card, .js-order-card",
+    "[data-component=orderCard]",
+    "#ordersContainer",
+    "#your-orders-content",
 )
+
+
+def describe_state(url: str | None) -> str:
+    """Short human-readable "where are we" for the waiting heartbeat."""
+    if not url:
+        return "no page loaded yet"
+    if is_signin_url(url):
+        return "on Amazon's sign-in / verification page"
+    if "/your-orders" in url:
+        return "on the orders page, but the order list hasn't rendered"
+    return f"on {url[:60]}"
+
+
+def is_signin_url(url: str | None) -> bool:
+    return bool(url) and any(p in url for p in SIGNIN_PATHS)
+
+
+def order_access_ok(url: str | None, signout_links: int, order_cards: int) -> bool:
+    """True only when order history actually rendered for this session.
+
+    The sign-in page carries nodes that match the order-card selector, so a
+    marker count on its own says nothing — the URL check has to come first.
+    That false positive is exactly how a recognized-but-unauthenticated session
+    used to pass for a real one.
+    """
+    if not url or is_signin_url(url):
+        return False
+    return signout_links > 0 or order_cards > 0
+
+
+def should_renavigate(url: str | None) -> bool:
+    """Nudge an idle tab back to order history.
+
+    Amazon sometimes returns you to the homepage after sign-in instead of the
+    page you asked for. Without this the poll would watch a signed-in homepage
+    until it timed out, having never tested the thing it cares about. A tab
+    still inside /ap/ is mid-challenge and must be left alone.
+    """
+    if not url or is_signin_url(url):
+        return False
+    return "/your-orders" not in url
 
 
 def main() -> int:
@@ -121,8 +175,8 @@ def main() -> int:
 
         context = browser.new_context(**context_args)
         page = context.new_page()
-        emit("navigate", url=SIGN_IN_URL)
-        page.goto(SIGN_IN_URL, wait_until="domcontentloaded")
+        emit("navigate", url=ORDERS_URL)
+        page.goto(ORDERS_URL, wait_until="domcontentloaded")
 
         email = load_email()
         if email:
@@ -142,31 +196,54 @@ def main() -> int:
             "log",
             msg=(
                 "Sign in to Amazon in the browser window. Solve any captcha or 2FA. "
-                "When you reach the signed-in homepage, this script will detect it "
-                "automatically and save cookies."
+                "Amazon may ask for your password again even if it greets you by "
+                "name — it guards order history separately. This waits for your "
+                "orders to load, then saves cookies automatically."
             ),
         )
 
-        # Poll for authenticated state. Two signals:
-        #   1) `x-main` cookie present (amazon-orders' COOKIES_SET_WHEN_AUTHENTICATED)
-        #   2) URL is on amazon.com root or a non-auth path AND nav-item-signout exists
+        # Poll until order history renders. The old check — an `x-main` cookie
+        # plus "not on /ap/signin" — is satisfied by a merely recognized
+        # session, so it reported success for sessions that `amazon order sync`
+        # was then rejected with. Nothing short of loading the page proves it.
         deadline = time.time() + 600  # 10 minutes
         authenticated = False
+        last_nudge = 0.0
+        last_report = time.time()
         while time.time() < deadline:
-            cookies = context.cookies()
-            names = {c.get("name") for c in cookies}
-            if "x-main" in names:
-                # Also confirm we're not still on the signin page
-                try:
-                    if "/ap/signin" not in page.url:
-                        authenticated = True
-                        break
-                except Exception:  # noqa: BLE001
-                    pass
+            try:
+                url = page.url
+                cards = sum(page.locator(sel).count() for sel in ORDER_MARKERS)
+                if order_access_ok(url, page.locator("#nav-item-signout").count(), cards):
+                    authenticated = True
+                    break
+
+                # Ten minutes of silence gives the user nothing to act on and
+                # leaves a timeout undiagnosable afterwards. Say where we are.
+                if time.time() - last_report > 30:
+                    last_report = time.time()
+                    left = int(deadline - time.time())
+                    emit("log", msg=f"waiting ({left}s left) — {describe_state(url)}")
+                # Give the tab a few seconds to settle before steering it, so a
+                # redirect in flight isn't mistaken for an idle page.
+                if should_renavigate(url) and time.time() - last_nudge > 10:
+                    last_nudge = time.time()
+                    page.goto(ORDERS_URL, wait_until="domcontentloaded")
+            except Exception:  # noqa: BLE001
+                # A navigation mid-poll detaches the frame; try again next tick.
+                pass
             time.sleep(2)
 
         if not authenticated:
-            emit("error", msg="timed out waiting for sign-in (10 min). Cookies not saved.")
+            emit(
+                "error",
+                msg=(
+                    "timed out waiting for sign-in (10 min) — order history never "
+                    "loaded, so nothing was saved. Amazon asks for the password "
+                    "again before it will show orders, even when the browser "
+                    "already looks signed in."
+                ),
+            )
             context.close()
             browser.close()
             return 1
