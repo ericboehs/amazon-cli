@@ -338,12 +338,22 @@ class WritePrivateTest(unittest.TestCase):
 
 
 class OrderMarkersTest(unittest.TestCase):
-    def test_several_markers_are_tried(self):
-        # A single selector that Amazon has since renamed costs the user ten
-        # minutes of waiting and then a failure, so breadth is worth more here
-        # than precision -- the URL check is what keeps it honest.
-        self.assertGreater(len(ORDER_MARKERS), 1)
-        self.assertTrue(all(isinstance(s, str) and s for s in ORDER_MARKERS))
+    def test_an_account_with_no_orders_can_still_be_verified(self):
+        # The contract `order_access_ok` documents and depends on. Every other
+        # marker is a card, so a brand-new account with an empty order list
+        # would count zero of them and time out at ten minutes having been
+        # signed in the whole time. `#your-orders-content` is the page
+        # container: it renders empty, which is what separates "your list is
+        # empty" from "you can't see your list".
+        self.assertIn("#your-orders-content", ORDER_MARKERS)
+
+    def test_the_card_selectors_are_not_the_container(self):
+        # The list has to keep both kinds. Cards alone can't distinguish an
+        # empty order list from a bounce; the container alone renders on a shell
+        # Amazon serves before it has decided which you get. The poll's
+        # two-consecutive-ticks rule exists because of that second half.
+        cards = [m for m in ORDER_MARKERS if m != "#your-orders-content"]
+        self.assertTrue(cards, "no card-level markers left")
 
 
 if __name__ == "__main__":
