@@ -515,11 +515,21 @@ class ReviewsUrlTest(unittest.TestCase):
         self.assertIn("sortBy=helpful", reviews_url("B1", 1, "bogus"))
 
 
+def aria_rows(*pairs):
+    """A locator over N histogram rows, each carrying its own aria-label."""
+    return FakeCardList([
+        FakeTextLocator(attrs={"aria-label": f"{star} stars represent {pct}% of rating"})
+        for star, pct in pairs
+    ])
+
+
+FULL_HISTOGRAM = ((5, 79), (4, 10), (3, 5), (2, 2), (1, 4))
+
+
 class ScrapeHistogramTest(unittest.TestCase):
     def test_reads_aria_labels(self):
-        rows = FakeTextLocator(count=1, attrs={"aria-label": "5 stars represent 71% of rating"})
-        page = FakeScope({"#histogramTable a[aria-label]": rows})
-        self.assertEqual(scrape_histogram(page), {"5": 71})
+        page = FakeScope({"#histogramTable a[aria-label]": aria_rows(*FULL_HISTOGRAM)})
+        self.assertEqual(scrape_histogram(page), {"5": 79, "4": 10, "3": 5, "2": 2, "1": 4})
 
     def test_falls_back_to_row_text_when_no_aria_labels(self):
         rows = FakeTextLocator(count=1, text="3 star   9%")
@@ -533,6 +543,32 @@ class ScrapeHistogramTest(unittest.TestCase):
 
     def test_survives_a_detached_page(self):
         self.assertEqual(scrape_histogram(FakeScope(raises=True)), {})
+
+    # Was: a single row was accepted as the whole histogram and returned as
+    # final. A star distribution is five rows by definition, so anything short
+    # of five means the read is incomplete — and downstream, every absent star
+    # scored as 0%, which is the shape the fraud model treats as damning.
+    def test_a_partial_read_does_not_end_the_search(self):
+        page = FakeScope({
+            "#histogramTable a[aria-label]": aria_rows((5, 79)),
+            "[data-hook=cr-histogram-row] a[aria-label]": aria_rows(*FULL_HISTOGRAM),
+        })
+        self.assertEqual(scrape_histogram(page), {"5": 79, "4": 10, "3": 5, "2": 2, "1": 4})
+
+    def test_a_partial_read_is_reported_rather_than_passed_off_as_whole(self):
+        page = FakeScope({"#histogramTable a[aria-label]": aria_rows((5, 79))})
+        events = emitted(lambda: scrape_histogram(page))
+        self.assertEqual([e["level"] for e in events], ["warn"])
+        self.assertIn("1 of 5", events[0]["msg"])
+
+    def test_a_complete_read_is_silent(self):
+        page = FakeScope({"#histogramTable a[aria-label]": aria_rows(*FULL_HISTOGRAM)})
+        self.assertEqual(emitted(lambda: scrape_histogram(page)), [])
+
+    def test_an_unreadable_table_is_not_reported_as_a_partial(self):
+        # Nothing read at all is already handled downstream as "unknown"; a
+        # warn here would fire on every page that simply has no histogram.
+        self.assertEqual(emitted(lambda: scrape_histogram(FakeScope())), [])
 
 
 class ReviewIdTest(unittest.TestCase):

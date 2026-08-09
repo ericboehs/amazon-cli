@@ -1841,6 +1841,33 @@ class ReviewsHistogramSignalTest < Minitest::Test
     # through the web UI can hand us strings.
     assert_equal 20, points('5' => '96', '4' => '2', '3' => '1', '2' => '0', '1' => '1')['points']
   end
+
+  def test_a_partial_histogram_is_not_computable_rather_than_damning
+    # Rows lost to selector drift used to read as 0%, so a listing whose 5★ row
+    # was the only survivor scored as a five-star wall with no middle and no
+    # tail -- the tool manufacturing the exact shape it exists to detect. The
+    # healthy real listing below scores 0 intact; every truncation of it must
+    # abstain rather than climb.
+    assert_equal 0, points('5' => 79, '4' => 10, '3' => 5, '2' => 2, '1' => 4)['points']
+    assert_nil points('5' => 79)['points']
+    assert_nil points('5' => 96)['points']
+    assert_nil points('5' => 79, '4' => 10, '3' => 5)['points']
+    assert_includes points('5' => 96)['detail'], "didn't render"
+  end
+
+  def test_percentages_that_do_not_add_up_are_rejected
+    # All five rows present and summing to 40 means some of them were misread.
+    # Scoring that is scoring noise.
+    assert_nil points('5' => 20, '4' => 8, '3' => 5, '2' => 4, '1' => 3)['points']
+    assert_nil points('5' => 96, '4' => 40, '3' => 30, '2' => 20, '1' => 10)['points']
+  end
+
+  def test_rounding_slack_is_not_mistaken_for_a_partial_read
+    # Amazon rounds every row to a whole percent, so a real histogram routinely
+    # lands a point or two either side of 100.
+    assert_equal 0, points('5' => 79, '4' => 12, '3' => 5, '2' => 1, '1' => 4)['points']
+    assert_equal 0, points('5' => 78, '4' => 12, '3' => 5, '2' => 1, '1' => 3)['points']
+  end
 end
 
 class ReviewsUnverifiedSignalTest < Minitest::Test
@@ -2229,6 +2256,21 @@ class ReviewsFormatterTest < Minitest::Test
     assert_includes out, 'Vine:'
     assert_includes out, 'What critical reviews mention'
     assert_includes out, 'not a verdict'
+  end
+
+  def test_rows_the_scraper_never_read_render_as_unknown_not_zero
+    # A drawn bar of 0% is a claim about the product. The rows that came back
+    # are still worth showing, but the ones that didn't have to look absent,
+    # or the picture reads as a five-star wall the page never showed.
+    rows = render(data('histogram' => { '5' => 79 })).lines.grep(/\A  \d★ /)
+    assert_equal 5, rows.size
+    assert_includes rows.first, '79%'
+    rows.drop(1).each do |row|
+      assert_match(/\?\s*\z/, row)
+      refute_includes row, '%'
+    end
+    # And the check itself abstains rather than scoring the rows it invented.
+    assert_includes render(data('histogram' => { '5' => 79 })), "?  Rating distribution: Amazon didn't render"
   end
 
   def test_adjusted_rating_is_labelled_as_sample_only
