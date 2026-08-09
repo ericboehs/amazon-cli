@@ -106,6 +106,19 @@ def order_access_ok(url: str | None, signout_links: int, order_cards: int) -> bo
     return signout_links > 0 or order_cards > 0
 
 
+def should_prefill_email(email_visible: bool, password_visible: bool) -> bool:
+    """Only auto-advance the email step when it really is the email step.
+
+    The re-auth page Amazon serves on the `max_auth_age=0` bounce already knows
+    who you are and wants the password, but it still renders an email field
+    beside it. Filling that and clicking Continue submits the form with an empty
+    password, and Amazon answers by dropping the context and rendering a clean
+    sign-in page — so the pre-fill costs the user the very step it meant to skip.
+    A password box on screen means the human is the only one who can proceed.
+    """
+    return email_visible and not password_visible
+
+
 def should_renavigate(url: str | None) -> bool:
     """Nudge an idle tab back to order history.
 
@@ -181,14 +194,33 @@ def main() -> int:
         email = load_email()
         if email:
             try:
+                pw = page.locator("#ap_password")
+                password_visible = pw.count() > 0 and pw.first.is_visible()
+
                 email_input = page.locator("#ap_email_login, #ap_email").first
-                email_input.wait_for(state="visible", timeout=5000)
-                email_input.fill(email)
-                emit("log", msg=f"pre-filled email: {email}")
-                cont = page.locator("#continue, input[type=submit][aria-labelledby*=continue]").first
-                if cont.count() > 0:
-                    cont.click()
-                    emit("log", msg="clicked Continue — finish password + any 2FA in the window")
+                email_visible = False
+                if not password_visible:
+                    try:
+                        email_input.wait_for(state="visible", timeout=5000)
+                        email_visible = True
+                    except Exception:  # noqa: BLE001
+                        email_visible = False
+
+                if should_prefill_email(email_visible, password_visible):
+                    email_input.fill(email)
+                    emit("log", msg=f"pre-filled email: {email}")
+                    cont = page.locator("#continue, input[type=submit][aria-labelledby*=continue]").first
+                    if cont.count() > 0:
+                        cont.click()
+                        emit("log", msg="clicked Continue — finish password + any 2FA in the window")
+                elif password_visible:
+                    emit(
+                        "log",
+                        msg=(
+                            "Amazon is asking for your password on this page — type it in "
+                            "the window. Leaving the form alone so Continue can't reset it."
+                        ),
+                    )
             except Exception as e:  # noqa: BLE001
                 emit("log", msg=f"could not pre-fill email ({e}); continue manually")
 

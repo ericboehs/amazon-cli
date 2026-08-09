@@ -16,6 +16,7 @@ from login import (  # noqa: E402
     describe_state,
     is_signin_url,
     order_access_ok,
+    should_prefill_email,
     should_renavigate,
 )
 
@@ -66,6 +67,22 @@ class OrderAccessOkTest(unittest.TestCase):
 
     def test_missing_url_fails(self):
         self.assertFalse(order_access_ok(None, signout_links=1, order_cards=1))
+
+
+class ShouldPrefillEmailTest(unittest.TestCase):
+    def test_the_email_step_gets_prefilled(self):
+        self.assertTrue(should_prefill_email(email_visible=True, password_visible=False))
+
+    def test_a_password_prompt_is_left_alone(self):
+        # The reported regression: the re-auth page shows an email field next to
+        # the password box, so pre-filling it and clicking Continue submitted an
+        # empty password. Amazon threw the context away and re-rendered a clean
+        # sign-in page -- which reads as "it skipped past the password".
+        self.assertFalse(should_prefill_email(email_visible=True, password_visible=True))
+
+    def test_nothing_to_fill(self):
+        self.assertFalse(should_prefill_email(email_visible=False, password_visible=False))
+        self.assertFalse(should_prefill_email(email_visible=False, password_visible=True))
 
 
 class ShouldRenavigateTest(unittest.TestCase):
