@@ -5,6 +5,7 @@ bounces to sign-in persists a stripped jar over a working one. These cover the
 decision about when to put the old jar back.
 """
 
+import contextlib
 import io
 import json
 import os
@@ -13,12 +14,16 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from contextlib import redirect_stdout
+from datetime import date
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import fetch  # noqa: E402
 from fetch import (  # noqa: E402
     AUTH_COOKIE_NAMES,
     JarGuard,
@@ -427,6 +432,205 @@ class BareInterpreterImportTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), ",".join(sorted(AUTH_COOKIE_NAMES)))
+
+
+class FakeOrder:
+    """The attributes `order_to_dict` and `_emit_progress` actually read."""
+
+    def __init__(self, number, detailed=False):
+        self.order_number = number
+        self.order_placed_date = date(2026, 1, 2)
+        self.grand_total = 9.99
+        self.order_details_link = f"https://example.invalid/{number}"
+        self.recipient = None
+        self.items = []
+        self.shipments = []
+        self.detailed = detailed
+
+
+@contextlib.contextmanager
+def fake_amazonorders(login, history, get_order):
+    """Stand in for the amazon-orders package for the length of a `main()` call.
+
+    `main()` imports it lazily precisely so this module loads without it, which
+    also means it can be swapped here. Nothing else gives these paths a seam: a
+    detail fetch that comes back empty and a session Amazon rejects mid-run are
+    wrong in terms of which events reach the parent and what the exit code is,
+    and neither is reachable from a pure helper.
+    """
+    class AmazonOrdersConfig:
+        def __init__(self, config_path=None, data=None):
+            self.config_path, self.data = config_path, data
+
+    class AmazonOrders:
+        def __init__(self, session, config=None):
+            self.session, self.config = session, config
+
+        def get_order_history(self, year=None, full_details=False):
+            return history(year)
+
+        def get_order(self, order_number, clone=None):
+            return get_order(order_number, clone)
+
+    class IODefault:
+        pass
+
+    class AmazonSession:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def login(self):
+            login()
+
+    mods = {
+        "amazonorders": _module("amazonorders", __version__="0.0.0-fake"),
+        "amazonorders.conf": _module("amazonorders.conf", AmazonOrdersConfig=AmazonOrdersConfig),
+        "amazonorders.orders": _module("amazonorders.orders", AmazonOrders=AmazonOrders),
+        "amazonorders.session": _module(
+            "amazonorders.session", IODefault=IODefault, AmazonSession=AmazonSession
+        ),
+    }
+    with mock.patch.dict(sys.modules, mods):
+        yield
+
+
+def _module(name, **attrs):
+    mod = types.ModuleType(name)
+    mod.__dict__.update(attrs)
+    return mod
+
+
+class WorkerRunTest(unittest.TestCase):
+    """End-to-end `main()` runs against the fake package above."""
+
+    def run_worker(self, *, orders=(), login=None, get_order=None, jar=None, **overrides):
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, True)
+        cookies = home / "amazon" / "cache" / "cookies.json"
+        cookies.parent.mkdir(parents=True)
+        if jar is not None:
+            cookies.write_text(jar)
+
+        request = {
+            "action": "sync",
+            "email": "someone@example.invalid",
+            "password": "unused-have-cookies",
+            "years": [2026],
+            "full_details": True,
+            "detail_delay": 0,
+            "detail_jitter": 0,
+            "retry_backoff": [],
+            **overrides,
+        }
+        def default_get_order(number, clone):
+            return FakeOrder(number, detailed=True)
+
+        buf = io.StringIO()
+        with fake_amazonorders(
+            login or (lambda: None),
+            lambda year: list(orders),
+            get_order or default_get_order,
+        ), mock.patch.dict(
+            os.environ, {"XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home)}
+        ), mock.patch.object(
+            sys, "stdin", io.StringIO(json.dumps(request) + "\n")
+        ), redirect_stdout(buf):
+            code = fetch.main()
+
+        events = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+        return code, events, cookies
+
+    def kinds(self, events, name):
+        return [e for e in events if e["event"] == name]
+
+    def test_a_clean_run_reports_every_order(self):
+        code, events, _ = self.run_worker(orders=[FakeOrder("111"), FakeOrder("222")])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [e["data"]["order_id"] for e in self.kinds(events, "order")], ["111", "222"]
+        )
+        self.assertEqual(self.kinds(events, "done")[0]["count"], 2)
+
+    def test_an_order_whose_details_failed_is_never_handed_to_the_store(self):
+        # The parent writes every `order` event it receives and then feeds those
+        # ids back as `known_order_ids`, so emitting the history-page stub for a
+        # failed detail fetch caches a detail-less order permanently — the next
+        # sync skips it as already known. Being forgiving here is what makes the
+        # damage unrecoverable.
+        def get_order(number, clone):
+            return None if number == "222" else FakeOrder(number, detailed=True)
+
+        code, events, _ = self.run_worker(
+            orders=[FakeOrder("111"), FakeOrder("222")], get_order=get_order
+        )
+        self.assertEqual([e["data"]["order_id"] for e in self.kinds(events, "order")], ["111"])
+        self.assertEqual(code, 1)
+
+    def test_a_run_that_lost_details_does_not_look_like_a_clean_sync(self):
+        # Exit 0 with no terminal error is how cron and `&&` chains are told the
+        # sync completed. A run that gave up on orders has not completed.
+        code, events, _ = self.run_worker(
+            orders=[FakeOrder("111")], get_order=lambda number, clone: None
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(self.kinds(events, "done"), [])
+        errors = self.kinds(events, "error")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("111", errors[0]["msg"])
+
+    def test_a_detail_fetch_that_raises_is_treated_as_a_loss_not_a_stub(self):
+        def get_order(number, clone):
+            raise RuntimeError("connection reset by peer")
+
+        code, events, _ = self.run_worker(orders=[FakeOrder("111")], get_order=get_order)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.kinds(events, "order"), [])
+
+    def test_already_stored_orders_are_counted_as_skipped(self):
+        # `skipped` reached the parent as a hard-coded 0, so the "(N skipped)"
+        # the parent knows how to print could never appear.
+        code, events, _ = self.run_worker(
+            orders=[FakeOrder("111"), FakeOrder("222")], known_order_ids=["111"]
+        )
+        self.assertEqual(code, 0)
+        done = self.kinds(events, "done")[0]
+        self.assertEqual((done["count"], done["skipped"]), (1, 1))
+
+    def test_a_session_earned_this_run_survives_a_later_failure(self):
+        # Finding 7 end to end: the run starts with a stale jar, signs in for
+        # real, and only then hits a failure that strips the jar. What gets put
+        # back must be the session this run earned.
+        cookies_holder = {}
+
+        def login():
+            cookies_holder["path"].write_text(FRESH)
+
+        def history(year):
+            cookies_holder["path"].write_text(BOUNCED)
+            raise RuntimeError("500 Server Error")
+
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, True)
+        cookies = home / "amazon" / "cache" / "cookies.json"
+        cookies.parent.mkdir(parents=True)
+        cookies.write_text(GOOD)
+        cookies_holder["path"] = cookies
+
+        request = {
+            "action": "sync",
+            "email": "someone@example.invalid",
+            "password": "unused-have-cookies",
+            "years": [2026],
+        }
+        with fake_amazonorders(login, history, lambda n, c: None), mock.patch.dict(
+            os.environ, {"XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home)}
+        ), mock.patch.object(
+            sys, "stdin", io.StringIO(json.dumps(request) + "\n")
+        ), redirect_stdout(io.StringIO()):
+            code = fetch.main()
+
+        self.assertEqual(code, 1)
+        self.assertEqual(cookies.read_text(), FRESH)
 
 
 if __name__ == "__main__":
