@@ -107,7 +107,9 @@ module Amazon
         # hasn't expired.
         def cookies_authenticated?
           jar = read_json(Amazon::Config.cache_dir.join("cookies.json"))
-          return false unless jar.is_a?(Hash) && jar.key?("x-main")
+          # `key?` isn't enough: a cookie is deleted over HTTP by being set to
+          # empty, so a bounced sync leaves the name behind with nothing in it.
+          return false unless jar.is_a?(Hash) && !jar["x-main"].to_s.empty?
           session_cookie_live?("x-main")
         end
 

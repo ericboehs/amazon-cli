@@ -63,6 +63,15 @@ class JarCookieNamesTest(unittest.TestCase):
     def test_reads_names(self):
         self.assertEqual(jar_cookie_names(GOOD), {"x-main", "at-main", "session-id", "ubid-main"})
 
+    def test_a_cookie_with_no_value_is_not_held(self):
+        # How a cookie is deleted over HTTP: the response sets it to empty with
+        # an expiry in the past, and requests' jar keeps the name with `""`.
+        # Counting the name as present is counting a deletion as a session —
+        # the strip that this whole file exists to catch would sail past the
+        # regression check with `x-main` sitting there, empty.
+        self.assertEqual(jar_cookie_names(json.dumps({"x-main": "", "session-id": "v"})),
+                         {"session-id"})
+
     def test_unreadable_jars_are_empty_not_fatal(self):
         # A corrupt or truncated jar must not crash a sync; it reads as "no
         # cookies", which makes the regression check treat it as a loss.
@@ -95,6 +104,14 @@ class JarRegressedTest(unittest.TestCase):
 
     def test_a_jar_that_never_had_auth_cookies_is_not_a_regression(self):
         self.assertFalse(jar_regressed(BOUNCED, WIPED))
+
+    def test_an_auth_cookie_emptied_out_is_a_regression(self):
+        # The quiet version of a sign-in bounce: the name survives, the value
+        # doesn't. Read as "still there", it is a stripped jar that no longer
+        # looks stripped — and the restore never fires.
+        before = json.dumps({"x-main": "v", "session-id": "v"})
+        emptied = json.dumps({"x-main": "", "session-id": "v"})
+        self.assertTrue(jar_regressed(before, emptied))
 
     def test_losing_any_single_auth_cookie_counts(self):
         for name in AUTH_COOKIE_NAMES:

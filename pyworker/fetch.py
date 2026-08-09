@@ -52,14 +52,25 @@ AUTH_COOKIE_NAMES = ("x-main", "at-main", "sess-at-main", "sst-main", "ubid-main
 
 
 def jar_cookie_names(raw: str | None) -> set[str]:
-    """Cookie *names* in a jar blob. Names only — values are never handled here."""
+    """Names of the cookies a jar actually holds.
+
+    A name with an empty value doesn't count. Deleting a cookie over HTTP is
+    setting it to `""` with an expiry in the past, and requests' jar keeps the
+    name — so the quiet form of a sign-in bounce leaves `x-main` sitting there,
+    empty. Counting that as held reads a deletion as a session: the strip this
+    module exists to catch stops looking like one, and the restore never fires.
+
+    Values are compared against nothing and never leave this function.
+    """
     if not raw:
         return set()
     try:
         data = json.loads(raw)
     except (ValueError, TypeError):
         return set()
-    return set(data) if isinstance(data, dict) else set()
+    if not isinstance(data, dict):
+        return set()
+    return {name for name, value in data.items() if value}
 
 
 def jar_regressed(before: str | None, after: str | None) -> bool:
