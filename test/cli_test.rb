@@ -29,11 +29,10 @@ SimpleCov.start do
   use_merging false
   add_filter '/test/'
   add_filter '/web.rb'
-  # Browser- and 1Password-bound: `login` drives a real Chrome window and
-  # `order sync` shells out to `op` and the amazon-orders worker, so both are
-  # verified by live runs. Everything else is graded, including worker.rb —
-  # its NDJSON protocol is driven against a stub subprocess.
-  add_filter '/lib/amazon/commands/login.rb'
+  # 1Password-bound: `order sync` shells out to `op` and the amazon-orders
+  # worker, so it's verified by live runs. Everything else is graded, including
+  # worker.rb and login.rb — the browser lives on the far side of a subprocess,
+  # and their NDJSON protocol is driven against a stub one.
   add_filter '/lib/amazon/commands/order/sync.rb'
   minimum_coverage line: 99, branch: 95
 end
@@ -1114,6 +1113,159 @@ def with_python_cmd(script_body)
 ensure
   Amazon::Worker.send(:define_method, :python_cmd, original)
   Amazon::Worker.send(:private, :python_cmd)
+end
+
+# `login` was excluded from coverage on the grounds that it drives a real Chrome
+# window. It doesn't — login.py does, on the far side of a subprocess. What
+# login.rb does is read NDJSON off a pipe and decide what the user is told,
+# which is the same thing worker.rb does and is graded the same way.
+def with_login_python(script_body)
+  klass = Amazon::Commands::Login
+  original = klass.instance_method(:python_cmd)
+  script = "require 'json'\n#{script_body}"
+  klass.send(:define_method, :python_cmd) { ['ruby', '-e', script] }
+  yield
+ensure
+  klass.send(:define_method, :python_cmd, original)
+  klass.send(:private, :python_cmd)
+end
+
+class LoginCommandTest < Minitest::Test
+  def login(quiet: false, verbose: false)
+    Amazon::Commands::Login.new(Amazon::GlobalOptions.new(json: false, quiet: quiet, verbose: verbose))
+  end
+
+  def test_help_needs_no_subprocess
+    out, = capture_io_streams { assert_equal 0, login.run(%w[--help]) }
+    assert_includes out, 'Usage: amazon login'
+    assert_includes out, 'order history'
+  end
+
+  def test_it_relays_the_worker_events
+    body = <<~SCRIPT
+      puts({event: 'navigate', url: 'https://www.amazon.com/your-orders/orders'}.to_json)
+      puts({event: 'log', msg: 'waiting (540s left)'}.to_json)
+      puts({event: 'done', count: 23, cookies_path: '/tmp/cookies.json'}.to_json)
+    SCRIPT
+    with_login_python(body) do
+      _, err = capture_io_streams { assert_equal 0, login.run([]) }
+      assert_includes err, '→ https://www.amazon.com/your-orders/orders'
+      assert_includes err, 'waiting (540s left)'
+      assert_includes err, 'saved 23 cookies to /tmp/cookies.json'
+    end
+  end
+
+  def test_quiet_keeps_the_result_and_drops_the_narration
+    body = <<~SCRIPT
+      puts({event: 'log', msg: 'waiting (540s left)'}.to_json)
+      puts({event: 'navigate', url: 'https://www.amazon.com/'}.to_json)
+      puts({event: 'done', count: 23, cookies_path: '/tmp/cookies.json'}.to_json)
+    SCRIPT
+    with_login_python(body) do
+      _, err = capture_io_streams { login.run([]) }
+      assert_includes err, 'waiting (540s left)'
+
+      _, err = capture_io_streams { login(quiet: true).run([]) }
+      refute_includes err, 'waiting'
+      refute_includes err, '→ '
+      # -q suppresses progress, not the one line saying whether it worked.
+      assert_includes err, 'saved 23 cookies'
+    end
+  end
+
+  def test_an_error_event_is_printed_and_the_exit_code_carried_out
+    body = <<~SCRIPT
+      puts({event: 'error', msg: 'the browser window was closed before order history loaded'}.to_json)
+      exit 1
+    SCRIPT
+    with_login_python(body) do
+      _, err = capture_io_streams { assert_equal 1, login.run([]) }
+      assert_includes err, 'amazon login: the browser window was closed'
+    end
+  end
+
+  # The reason this file is graded now. login.py has statements outside every
+  # handler — the two writes, the chmods, `page.goto` — and a disk-full OSError
+  # comes out as a traceback on stderr with nothing on stdout. That was
+  # discarded unless -v happened to be passed, so the user got exit 1 and not a
+  # single line of output.
+  def test_a_silent_crash_surfaces_its_stderr
+    body = <<~SCRIPT
+      warn 'Traceback (most recent call last):'
+      warn 'OSError: [Errno 28] No space left on device'
+      exit 1
+    SCRIPT
+    with_login_python(body) do
+      _, err = capture_io_streams { assert_equal 1, login.run([]) }
+      assert_includes err, 'the browser worker failed'
+      assert_includes err, 'No space left on device'
+    end
+  end
+
+  def test_stderr_is_not_repeated_when_the_worker_already_explained_itself
+    body = <<~SCRIPT
+      warn 'noisy playwright deprecation notice'
+      puts({event: 'error', msg: 'timed out waiting for sign-in (10 min)'}.to_json)
+      exit 1
+    SCRIPT
+    with_login_python(body) do
+      _, err = capture_io_streams { assert_equal 1, login.run([]) }
+      assert_includes err, 'timed out waiting for sign-in'
+      refute_includes err, 'the browser worker failed'
+    end
+  end
+
+  def test_verbose_relays_stderr_as_it_arrives_without_the_tail
+    body = <<~SCRIPT
+      warn 'OSError: [Errno 28] No space left on device'
+      exit 1
+    SCRIPT
+    with_login_python(body) do
+      _, err = capture_io_streams { assert_equal 1, login(verbose: true).run([]) }
+      assert_equal 1, err.scan('No space left on device').length
+    end
+  end
+
+  def test_a_clean_exit_with_no_stderr_says_nothing_extra
+    with_login_python("exit 0") do
+      _, err = capture_io_streams { assert_equal 0, login.run([]) }
+      assert_empty err
+    end
+  end
+
+  # A truncated line and a bug in the parser used to look identical: `rescue nil`
+  # swallowed every StandardError and returned nil for both.
+  def test_non_json_output_is_skipped_and_only_shown_under_v
+    body = <<~SCRIPT
+      puts '{"event": "log", "msg": "trunc'
+      puts({event: 'done', count: 1, cookies_path: '/tmp/c.json'}.to_json)
+    SCRIPT
+    with_login_python(body) do
+      _, err = capture_io_streams { assert_equal 0, login(verbose: true).run([]) }
+      assert_includes err, '[login] non-JSON output: {"event": "log", "msg": "trunc'
+      assert_includes err, 'saved 1 cookies'
+
+      _, err = capture_io_streams { assert_equal 0, login.run([]) }
+      refute_includes err, 'non-JSON'
+    end
+  end
+
+  def test_blank_lines_are_ignored
+    body = <<~SCRIPT
+      puts ''
+      puts({event: 'done', count: 1, cookies_path: '/tmp/c.json'}.to_json)
+    SCRIPT
+    with_login_python(body) do
+      _, err = capture_io_streams { assert_equal 0, login.run([]) }
+      assert_includes err, 'saved 1 cookies'
+    end
+  end
+
+  def test_the_real_command_prefers_the_venv_interpreter_when_present
+    cmd = login.send(:python_cmd)
+    assert_equal 'login.py', cmd.last
+    assert_match(/python3?\z/, cmd.first)
+  end
 end
 
 class WorkerProtocolTest < Minitest::Test
