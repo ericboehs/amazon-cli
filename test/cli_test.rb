@@ -2407,6 +2407,34 @@ class ReviewsThemesTest < Minitest::Test
   def test_too_few_critical_reviews_to_generalise
     assert_empty analyze(reviews: [review(1, 'rating' => 1.0), review(2, 'rating' => 1.0)])['themes']
   end
+
+  # "What critical reviews mention" is a claim about reviewers, not about word
+  # frequency. Unigrams were already counted once per review; bigrams were not,
+  # so one person who said "filament jammed" three times cleared the two-mention
+  # bar alone and got printed as "(3x)" — three reviewers, as far as anyone
+  # reading the report could tell.
+  def test_one_reviewer_repeating_a_phrase_is_not_a_theme
+    reviews = [
+      review(1, 'rating' => 1.0, 'title' => tag(1),
+                'body' => 'Filament jammed. Filament jammed again. Filament jammed a third time.'),
+      review(2, 'rating' => 1.0, 'title' => tag(2), 'body' => "#{tag(20)} #{tag(21)}."),
+      review(3, 'rating' => 1.0, 'title' => tag(3), 'body' => "#{tag(30)} #{tag(31)}.")
+    ]
+    assert_empty analyze(reviews: reviews)['themes']
+  end
+
+  def test_a_phrase_two_reviewers_use_is_still_a_theme
+    reviews = [
+      review(1, 'rating' => 1.0, 'title' => tag(1), 'body' => 'Filament jammed. Filament jammed again.'),
+      review(2, 'rating' => 1.0, 'title' => tag(2), 'body' => 'Filament jammed on the first spool.'),
+      review(3, 'rating' => 1.0, 'title' => tag(3), 'body' => "#{tag(30)} #{tag(31)}.")
+    ]
+    themes = analyze(reviews: reviews)['themes']
+    jammed = themes.find { |t| t['phrase'] == 'filament jammed' }
+    refute_nil jammed
+    # Two reviewers, not the three times it appears.
+    assert_equal 2, jammed['count']
+  end
 end
 
 # --- Review formatting -------------------------------------------------
