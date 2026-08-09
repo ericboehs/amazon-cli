@@ -528,12 +528,26 @@ def scrape_item(
     if not title:
         raise RuntimeError(f"no product found for {asin} (page may be a 404 or a redirect)")
 
+    # The featured offer's row comes first, for the same reason the seller does.
+    # On an accordion listing `#corePrice_feature_div` exists once per row, so
+    # the unscoped selector below matches the used offer's price too — measured
+    # on both fixtures: 2 matches, the second being $563.36 against a $599.00
+    # buybox. Today `.first` returns the right one only because the new row
+    # precedes the used row in the document, and which row Amazon features is
+    # not ours to assume. Getting this wrong prints the used offer's price in
+    # bold beside the new offer's seller, which is the defect this PR is named
+    # for with the two halves swapped.
     price_raw = text(
         page,
+        "[id^=newAccordionRow] .a-price .a-offscreen",
         "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
         "#corePrice_feature_div .a-price .a-offscreen",
         "#priceblock_ourprice",
         "#priceblock_dealprice",
+        # Last resort, and page-wide: it will match a "Buy it with" bundle or an
+        # accessory carousel on a listing whose buybox has no price at all.
+        # Kept because a listing with no buybox still has a price worth showing,
+        # and narrowed to the buybox first by everything above it.
         ".a-price .a-offscreen",
     )
     list_raw = text(

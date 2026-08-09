@@ -1338,3 +1338,57 @@ class RealMarkupCleanTextTest(unittest.TestCase):
         self.assertIsNotNone(got)
         self.assertNotIn("{", got)
         self.assertIn("left in stock", got)
+
+
+class RealMarkupPriceTest(unittest.TestCase):
+    """The price half of the same offer-mixing hazard.
+
+    The seller was being read off one offer and the price off another. Fixing
+    the seller left the price side reading `#corePrice_feature_div`, which on an
+    accordion listing exists once per offer row.
+    """
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest("beautifulsoup4 is not installed (this is the bare-interpreter CI job)")
+
+    # (fixture, featured price, used-offer price)
+    PAGES = (
+        ("buybox_amazon_sold.html", "$599.00", "$563.36"),
+        ("buybox_third_party.html", "$519.99", "$451.73"),
+    )
+
+    def test_the_unscoped_selector_really_does_reach_the_used_offer(self):
+        # Establishes the hazard is real before asserting it's handled — without
+        # this, the test below passes on a page where there is only one price
+        # and proves nothing.
+        for name, _featured, used in self.PAGES:
+            page = DomPage.from_fixture(name)
+            prices = [
+                t.strip()
+                for t in page.locator("#corePrice_feature_div .a-price .a-offscreen").all_text_contents()
+            ]
+            self.assertIn(used, prices, name)
+
+    def test_the_featured_offers_price_is_the_one_reported(self):
+        for name, featured, used in self.PAGES:
+            page = DomPage.from_fixture(name)
+            got = text(page, "[id^=newAccordionRow] .a-price .a-offscreen")
+            self.assertEqual(got, featured, name)
+            self.assertNotEqual(got, used, name)
+
+    def test_price_and_seller_come_from_the_same_offer(self):
+        # The invariant the whole PR is about: never pair one offer's price with
+        # another's seller. Spelled out as a literal rather than built from
+        # SELLER_SELECTORS, so it stays an independent statement about the page.
+        seller_in_featured_row = (
+            "[id^=newAccordionRow] [offer-display-feature-name=desktop-merchant-info] "
+            ".offer-display-feature-text-message"
+        )
+        for name, _featured, _used in self.PAGES:
+            page = DomPage.from_fixture(name)
+            self.assertGreaterEqual(
+                page.locator(seller_in_featured_row).count(),
+                1,
+                f"{name}: the seller is not inside the row the price is read from",
+            )
