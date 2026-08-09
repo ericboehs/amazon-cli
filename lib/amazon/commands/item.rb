@@ -52,6 +52,7 @@ module Amazon
           warn "amazon: no product data for #{target} — the worker finished without returning an item"
           return 1
         end
+        cache.replay_degradations(data)
 
         store = Amazon::Store.new
         data = data.merge("purchases" => store.purchases_by_asin[data["asin"]] || [])

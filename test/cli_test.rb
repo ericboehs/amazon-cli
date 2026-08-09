@@ -2646,6 +2646,34 @@ class ReviewsCommandTest < Minitest::Test
     assert_includes out, '5-review sample'
   end
 
+  # The worker announces a degraded scrape once, while it is scraping. The
+  # result is then cached, so every run inside the TTL renders the same partial
+  # data with none of the warnings that came with it — and the run that looks
+  # clean is the one where the user has no way of knowing it isn't.
+  def test_a_cached_degraded_scrape_still_says_it_was_degraded
+    degraded = Class.new do
+      def item(_asin, **kw)
+        FakeWorker.new.item('B1', **kw).merge(
+          '_degraded' => ['4/6 expected fields were empty (seller, rating, image, price)']
+        )
+      end
+    end.new
+    _, first = run_cli('reviews', 'B0ROTTED', '--fresh', worker: degraded)
+    # Not on the fetch: the worker already said it live, and saying it twice
+    # trains people to skip it.
+    refute_includes first, 'expected fields were empty'
+
+    _, second = run_cli('reviews', 'B0ROTTED', worker: degraded)
+    assert_includes second, 'expected fields were empty'
+    assert_includes second, 'cached'
+  end
+
+  def test_a_cached_clean_scrape_says_nothing
+    run_cli('reviews', 'B0CLEAN', '--fresh')
+    _, err = run_cli('reviews', 'B0CLEAN')
+    refute_includes err, 'cached'
+  end
+
   def test_critical_with_no_low_ratings_explains_the_empty_result
     # Amazon's product-page picks skew positive, so this is common on real
     # listings; printing nothing would read as "no complaints exist".

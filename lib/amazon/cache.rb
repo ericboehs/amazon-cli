@@ -20,14 +20,30 @@ module Amazon
       @write = write
     end
 
+    # Whether the last `fetch` was served from disk. Callers need to tell the
+    # two apart: warnings the worker emitted while scraping went to this run's
+    # stderr on a miss and to nobody at all on a hit.
+    attr_reader :hit
+
     # Yields and stores on miss; returns cached value on hit.
     def fetch(key)
-      hit = read(key)
-      return hit unless hit.nil?
+      cached = read(key)
+      @hit = !cached.nil?
+      return cached if @hit
 
       value = yield
       write(key, value)
       value
+    end
+
+    # Re-print the notes the worker attached to a degraded scrape, but only for
+    # a payload that came off disk. On a miss the worker said all of this on
+    # this run's stderr as it scraped; on a hit it said it to a run that has
+    # already finished, and what's left is a partial report that looks exactly
+    # like a whole one.
+    def replay_degradations(data)
+      return unless @hit && data.is_a?(Hash)
+      Array(data["_degraded"]).each { |msg| warn "amazon: [cached] #{msg}" }
     end
 
     def read(key)

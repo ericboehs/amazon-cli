@@ -54,6 +54,7 @@ module Amazon
           warn "amazon: no product data for #{target} — the worker finished without returning an item"
           return 1
         end
+        cache.replay_degradations(data)
 
         # Analysis runs on the whole sample; --critical narrows only what gets
         # printed. Scoring a hand-picked subset would be meaningless.
