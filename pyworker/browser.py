@@ -11,9 +11,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
+
+# Amazon inlines <style> blocks inside content containers — #availability_feature_div
+# ships one — and Playwright's inner_text hands back their source as text. Anchoring
+# on a leading `.`/`#` selector token plus a braced body keeps this off ordinary
+# product copy, which does not contain CSS rules.
+CSS_RULE_RE = re.compile(r"[.#][\w-]+[^{}]*\{[^{}]*\}")
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -148,12 +155,23 @@ def text(scope: Any, *selectors: str) -> str | None:
             loc = scope.locator(sel).first
             if loc.count() == 0:
                 continue
-            val = " ".join(loc.inner_text().split())
+            val = clean_text(loc.inner_text())
             if val:
                 return val
         except Exception:  # noqa: BLE001
             continue
     return None
+
+
+def clean_text(raw: str | None) -> str:
+    """Collapse whitespace and drop any inlined CSS the container carried.
+
+    Without this, "Only 4 left in stock - order soon." comes back with a style
+    rule stapled to it, and it reads as scraper output nobody checked.
+    """
+    if not raw:
+        return ""
+    return " ".join(CSS_RULE_RE.sub(" ", raw).split())
 
 
 def attr(scope: Any, selector: str, name: str) -> str | None:

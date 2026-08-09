@@ -14,12 +14,15 @@ import browser
 from browser import (
     Blocked,
     NotLoggedIn,
+    clean_text,
     guard,
     is_signin_page,
     parse_money,
     session_rejected,
+    text,
 )
 from live import (
+    SELLER_SELECTORS,
     extract_asin,
     parse_delivery_date,
     parse_helpful_votes,
@@ -994,3 +997,87 @@ class ScrapeReviewsIdlessDedupeTest(unittest.TestCase):
         got, walk = scrape_reviews(Page(), "B0TEST00001", pages=3)
         self.assertEqual(len(got), 4)
         self.assertEqual(walk, "complete")
+class FakeTextPage:
+    """Selector -> raw inner_text, for exercising `text()`'s fallback chain.
+
+    Built on the review suite's `FakeTextLocator` rather than a second stand-in
+    of its own: two locator fakes in one file is how one of them quietly stops
+    resembling Playwright.
+    """
+
+    def __init__(self, texts):
+        self._texts = texts
+
+    def locator(self, sel):
+        found = self._texts.get(sel)
+        if found is None:
+            return FakeTextLocator(count=0)
+        return FakeTextLocator(count=1, text=found)
+
+
+class CleanTextTest(unittest.TestCase):
+    # Verbatim from #availability_feature_div on a live product page. Playwright
+    # hands back the inlined <style> block as though it were copy.
+    AVAILABILITY = (
+        "Only 4 left in stock - order soon.                    \n"
+        "    .availabilityMoreDetailsIcon {\n"
+        "        width: 12px;\n"
+        "        vertical-align: baseline;\n"
+        "        fill: #969696;\n"
+        "    }"
+    )
+
+    def test_an_inlined_style_block_is_dropped(self):
+        self.assertEqual(clean_text(self.AVAILABILITY), "Only 4 left in stock - order soon.")
+
+    def test_whitespace_is_collapsed(self):
+        self.assertEqual(clean_text("  In\n  Stock \t"), "In Stock")
+
+    def test_ordinary_copy_is_untouched(self):
+        # Braces and #hashes appear in real titles; only a selector *plus* a
+        # braced body is CSS, and neither of these is that.
+        for raw in ("Sold by Amazon.com", "Set of 4 {assorted} colors", "Filament #3 refill"):
+            self.assertEqual(clean_text(raw), raw)
+
+    def test_empty(self):
+        self.assertEqual(clean_text(None), "")
+        self.assertEqual(clean_text(""), "")
+
+    def test_text_applies_the_cleaning(self):
+        page = FakeTextPage({"#availability": self.AVAILABILITY})
+        self.assertEqual(text(page, "#availability"), "Only 4 left in stock - order soon.")
+
+
+class SellerSelectorsTest(unittest.TestCase):
+    """Regression: B0GJ5S4V78 is new, $599, sold by Amazon.com — and was reported
+    as "Sold by Amazon Resale" because the unscoped `#merchant-info` matched the
+    used-offer accordion instead of the buybox."""
+
+    BUYBOX = SELLER_SELECTORS[0]
+    USED_OFFER = "#merchant-info"
+
+    def test_the_buybox_seller_wins_over_a_used_offer_block(self):
+        page = FakeTextPage({
+            self.BUYBOX: "Amazon.com",
+            self.USED_OFFER: "Sold by Amazon Resale and Fulfilled by Amazon.",
+        })
+        self.assertEqual(text(page, *SELLER_SELECTORS), "Amazon.com")
+
+    def test_a_listing_with_only_a_used_offer_reports_nothing_rather_than_it(self):
+        # An unscoped `#merchant-info` here would attribute the used offer's
+        # seller to the new-offer price sitting next to it in the output.
+        page = FakeTextPage({self.USED_OFFER: "Sold by Amazon Resale and Fulfilled by Amazon."})
+        self.assertIsNone(text(page, *SELLER_SELECTORS))
+
+    def test_every_selector_is_scoped_to_the_buybox(self):
+        for sel in SELLER_SELECTORS:
+            self.assertTrue(sel.startswith("#buybox "), sel)
+
+    def test_the_seller_profile_link_is_not_in_the_chain(self):
+        # Its text is "Learn more about the seller", not a seller name — it was
+        # winning the chain on listings that had no used offer to mis-match.
+        self.assertNotIn("#sellerProfileTriggerId", " ".join(SELLER_SELECTORS))
+
+    def test_the_tabular_layout_still_resolves(self):
+        page = FakeTextPage({SELLER_SELECTORS[1]: "ELEGOO Official US"})
+        self.assertEqual(text(page, *SELLER_SELECTORS), "ELEGOO Official US")

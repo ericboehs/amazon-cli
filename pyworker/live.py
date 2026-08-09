@@ -101,6 +101,24 @@ STAR_PREFIX_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s+out of\s+\d+(?:\.\d+)?\s+stars
 SORT_KEYS = {"helpful": "helpful", "recent": "recent"}
 
 
+# Who is actually selling the thing in the buybox.
+#
+# Every one of these is scoped to #buybox on purpose. A listing that also has a
+# used offer renders a second merchant block for it, and the old unscoped
+# `#merchant-info` matched *that* one — so a new $599 item sold by Amazon.com
+# was reported as "Sold by Amazon Resale", pairing the new offer's price with
+# the used offer's seller. Nothing in the output hinted the two came from
+# different offers.
+#
+# `#sellerProfileTriggerId` is gone rather than demoted: it is the "Learn more
+# about the seller" link, and its text is that boilerplate, not a seller name.
+SELLER_SELECTORS = (
+    "#buybox [offer-display-feature-name=desktop-merchant-info] .offer-display-feature-text-message",
+    "#buybox .tabular-buybox-text[tabular-attribute-name='Sold by']",
+    "#buybox #merchant-info",
+)
+
+
 def extract_asin(raw: str) -> str | None:
     """Accept a bare ASIN, a /dp/ URL, or a /gp/product/ URL.
 
@@ -535,7 +553,7 @@ def scrape_item(
         "delivery_raw": delivery_raw,
         "delivery_date": parse_delivery_date(delivery_raw or fastest_raw),
         "fastest_raw": fastest_raw,
-        "seller": text(page, "#sellerProfileTriggerId", "#merchant-info", "#tabular-buybox"),
+        "seller": text(page, *SELLER_SELECTORS),
         "rating": _first_float(rating_raw),
         "reviews": _review_count(reviews_raw),
         "coupon": text(page, "#promoPriceBlockMessage_feature_div", "#couponFeature"),
