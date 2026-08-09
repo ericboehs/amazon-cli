@@ -187,9 +187,22 @@ module Amazon
     # `Progress` alone, which only the sync path builds.
     def log_event(event)
       level = event["level"] || "info"
-      return unless @verbose || level == "warn"
+      return unless @verbose || loud?(level)
       warn("[worker:#{level}] #{event["msg"]}")
     end
+
+    # Levels quiet enough to hide behind -v. Everything else prints, which is
+    # the asymmetry rather than the ordering: this used to be `level == "warn"`,
+    # an equality test wearing a threshold's clothes, and it made `error`
+    # *quieter* than `warn` — backwards from what any author reaching for the
+    # more severe word would assume, and silent about being backwards. A typo'd
+    # `warning` vanished the same way. Unrecognized resolves loud for the same
+    # reason `classify_failure` resolves an unrecognized exception transient:
+    # the cost of a needless line is a line, and the cost of the other
+    # direction is the message that mattered.
+    ROUTINE_LEVELS = %w[debug trace info].freeze
+
+    def loud?(level) = !ROUTINE_LEVELS.include?(level)
 
     def live_error(event)
       case event["kind"]
