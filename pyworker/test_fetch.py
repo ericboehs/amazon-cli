@@ -113,10 +113,25 @@ class JarRegressedTest(unittest.TestCase):
         emptied = json.dumps({"x-main": "", "session-id": "v"})
         self.assertTrue(jar_regressed(before, emptied))
 
-    def test_losing_any_single_auth_cookie_counts(self):
+    def test_an_anonymous_jar_is_not_a_session_worth_protecting(self):
+        # `ubid-main` is a device id Amazon sets before you have ever signed in.
+        # Treating its loss as a regression armed the rollback on a jar that was
+        # never a session — including on the first sync of a new install, where
+        # what it would roll back over is the jar the login just earned.
+        anonymous = json.dumps({"ubid-main": "v", "session-id": "v"})
+        self.assertFalse(jar_regressed(anonymous, WIPED))
+
+    def test_the_trigger_is_the_cookie_everything_keys_on(self):
+        # amazon-orders and `cookies_authenticated?` both decide on `x-main`
+        # alone, so it is the loss that actually costs you the session. The
+        # others are put back by the repair, but they don't arm it: firing on a
+        # cookie nobody reads is how a rollback happens over a healthy jar.
         for name in AUTH_COOKIE_NAMES:
-            before = json.dumps({name: "v", "session-id": "v"})
-            self.assertTrue(jar_regressed(before, BOUNCED), name)
+            if name == "x-main":
+                continue
+            before = json.dumps({"x-main": "v", name: "v"})
+            self.assertFalse(jar_regressed(before, json.dumps({"x-main": "v"})), name)
+        self.assertTrue(jar_regressed(json.dumps({"x-main": "v"}), WIPED))
 
 
 class RestoreJarTest(unittest.TestCase):
@@ -163,6 +178,27 @@ class RestoreJarTest(unittest.TestCase):
             path = Path(d) / "cookies.json"
             self.assertTrue(silently(lambda: restore_jar(path, GOOD, "the test")))
             self.assertEqual(path.read_text(), GOOD)
+
+    def test_the_runs_own_writes_survive_the_repair(self):
+        # Rolling the file back wholesale undoes more than the failure did.
+        # Amazon rotates its anonymous cookies constantly and amazon-orders
+        # persists every one of those writes, so a jar restored byte-for-byte
+        # comes back stale in ways that had nothing to do with the bounce.
+        after = json.dumps({"session-id": "rotated", "csm-hit": "new"})
+        wrote, text, _ = self._restore(GOOD, after)
+        self.assertTrue(wrote)
+        self.assertEqual(json.loads(text), {
+            "x-main": "v", "at-main": "v", "ubid-main": "v",  # put back
+            "session-id": "rotated",                          # kept, not reverted
+            "csm-hit": "new",                                 # kept
+        })
+
+    def test_a_truncated_jar_is_replaced_wholesale(self):
+        # Nothing can read it — amazon-orders least of all — so there is no
+        # write of this run's worth keeping. It counts as the session gone.
+        wrote, text, _ = self._restore(GOOD, '{"x-main": "v", "at-mai')
+        self.assertTrue(wrote)
+        self.assertEqual(json.loads(text), json.loads(GOOD))
 
     def test_it_says_which_run_did_the_damage(self):
         with tempfile.TemporaryDirectory() as d:
@@ -318,7 +354,7 @@ class JarGuardTest(unittest.TestCase):
         guard, path = self.guard()
         path.write_text(BOUNCED)
         self.assertTrue(silently(lambda: guard.restore("the test")))
-        self.assertEqual(path.read_text(), GOOD)
+        self.assertEqual(json.loads(path.read_text())["x-main"], "v")
 
     def test_clearing_latches_the_session_dead(self):
         # The interaction that makes the latch necessary rather than tidy: the
@@ -343,7 +379,7 @@ class JarGuardTest(unittest.TestCase):
         guard.resnapshot()
         path.write_text(BOUNCED)
         self.assertTrue(silently(lambda: guard.restore("the test")))
-        self.assertEqual(path.read_text(), FRESH)
+        self.assertEqual(json.loads(path.read_text())["x-main"], "earned")
 
     def test_resnapshotting_a_jar_that_is_gone_protects_nothing(self):
         # Not every login leaves a jar behind — and "nothing there" must not
@@ -647,7 +683,7 @@ class WorkerRunTest(unittest.TestCase):
             code = fetch.main()
 
         self.assertEqual(code, 1)
-        self.assertEqual(cookies.read_text(), FRESH)
+        self.assertEqual(json.loads(cookies.read_text())["x-main"], "earned")
 
 
 if __name__ == "__main__":

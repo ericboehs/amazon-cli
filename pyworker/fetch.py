@@ -50,6 +50,23 @@ from browser import session_rejected
 # the error's own advice ("Run: amazon login") walks you back into the same trap.
 AUTH_COOKIE_NAMES = ("x-main", "at-main", "sess-at-main", "sst-main", "ubid-main")
 
+# The one every consumer decides on: amazon-orders' COOKIES_SET_WHEN_AUTHENTICATED
+# is `["x-main"]`, and `sync.rb`'s `cookies_authenticated?` reads the same name.
+# Losing it is what costs you the session; the rest are collateral, put back by
+# the repair but never the thing that arms it.
+AUTH_COOKIE = "x-main"
+
+
+def _jar_dict(raw: str | None) -> dict[str, Any]:
+    """A jar blob as a mapping. Anything unreadable is `{}` — never an exception."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
 
 def jar_cookie_names(raw: str | None) -> set[str]:
     """Names of the cookies a jar actually holds.
@@ -62,28 +79,43 @@ def jar_cookie_names(raw: str | None) -> set[str]:
 
     Values are compared against nothing and never leave this function.
     """
-    if not raw:
-        return set()
-    try:
-        data = json.loads(raw)
-    except (ValueError, TypeError):
-        return set()
-    if not isinstance(data, dict):
-        return set()
-    return {name for name, value in data.items() if value}
+    return {name for name, value in _jar_dict(raw).items() if value}
 
 
 def jar_regressed(before: str | None, after: str | None) -> bool:
-    """True when a run stripped sign-in cookies the jar had going in.
+    """True when a run lost the sign-in cookie the jar had going in.
 
     Compares names, not contents: a jar that merely gained or refreshed cookies
-    is a normal, healthy write and must be left alone. Only the loss of an
-    authentication cookie means the run traded a working session for a dead one.
+    is a normal, healthy write and must be left alone.
+
+    Only `x-main` arms it. `ubid-main` is a device id Amazon sets before you
+    have ever signed in, so counting its loss put the rollback on a hair
+    trigger over jars that were never sessions — the first sync of a new
+    install being the worst case, where what it would roll back over is the jar
+    the login had just earned. A rollback is a destructive act; it should need
+    the one cookie whose absence actually costs you the session.
     """
     if before is None:
         return False
-    had = jar_cookie_names(before) & set(AUTH_COOKIE_NAMES)
-    return bool(had - jar_cookie_names(after))
+    return AUTH_COOKIE in jar_cookie_names(before) and AUTH_COOKIE not in jar_cookie_names(after)
+
+
+def repaired_jar(before: str | None, after: str | None) -> str:
+    """The pre-run jar with everything this run actually wrote layered on top.
+
+    Rolling the file back wholesale undoes more than the failure did. Amazon
+    rotates its anonymous cookies constantly and amazon-orders persists every
+    one of those writes, so a jar restored byte-for-byte comes back stale in
+    ways that had nothing to do with the bounce. Overlaying keeps every value
+    the run wrote and puts back only what it dropped — which on a wiped jar is
+    still the whole thing, and on a stripped one is just the sign-in cookies.
+
+    Empty values are not written: they are how the strip spells a deletion, and
+    letting them win here would be restoring the damage.
+    """
+    merged = _jar_dict(before)
+    merged.update({name: value for name, value in _jar_dict(after).items() if value})
+    return json.dumps(merged)
 
 
 def write_jar(cookies_path: Path, content: str) -> None:
@@ -188,7 +220,7 @@ def restore_jar(cookies_path: Path, jar_before: str | None, reason: str) -> bool
         after = cookies_path.read_text() if cookies_path.exists() else None
         if not jar_regressed(jar_before, after):
             return False
-        write_jar(cookies_path, jar_before)
+        write_jar(cookies_path, repaired_jar(jar_before, after))
     except Exception as e:  # noqa: BLE001 — cleanup must not outrank the message
         emit("log", level="warn", msg=f"could not restore the cookie jar: {e}")
         return False
@@ -197,8 +229,8 @@ def restore_jar(cookies_path: Path, jar_before: str | None, reason: str) -> bool
         level="warn",
         msg=(
             f"{reason} stripped the saved sign-in cookies from {cookies_path}; "
-            "restored the jar as it was. Your session may still be dead — but "
-            "a failed sync no longer destroys a working one."
+            "put them back. Your session may still be dead — but a failed sync "
+            "no longer destroys a working one."
         ),
     )
     return True
