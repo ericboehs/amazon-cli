@@ -204,6 +204,18 @@ module Amazon
 
     def loud?(level) = !ROUTINE_LEVELS.include?(level)
 
+    # `fetch.py` puts a full traceback on its error events as `trace`, and
+    # nothing here read it: `sync` takes `msg`, `live_error` takes `kind` and
+    # `msg`. So the stack naming which parser broke was captured, serialized,
+    # piped, parsed and dropped — at every verbosity, which made -v useless as
+    # an escape hatch. Unconditional for the same reason the stderr tail is:
+    # the run you need it for is the one that already happened.
+    def log_trace(event)
+      trace = event["trace"].to_s
+      return if trace.empty?
+      warn(trace.lines.map { |l| "[worker:trace] #{l.chomp}" }.join("\n"))
+    end
+
     def live_error(event)
       case event["kind"]
       when "not_logged_in", "blocked" then event["msg"]
@@ -253,6 +265,9 @@ module Amazon
               answer = prompt_text(event)
               stdin.write(answer + "\n")
             else
+              # Before the yield, not after: the live callers raise from inside
+              # it, and the traceback is worth most on exactly that path.
+              log_trace(event) if event["event"] == "error"
               yield event
               saw_error = true if event["event"] == "error"
               # `break`, not `return`: returning from here exits the popen3 block
