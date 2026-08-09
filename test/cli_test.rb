@@ -1637,6 +1637,16 @@ class SessionCookieTest < Minitest::Test
     refute authenticated?
   end
 
+  # A cookie is deleted over HTTP by being set to empty, so a bounced sync
+  # leaves the name in the jar with nothing in it. `key?` called that a session:
+  # the next sync skipped the password lookup and posted the placeholder at
+  # Amazon's login form, which is the exact wedge this check exists to prevent.
+  def test_an_emptied_out_session_cookie_is_not_a_session
+    write_jar('x-main' => '')
+    write_storage_state([cookie('x-main', FUTURE)])
+    refute authenticated?
+  end
+
   def test_corrupt_files_are_treated_as_no_session
     File.write(@dir.join('cookies.json'), '{"x-main": trunc')
     write_storage_state([cookie('x-main', FUTURE)])
