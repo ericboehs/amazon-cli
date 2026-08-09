@@ -500,6 +500,7 @@ def main() -> int:
 
         total = 0
         skipped = 0
+        lost: list[str] = []
         for year in years:
             emit("log", level="info", msg=f"fetching year {year} (history page)")
             try:
@@ -538,6 +539,7 @@ def main() -> int:
             new_n = len(new_orders)
             cached_count = n - new_n
             emit("total", year=int(year), count=new_n, new=new_n, cached=cached_count)
+            skipped += cached_count
             if cached_count:
                 emit("log", level="info", msg=f"year {year}: skipping {cached_count} already-stored orders")
 
@@ -568,10 +570,32 @@ def main() -> int:
                     except Exception as e:  # noqa: BLE001
                         emit("log", level="warn",
                              msg=f"detail fetch raised for {original.order_number}: {e}")
-                    order = fetched or original
-                    _emit_progress(year, completed, new_n, order)
-                    emit("order", data=order_to_dict(order, _ao_mod.__version__))
+                    _emit_progress(year, completed, new_n, fetched or original)
+                    if fetched is None:
+                        # Not `fetched or original`. The parent writes every
+                        # order event it is handed and feeds those ids back as
+                        # `known_order_ids`, so emitting the history-page stub
+                        # caches a detail-less order permanently: the next sync
+                        # sees the id, calls it already-stored, and never tries
+                        # again. Being forgiving here is what makes the loss
+                        # unrecoverable. Leaving it out costs one order this
+                        # run and gets it in full on the next.
+                        lost.append(original.order_number)
+                        continue
+                    emit("order", data=order_to_dict(fetched, _ao_mod.__version__))
                     total += 1
+
+        if lost:
+            # An `error` rather than a `done`: the parent stops at whichever
+            # arrives first, keeps the orders it already received, and exits
+            # non-zero. Silently exiting 0 is what makes a sync that gave up on
+            # orders indistinguishable from a complete one to cron and `&&`.
+            shown = ", ".join(lost[:5])
+            more = f" (and {len(lost) - 5} more)" if len(lost) > 5 else ""
+            emit("error", msg=(
+                f"could not fetch full details for {len(lost)} order(s): {shown}{more}. "
+                "They were left unstored so the next sync retries them."))
+            return 1
 
         emit("done", count=total, skipped=skipped)
         return 0
