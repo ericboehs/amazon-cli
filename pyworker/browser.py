@@ -165,12 +165,35 @@ def text(scope: Any, *selectors: str) -> str | None:
             loc = scope.locator(sel).first
             if loc.count() == 0:
                 continue
-            val = clean_text(loc.inner_text())
+            val = clean_text(without_style_nodes(loc, loc.inner_text()))
             if val:
                 return val
         except Exception:  # noqa: BLE001
             continue
     return None
+
+
+def without_style_nodes(loc: Any, raw: str) -> str:
+    """Remove the text of any <style>/<script> the container carried.
+
+    `innerText` normally excludes both — the UA stylesheet gives them
+    `display: none` — but only for an element that is *being rendered*. Amazon's
+    `#availability_feature_div` has no layout box (verified against a live page:
+    `getClientRects().length === 0` while its own `<style>` children compute to
+    `display: none`), and for an unrendered element `innerText` is specified to
+    fall back to `textContent`, which carries the stylesheet source through
+    verbatim. That, not any exotic markup, is where the CSS in the output came
+    from.
+
+    Subtracting the style nodes' own `textContent` removes exactly what leaked
+    and nothing else, which is why this is preferred over pattern-matching the
+    result: a regex has to guess what CSS looks like, and every shape it guesses
+    wrong is either product copy deleted or a rule printed to the user.
+    """
+    for css in loc.locator("style, script").all_text_contents():
+        if css:
+            raw = raw.replace(css, " ")
+    return raw
 
 
 def clean_text(raw: str | None) -> str:

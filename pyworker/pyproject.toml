@@ -8,6 +8,15 @@ dependencies = [
     "playwright>=1.49,<2",
 ]
 
+# Test-only. The selector tests parse a captured product page with a real CSS
+# engine, because a dict-keyed fake answers "does this selector match?" with
+# whatever the production constant happens to say. bs4 arrives transitively via
+# amazon-orders anyway, but naming it here is the point: a transitive dependency
+# that disappears takes the tests with it silently, and these tests are the only
+# thing standing between a mistyped selector and a wrong seller.
+[dependency-groups]
+dev = ["beautifulsoup4>=4.12"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

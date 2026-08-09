@@ -103,19 +103,36 @@ SORT_KEYS = {"helpful": "helpful", "recent": "recent"}
 
 # Who is actually selling the thing in the buybox.
 #
-# Every one of these is scoped to #buybox on purpose. A listing that also has a
-# used offer renders a second merchant block for it, and the old unscoped
-# `#merchant-info` matched *that* one — so a new $599 item sold by Amazon.com
-# was reported as "Sold by Amazon Resale", pairing the new offer's price with
-# the used offer's seller. Nothing in the output hinted the two came from
-# different offers.
+# The bug this replaces: a new $599 item sold by Amazon.com was reported as
+# "Sold by Amazon Resale", pairing the new offer's price with the used offer's
+# seller, with nothing in the output hinting the two came from different offers.
 #
-# `#sellerProfileTriggerId` is gone rather than demoted: it is the "Learn more
+# `#merchant-info` is not on this list, and scoping it to #buybox would not have
+# helped. Captured markup from two live listings (B0GJ5S4V78, B0DT8PV51T) shows
+# the element nested #buybox > #buyBoxAccordion > #usedAccordionRow >
+# #shipsFromSoldBy_feature_div > #merchant-info — it is *inside* the buybox and
+# it belongs to the used offer, on both. On a third listing (B08626WF87) it does
+# not exist at all. So on the evidence available it is never the featured
+# offer's seller, and `test_no_selector_in_the_chain_matches_the_used_offer_block`
+# holds the line.
+#
+# `#sellerProfileTriggerId` is gone for a different reason: it is the "Learn more
 # about the seller" link, and its text is that boilerplate, not a seller name.
+# It is present and reads exactly that on B0DT8PV51T.
+#
+# What is left is two selectors sharing one ancestor, which is thin cover if
+# Amazon renames #buybox. That is deliberate — a fallback that confidently
+# returns the wrong seller is worse than no fallback — and it is why
+# `_missing_seller_warning` exists to say so out loud instead.
+#
+# Known gap: the tabular selector matched nothing on all three listings checked,
+# so it is carried on the strength of the layout existing, not on evidence that
+# this selector finds it. Reversing the order of these two is invisible to the
+# test suite for the same reason. If a tabular page turns up, capture it as a
+# third fixture; until then the first selector is doing all the work.
 SELLER_SELECTORS = (
     "#buybox [offer-display-feature-name=desktop-merchant-info] .offer-display-feature-text-message",
     "#buybox .tabular-buybox-text[tabular-attribute-name='Sold by']",
-    "#buybox #merchant-info",
 )
 
 
@@ -697,10 +714,33 @@ def _selector_rot_warning(data: dict[str, Any]) -> str | None:
     )
 
 
+def _missing_seller_warning(data: dict[str, Any]) -> str | None:
+    """Say so when the seller chain came back empty off a page that has a buybox.
+
+    `_selector_rot_warning` cannot cover this one. It needs three of six fields
+    to fail before it speaks, and every selector in `SELLER_SELECTORS` is rooted
+    at `#buybox` while the other five chains are not — so a rename of that one
+    container empties exactly one field, scores 1/6, and passes in silence. The
+    user then gets a card with price, stock, delivery, rating and image all
+    filled in and simply no Seller line, which is indistinguishable from a
+    listing that legitimately has no seller to show.
+
+    A buybox price is the evidence that rules that out: something is being
+    offered, so somebody is offering it. Deliberately not folded into the
+    threshold — a correlated chain needs its own check, not a larger bucket.
+    """
+    if data.get("seller") or not data.get("price"):
+        return None
+    return (
+        "read a price from the buybox but no seller — the #buybox seller selectors "
+        "may have changed; treat the seller as unknown rather than as absent"
+    )
+
+
 def _warn_selector_rot(data: dict[str, Any]) -> None:
-    msg = _selector_rot_warning(data)
-    if msg:
-        emit("log", level="warn", msg=msg)
+    for msg in (_selector_rot_warning(data), _missing_seller_warning(data)):
+        if msg:
+            emit("log", level="warn", msg=msg)
 
 
 def degradations(data: dict[str, Any]) -> list[str]:
@@ -718,9 +758,9 @@ def degradations(data: dict[str, Any]) -> list[str]:
     warning and the replayed one can't drift apart.
     """
     out = []
-    rot = _selector_rot_warning(data)
-    if rot:
-        out.append(rot)
+    for msg in (_selector_rot_warning(data), _missing_seller_warning(data)):
+        if msg:
+            out.append(msg)
     # A table we only half-read, which is not the same as a listing with no
     # ratings — plenty of those exist, and calling them degraded cries wolf.
     histogram = data.get("histogram")

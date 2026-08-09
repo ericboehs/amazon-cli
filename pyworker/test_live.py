@@ -9,6 +9,7 @@ import json
 import unittest
 from contextlib import redirect_stdout
 from datetime import date
+from pathlib import Path
 
 import browser
 from browser import (
@@ -260,22 +261,66 @@ class SelectorRotTest(unittest.TestCase):
         self.assertEqual(emitted(lambda: _warn_selector_rot(dict(self.FULL))), [])
 
     def test_two_missing_fields_is_still_silent(self):
-        data = dict(self.FULL, seller=None, rating=None)
+        # Deliberately not `seller` — a missing seller now has its own warning,
+        # and this test used to use it as filler, which quietly asserted that
+        # the very gap `_missing_seller_warning` exists to close was acceptable.
+        data = dict(self.FULL, image=None, rating=None)
         self.assertEqual(emitted(lambda: _warn_selector_rot(data)), [])
 
     def test_three_missing_fields_warns(self):
-        data = dict(self.FULL, seller=None, rating=None, image=None)
+        data = dict(self.FULL, delivery_raw=None, rating=None, image=None)
         events = emitted(lambda: _warn_selector_rot(data))
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["level"], "warn")
         self.assertIn("markup may have changed", events[0]["msg"])
-        for field in ("seller", "rating", "image"):
+        for field in ("delivery_raw", "rating", "image"):
             self.assertIn(field, events[0]["msg"])
 
     def test_empty_scrape_warns(self):
+        # No price either, so the seller warning stays quiet: with nothing read
+        # at all there is no evidence a buybox was even on the page, and the
+        # 6/6 line already says everything there is to say.
         events = emitted(lambda: _warn_selector_rot({}))
         self.assertEqual(len(events), 1)
         self.assertIn("6/6", events[0]["msg"])
+
+
+class MissingSellerWarningTest(unittest.TestCase):
+    """A seller that went missing on its own, which the 3-of-6 threshold can't see.
+
+    Every SELLER_SELECTORS entry is rooted at `#buybox`; none of the other five
+    field chains is. So a rename of that one container empties exactly one field
+    — 1/6, well under the threshold — and the user gets a card that looks whole
+    with the Seller line simply absent.
+    """
+
+    def test_a_price_without_a_seller_is_announced(self):
+        data = dict(SelectorRotTest.FULL, seller=None)
+        events = emitted(lambda: _warn_selector_rot(data))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["level"], "warn")
+        self.assertIn("no seller", events[0]["msg"])
+        self.assertIn("unknown rather than as absent", events[0]["msg"])
+
+    def test_a_seller_that_was_read_says_nothing(self):
+        self.assertEqual(emitted(lambda: _warn_selector_rot(dict(SelectorRotTest.FULL))), [])
+
+    def test_no_price_means_no_claim_about_the_seller(self):
+        # Currently-unavailable listings render no buybox price and no seller.
+        # Warning here would fire on every one of them.
+        data = dict(SelectorRotTest.FULL, seller=None, price=None)
+        msgs = [e["msg"] for e in emitted(lambda: _warn_selector_rot(data))]
+        self.assertFalse([m for m in msgs if "no seller" in m], msgs)
+
+    def test_it_survives_the_cache(self):
+        # Same reasoning as the rot line: the warning is emitted once, live, and
+        # then the payload is served from cache for the TTL with no warnings at
+        # all unless they are recorded on it.
+        data = dict(SelectorRotTest.FULL, seller=None)
+        self.assertIn(
+            "no seller",
+            " ".join(degradations(data)),
+        )
 
 
 class DegradationsTest(unittest.TestCase):
@@ -292,9 +337,14 @@ class DegradationsTest(unittest.TestCase):
         self.assertEqual(degradations(data), [])
 
     def test_selector_rot_is_recorded_in_the_same_words_it_was_announced_in(self):
+        # Every warning `_warn_selector_rot` emits has to come back off the
+        # payload in the same words, so asserting on the whole list rather than
+        # the first line keeps a newly-added warning from being announced live
+        # and then silently dropped from the cached copy.
         data = dict(SelectorRotTest.FULL, seller=None, rating=None, image=None)
-        announced = emitted(lambda: _warn_selector_rot(dict(data)))
-        self.assertEqual(degradations(data), [announced[0]["msg"]])
+        announced = [e["msg"] for e in emitted(lambda: _warn_selector_rot(dict(data)))]
+        self.assertEqual(degradations(data), announced)
+        self.assertEqual(len(announced), 2)
 
     def test_a_half_read_histogram_is_recorded(self):
         data = dict(SelectorRotTest.FULL, histogram={"5": 79, "4": 10})
@@ -420,6 +470,16 @@ class FakeTextLocator:
         if self._raises:
             raise RuntimeError("execution context was destroyed")
         return self._attrs.get(name)
+
+    def locator(self, _sel):
+        # `text()` asks every match for its <style>/<script> children. A locator
+        # that can't answer raises, and `text()` catches everything and moves on
+        # — so the field would come back empty with nothing said. Answering
+        # "none" is what a real locator does for a container that has none.
+        return FakeTextLocator(count=0)
+
+    def all_text_contents(self):
+        return []
 
 
 class FakeScope:
@@ -1071,7 +1131,14 @@ class SellerSelectorsTest(unittest.TestCase):
     as "Sold by Amazon Resale" because the unscoped `#merchant-info` matched the
     used-offer accordion instead of the buybox."""
 
-    BUYBOX = SELLER_SELECTORS[0]
+    # Literals, not `SELLER_SELECTORS[0]`. Deriving the fixture key from the
+    # production constant makes the fixture rewrite itself to match whatever
+    # production says, and the assertion degrades to `d["k"] == d["k"]` — it
+    # passes just as happily for a misspelled selector as for a working one.
+    BUYBOX = (
+        "#buybox [offer-display-feature-name=desktop-merchant-info] "
+        ".offer-display-feature-text-message"
+    )
     USED_OFFER = "#merchant-info"
 
     def test_the_buybox_seller_wins_over_a_used_offer_block(self):
@@ -1087,15 +1154,187 @@ class SellerSelectorsTest(unittest.TestCase):
         page = FakeTextPage({self.USED_OFFER: "Sold by Amazon Resale and Fulfilled by Amazon."})
         self.assertIsNone(text(page, *SELLER_SELECTORS))
 
-    def test_every_selector_is_scoped_to_the_buybox(self):
-        for sel in SELLER_SELECTORS:
-            self.assertTrue(sel.startswith("#buybox "), sel)
-
     def test_the_seller_profile_link_is_not_in_the_chain(self):
         # Its text is "Learn more about the seller", not a seller name — it was
         # winning the chain on listings that had no used offer to mis-match.
+        # Confirmed live: on B0DT8PV51T the element exists and reads exactly
+        # that, so restoring it to the chain would resurrect the bug.
         self.assertNotIn("#sellerProfileTriggerId", " ".join(SELLER_SELECTORS))
 
-    def test_the_tabular_layout_still_resolves(self):
-        page = FakeTextPage({SELLER_SELECTORS[1]: "ELEGOO Official US"})
+
+# --- Selector tests against real captured markup -----------------------------
+#
+# Everything above this line drives a dict keyed by selector string, which can
+# answer "what text is at this selector?" but not "does this selector match?".
+# The distinction is the whole ballgame for a selector chain: a mutation run
+# that replaced all three SELLER_SELECTORS with plausible nonsense left the
+# suite green, because the fixture keys were derived from the constant under
+# test. Below, selectors run against HTML captured from real product pages
+# through a real CSS engine, so a selector that matches nothing returns nothing.
+
+FIXTURES = Path(__file__).with_name("fixtures")
+
+try:
+    from bs4 import BeautifulSoup
+
+    HAVE_BS4 = True
+except ImportError:  # pragma: no cover - exercised by the bare-interpreter CI job
+    HAVE_BS4 = False
+
+
+class DomLocator:
+    """A Playwright-shaped locator backed by parsed HTML.
+
+    Implements only what `browser.text()` and `browser.attr()` actually call.
+    `inner_text` returns the node's full text *including* any <style> children,
+    which is not a shortcut: it is what a real `innerText` returns for a
+    container with no layout box, and that is precisely the case that put CSS
+    in the output. A fake that quietly dropped style text would make the bug
+    untestable here.
+    """
+
+    def __init__(self, nodes):
+        self._nodes = list(nodes)
+
+    @property
+    def first(self):
+        return DomLocator(self._nodes[:1])
+
+    def nth(self, i):
+        return DomLocator(self._nodes[i : i + 1])
+
+    def count(self):
+        return len(self._nodes)
+
+    def locator(self, sel):
+        return DomLocator([m for n in self._nodes for m in n.select(sel)])
+
+    def inner_text(self):
+        return self._nodes[0].get_text() if self._nodes else ""
+
+    def all_text_contents(self):
+        return [n.get_text() for n in self._nodes]
+
+    def get_attribute(self, name):
+        return self._nodes[0].get(name) if self._nodes else None
+
+
+class DomPage:
+    """Root scope over a captured fixture."""
+
+    def __init__(self, html):
+        self._soup = BeautifulSoup(html, "html.parser")
+
+    @classmethod
+    def from_fixture(cls, name):
+        return cls((FIXTURES / name).read_text(encoding="utf-8"))
+
+    def locator(self, sel):
+        return DomLocator(self._soup.select(sel))
+
+
+class RealMarkupSellerTest(unittest.TestCase):
+    """The seller chain, against markup captured from live product pages.
+
+    Fixtures are pruned to the containers under test and scrubbed of the
+    signed-in delivery address, but the structure — which node sits inside
+    which — is exactly as Amazon served it. That structure is the claim the
+    hand-written fakes could not check.
+    """
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest("beautifulsoup4 is not installed (this is the bare-interpreter CI job)")
+
+    def test_an_amazon_sold_listing_reports_amazon(self):
+        page = DomPage.from_fixture("buybox_amazon_sold.html")
+        self.assertEqual(text(page, *SELLER_SELECTORS), "Amazon.com")
+
+    def test_a_third_party_listing_reports_the_third_party(self):
+        # B0DT8PV51T. The used-offer block on this same page says "Amazon
+        # Resale"; reporting that would be the original bug.
+        page = DomPage.from_fixture("buybox_third_party.html")
         self.assertEqual(text(page, *SELLER_SELECTORS), "ELEGOO Official US")
+
+    def test_the_used_offer_block_lives_inside_the_buybox(self):
+        # The fact that motivates every selector below the first, and the one
+        # the PR's original comment got wrong: scoping to #buybox does NOT
+        # exclude the used offer. `#merchant-info` is inside #usedAccordionRow,
+        # which is inside #buybox, on both captured pages.
+        for name in ("buybox_amazon_sold.html", "buybox_third_party.html"):
+            page = DomPage.from_fixture(name)
+            self.assertEqual(page.locator("#buybox #merchant-info").count(), 1, name)
+            self.assertEqual(page.locator("#usedAccordionRow #merchant-info").count(), 1, name)
+            self.assertIn(
+                "Amazon Resale",
+                page.locator("#buybox #merchant-info").first.inner_text(),
+                name,
+            )
+
+    def test_no_selector_in_the_chain_matches_the_used_offer_block(self):
+        # The guarantee that replaces "it's scoped to #buybox, so it's fine".
+        for name in ("buybox_amazon_sold.html", "buybox_third_party.html"):
+            page = DomPage.from_fixture(name)
+            for sel in SELLER_SELECTORS:
+                for matched in page.locator(sel).all_text_contents():
+                    self.assertNotIn(
+                        "Amazon Resale",
+                        matched,
+                        f"{name}: {sel} reaches the used offer",
+                    )
+
+    def test_a_bogus_selector_chain_finds_nothing(self):
+        # The mutation the old suite could not survive. If this passes while
+        # `test_an_amazon_sold_listing_reports_amazon` also passes, the fixture
+        # is answering questions rather than echoing them.
+        page = DomPage.from_fixture("buybox_amazon_sold.html")
+        bogus = (
+            "#buybox [offer-display-feature-name=totally-bogus-name] .not-a-real-class",
+            "#buybox .tabular-buybox-text[tabular-attribute-name='Nope']",
+            "#buybox #no-such-merchant-info",
+        )
+        self.assertIsNone(text(page, *bogus))
+
+    def test_the_pre_fix_chain_still_gets_this_page_wrong(self):
+        # Guards the regression from the other side: the chain this PR replaced
+        # still returns a wrong answer against the real markup, so the tests
+        # above are measuring the fix rather than the fixture.
+        #
+        # The wrong answer it gives is the seller-profile link boilerplate, not
+        # the used-offer seller — `#sellerProfileTriggerId` comes first and wins
+        # before `#merchant-info` is ever consulted. Both are wrong; asserting
+        # the specific one keeps this honest about which failure it reproduces.
+        page = DomPage.from_fixture("buybox_third_party.html")
+        got = text(page, "#sellerProfileTriggerId", "#merchant-info", "#tabular-buybox")
+        self.assertEqual(got, "Learn more about the seller")
+        self.assertNotEqual(got, "ELEGOO Official US")
+
+    def test_the_used_offer_is_what_the_pre_fix_chain_falls_back_to(self):
+        # And with the boilerplate link removed, the next one down is the used
+        # offer — the failure the PR is named for.
+        page = DomPage.from_fixture("buybox_third_party.html")
+        got = text(page, "#merchant-info", "#tabular-buybox")
+        self.assertIn("Amazon Resale", got or "")
+
+
+class RealMarkupCleanTextTest(unittest.TestCase):
+    """The CSS leak, against the container it was actually observed in."""
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest("beautifulsoup4 is not installed (this is the bare-interpreter CI job)")
+
+    def test_the_availability_container_carries_a_style_block(self):
+        # If this fails the fixture has been re-captured from a page that no
+        # longer inlines CSS, and the test below stops proving anything.
+        page = DomPage.from_fixture("buybox_amazon_sold.html")
+        styles = page.locator("#availability_feature_div style")
+        self.assertGreaterEqual(styles.count(), 1)
+        self.assertIn("{", styles.first.inner_text())
+
+    def test_availability_comes_back_without_the_stylesheet(self):
+        page = DomPage.from_fixture("buybox_amazon_sold.html")
+        got = text(page, "#availability_feature_div")
+        self.assertIsNotNone(got)
+        self.assertNotIn("{", got)
+        self.assertIn("left in stock", got)

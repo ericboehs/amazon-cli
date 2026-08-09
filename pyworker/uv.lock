@@ -11,11 +11,19 @@ dependencies = [
     { name = "playwright" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "beautifulsoup4" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "amazon-orders", specifier = ">=4.0.18,<5" },
     { name = "playwright", specifier = ">=1.49,<2" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "beautifulsoup4", specifier = ">=4.12" }]
 
 [[package]]
 name = "amazon-orders"
