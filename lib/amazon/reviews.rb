@@ -194,18 +194,35 @@ module Amazon
 
       # The strongest single signal that survived into 2026. Farmed reviews are
       # usually posted without a matching purchase on the account.
-      def unverified_signal(reviews)
-        return thin(:unverified, "Verified purchases") if reviews.size < MIN_SAMPLE
+      # Amazon renames data hooks routinely. A renamed verified-purchase badge
+      # is indistinguishable from a review farm one card at a time — every probe
+      # comes back clean — but across a population it isn't: a listing where not
+      # one review in thirty carries the badge is far likelier to be a selector
+      # we stopped understanding than a farm that bought nothing.
+      BADGE_ROT_SAMPLE = 15
 
-        unverified = reviews.reject { |r| r["verified"] }
-        share = unverified.size / reviews.size.to_f
+      def unverified_signal(reviews)
+        # nil means the badge probe never completed on that card, which is not
+        # evidence either way. Judging only the reviews we could actually read
+        # keeps an unreadable card from reading as an unverified one.
+        readable = reviews.reject { |r| r["verified"].nil? }
+        return thin(:unverified, "Verified purchases") if readable.size < MIN_SAMPLE
+
+        unverified = readable.reject { |r| r["verified"] }
+        if unverified.size == readable.size && readable.size >= BADGE_ROT_SAMPLE
+          return na(:unverified, "Verified purchases",
+                    "not one of #{readable.size} sampled reviews carries a verified-purchase " \
+                    "badge — Amazon has most likely renamed it, so this can't be judged")
+        end
+
+        share = unverified.size / readable.size.to_f
         points = scaled(share, floor: 0.10, ceiling: 0.50, max: 20)
         glowing = unverified.count { |r| (rating = numeric(r["rating"])) && rating >= 4 }
         detail =
           if unverified.empty?
-            "all #{reviews.size} sampled reviews are verified purchases"
+            "all #{readable.size} sampled reviews are verified purchases"
           else
-            "#{unverified.size}/#{reviews.size} sampled reviews are unverified" \
+            "#{unverified.size}/#{readable.size} sampled reviews are unverified" \
               "#{glowing.positive? ? " (#{glowing} of them 4★ or better)" : ""}"
           end
         Signal.new(key: :unverified, label: "Verified purchases", points: points, max: 20, detail: detail)

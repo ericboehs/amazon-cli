@@ -601,6 +601,21 @@ class HasTest(unittest.TestCase):
         scope = FakeScope({"a": FakeTextLocator(raises=True), "b": FakeTextLocator(count=1)})
         self.assertTrue(_has(scope, "a", "b"))
 
+    # None, not False — the same contract _is_sponsored already keeps. False is
+    # a claim that the badge is absent, and a probe that never completed has
+    # made no such claim. This feeds the verified-purchase signal, the heaviest
+    # in the model, where "absent" is read as evidence of a review farm.
+    def test_a_card_that_cannot_be_probed_at_all_is_unknown(self):
+        self.assertIsNone(_has(FakeScope(raises=True), "[data-hook=avp-badge]"))
+
+    def test_unknown_survives_when_every_probe_throws(self):
+        scope = FakeScope({"a": FakeTextLocator(raises=True), "b": FakeTextLocator(raises=True)})
+        self.assertIsNone(_has(scope, "a", "b"))
+
+    def test_one_completed_probe_is_enough_to_say_absent(self):
+        scope = FakeScope({"a": FakeTextLocator(raises=True)})
+        self.assertIs(_has(scope, "a", "b"), False)
+
 
 class ScrapeReviewCardsTest(unittest.TestCase):
     def card(self, **overrides):
