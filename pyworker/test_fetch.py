@@ -692,12 +692,16 @@ class WorkerRunTest(unittest.TestCase):
     def kinds(self, events, name):
         return [e for e in events if e["event"] == name]
 
+    def order_ids(self, events):
+        # Sorted, not as emitted: details are fetched on a thread pool and
+        # drained by `as_completed`, so arrival order is genuinely arbitrary.
+        # Asserting on it buys nothing and fails at random.
+        return sorted(e["data"]["order_id"] for e in self.kinds(events, "order"))
+
     def test_a_clean_run_reports_every_order(self):
         code, events, _ = self.run_worker(orders=[FakeOrder("111"), FakeOrder("222")])
         self.assertEqual(code, 0)
-        self.assertEqual(
-            [e["data"]["order_id"] for e in self.kinds(events, "order")], ["111", "222"]
-        )
+        self.assertEqual(self.order_ids(events), ["111", "222"])
         self.assertEqual(self.kinds(events, "done")[0]["count"], 2)
 
     def test_an_order_whose_details_failed_is_never_handed_to_the_store(self):
@@ -712,7 +716,7 @@ class WorkerRunTest(unittest.TestCase):
         code, events, _ = self.run_worker(
             orders=[FakeOrder("111"), FakeOrder("222")], get_order=get_order
         )
-        self.assertEqual([e["data"]["order_id"] for e in self.kinds(events, "order")], ["111"])
+        self.assertEqual(self.order_ids(events), ["111"])
         self.assertEqual(code, 1)
 
     def test_a_run_that_lost_details_does_not_look_like_a_clean_sync(self):
