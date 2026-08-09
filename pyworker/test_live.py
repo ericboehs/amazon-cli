@@ -1039,6 +1039,24 @@ class CleanTextTest(unittest.TestCase):
         for raw in ("Sold by Amazon.com", "Set of 4 {assorted} colors", "Filament #3 refill"):
             self.assertEqual(clean_text(raw), raw)
 
+    def test_copy_is_untouched_even_with_a_style_block_below_it(self):
+        # The case the test above cannot reach. "Amazon.com" contains a token
+        # that looks exactly like a class selector, and it only costs anything
+        # when there is a real rule further down for it to reach forward to —
+        # which is the arrangement every one of these containers ships.
+        raw = (
+            "Ships from Amazon.com\n"
+            "Sold by ELEGOO Official US\n"
+            "    .offer-display-feature-text { font-weight: 400; }"
+        )
+        self.assertEqual(clean_text(raw), "Ships from Amazon.com Sold by ELEGOO Official US")
+
+    def test_a_rule_does_not_reach_backwards_past_a_line_break(self):
+        # Same shape, minimal: whatever a match consumes before the brace must
+        # stay on the brace's own line.
+        raw = "In Stock.\n#availability { color: green; }"
+        self.assertEqual(clean_text(raw), "In Stock.")
+
     def test_empty(self):
         self.assertEqual(clean_text(None), "")
         self.assertEqual(clean_text(""), "")

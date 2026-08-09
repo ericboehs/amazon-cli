@@ -17,10 +17,20 @@ from pathlib import Path
 from typing import Any
 
 # Amazon inlines <style> blocks inside content containers — #availability_feature_div
-# ships one — and Playwright's inner_text hands back their source as text. Anchoring
-# on a leading `.`/`#` selector token plus a braced body keeps this off ordinary
-# product copy, which does not contain CSS rules.
-CSS_RULE_RE = re.compile(r"[.#][\w-]+[^{}]*\{[^{}]*\}")
+# ships one — and Playwright's inner_text hands back their source as text.
+#
+# Both anchors here exist to stop a rule reaching backwards into the copy above
+# it. "Ships from Amazon.com" contains `.com`, which is indistinguishable from a
+# class selector, so requiring only "selector token ... braced body" let a match
+# start at `.com` and run forward to the next real rule, deleting every word in
+# between: the seller line came back as "Ships from Amazon". Hence `^[ \t]*` —
+# a rule begins its own line — and `[^{}\n]*`, which keeps the selector on the
+# same line as its opening brace.
+#
+# The cost is a selector list split across lines (`.a,\n.b { }`) leaves `.a,`
+# behind. That is the right way to be wrong: the residue is visibly junk, while
+# the alternative silently eats real text.
+CSS_RULE_RE = re.compile(r"(?m)^[ \t]*[.#][\w-]+[^{}\n]*\{[^{}]*\}")
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
