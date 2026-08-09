@@ -149,7 +149,7 @@ def clear_dead_session(cookies_path: Path) -> bool:
         if cleared is None:
             return False
         write_jar(cookies_path, cleared)
-    except OSError as e:
+    except Exception as e:  # noqa: BLE001 — see the note in `restore_jar`
         emit("log", level="warn", msg=f"could not clear the dead session's cookies: {e}")
         return False
     return True
@@ -162,6 +162,14 @@ def restore_jar(cookies_path: Path, jar_before: str | None, reason: str) -> bool
     file. It is held in memory only and written back solely to the file it came
     from. Returns whether it wrote, which is also whether the caller's run
     damaged something.
+
+    Nothing in here may escape. This is best-effort cleanup running alongside a
+    diagnostic the user needs, and `read_text()` raises `UnicodeDecodeError` —
+    a `ValueError`, not an `OSError` — on a jar with invalid UTF-8, which is
+    exactly what a killed write leaves behind. Escaping used to take `main()`
+    with it, so the sign-in bounce that this whole path exists to explain
+    reached the user as `python worker exited 1`, with no error event for the
+    stderr tail to attach to either.
     """
     if jar_before is None:
         return False
@@ -170,7 +178,7 @@ def restore_jar(cookies_path: Path, jar_before: str | None, reason: str) -> bool
         if not jar_regressed(jar_before, after):
             return False
         write_jar(cookies_path, jar_before)
-    except OSError as e:
+    except Exception as e:  # noqa: BLE001 — cleanup must not outrank the message
         emit("log", level="warn", msg=f"could not restore the cookie jar: {e}")
         return False
     emit(
@@ -208,7 +216,7 @@ class JarGuard:
         # and written back solely to the file it came from.
         try:
             self.jar_before = cookies_path.read_text() if cookies_path.exists() else None
-        except OSError as e:
+        except (OSError, ValueError) as e:
             # Say so. `None` is also how "first-ever sync, nothing to protect"
             # is spelled, so swallowing this left the two indistinguishable and
             # turned the whole feature off without a word — the session then
@@ -461,8 +469,8 @@ def main() -> int:
         try:
             session.login()
         except Exception as e:  # noqa: BLE001 — surface any auth failure to parent
-            guard.restore("the login attempt")
             emit("error", msg=f"login failed: {e}")
+            guard.restore("the login attempt")
             return 1
 
         api = AmazonOrders(session, config=config)
@@ -479,10 +487,9 @@ def main() -> int:
                 # discovers the session is dead. Its own message tells you to call
                 # AmazonSession.login() — useless advice from a CLI.
                 if session_rejected(e):
-                    # Not a restore. Amazon has just proven these cookies are dead,
-                    # and putting them back is what leaves `cookies_authenticated?`
-                    # answering yes forever — see `clear_dead_session`.
-                    guard.clear()
+                    # The message goes first. It is the only actionable thing
+                    # the user gets on this path, and best-effort cleanup has
+                    # no business being able to preempt it.
                     emit(
                         "error",
                         kind="not_logged_in",
@@ -494,9 +501,13 @@ def main() -> int:
                             "Run: amazon login"
                         ),
                     )
+                    # Not a restore. Amazon has just proven these cookies are
+                    # dead, and putting them back is what leaves
+                    # `cookies_authenticated?` answering yes forever.
+                    guard.clear()
                     return 1
-                guard.restore(f"the failed {year} history fetch")
                 emit("error", msg=f"history fetch failed for {year}: {e}", trace=traceback.format_exc())
+                guard.restore(f"the failed {year} history fetch")
                 return 1
 
             n = len(orders)

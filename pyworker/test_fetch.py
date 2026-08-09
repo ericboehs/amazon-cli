@@ -150,6 +150,41 @@ class RestoreJarTest(unittest.TestCase):
             self.assertIn("the failed 2025 history fetch", events[0]["msg"])
 
 
+class CleanupNeverEscapesTest(unittest.TestCase):
+    """Cleanup runs beside a diagnostic the user needs. It cannot outrank it.
+
+    `read_text()` raises `UnicodeDecodeError` — a `ValueError`, not an
+    `OSError` — on a jar with invalid UTF-8, which is precisely what a killed
+    write leaves behind. It escaped the handler, escaped `main()`, and took the
+    "Run: amazon login" message with it: the Ruby parent saw no error event at
+    all and printed `python worker exited 1`. The stderr tail added in 98526ac
+    can't rescue that either, because it attaches to an error event.
+    """
+
+    def undecodable(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = Path(d) / "cookies.json"
+        path.write_bytes(b'{"x-main": "\xff\xfe"}')
+        return path
+
+    def test_restore_survives_a_jar_it_cannot_decode(self):
+        path = self.undecodable()
+        events = emitted(lambda: restore_jar(path, GOOD, "the test"))
+        self.assertEqual(events[0]["level"], "warn")
+
+    def test_clear_survives_a_jar_it_cannot_decode(self):
+        path = self.undecodable()
+        self.assertFalse(silently(lambda: clear_dead_session(path)))
+
+    def test_the_guard_survives_a_jar_it_cannot_decode(self):
+        # And it still counts as "no snapshot", so nothing gets written back
+        # from a decode that never produced one.
+        path = self.undecodable()
+        guard = silently(lambda: JarGuard(path))
+        self.assertIsNone(guard.jar_before)
+
+
 class JarWithoutAuthTest(unittest.TestCase):
     def test_auth_cookies_are_dropped_and_the_rest_kept(self):
         out = jar_without_auth(GOOD)
@@ -219,7 +254,7 @@ class ClearDeadSessionTest(unittest.TestCase):
 
 
 class JarGuardTest(unittest.TestCase):
-    def guard(self, text=GOOD):
+    def guard(self, text: "str | None" = GOOD):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
         path = Path(d) / "cookies.json"
