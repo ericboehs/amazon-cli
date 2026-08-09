@@ -260,7 +260,7 @@ actually walks `/product-reviews/`, one request per page.
 | Check | Weight | Fires on |
 |---|---|---|
 | Rating distribution | 20 | a five-star wall with no organic middle |
-| Verified purchases | 20 | a high unverified share, worse if those are the positive ones |
+| Verified purchases | 20 | a high unverified share (how many of those are glowing is reported, not scored) |
 | Review timing | 20 | bursts of reviews inside a 7-day window |
 | Distinct wording | 15 | near-duplicate phrasing across reviews (Jaccard on content words) |
 | Undisclosed compensation | 10 | free/discounted-unit language outside Vine |
@@ -275,7 +275,7 @@ disclosed and legitimate, it just isn't a purchase.
 
 Thresholds are calibrated against real listings, not intuition. Four
 unrelated and apparently legitimate products — including a 30k-rating Anker
-charger — all sat at 79-83% five-star with a mid-teens middle and a 3-4%
+charger — all sat at 79-83% five-star with a 13-18% middle and a 3-4%
 one-star tail. That is simply the Amazon baseline for consumer goods, so
 the histogram check only scores a shape well past it. A signal that fires
 on everything teaches you to ignore the report.

@@ -270,7 +270,11 @@ def scrape_histogram(page: Any) -> dict[str, int]:
 
 
 def scrape_review_cards(scope: Any) -> list[dict[str, Any]]:
-    """Every [data-hook=review] card under `scope`, in page order."""
+    """Every review card under `scope`, in page order.
+
+    Both hooks: `review` on the product page and the full listing,
+    `cmps-review` on the cross-marketplace cards Amazon mixes in.
+    """
     out: list[dict[str, Any]] = []
     try:
         cards = scope.locator("[data-hook=review], [data-hook=cmps-review]")
