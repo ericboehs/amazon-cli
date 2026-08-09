@@ -517,6 +517,67 @@ class BareInterpreterImportTest(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), ",".join(sorted(AUTH_COOKIE_NAMES)))
 
 
+class PackageAssumptionsTest(unittest.TestCase):
+    """The fixtures at the top of this file are a claim about amazon-orders.
+
+    Every test here is shaped by that claim — that the jar is a flat
+    name => value dict, that `x-main` is the cookie authentication is decided
+    on, that a deleted cookie comes back as an empty value. If the real package
+    ever stops matching, hand-written fixtures keep this suite green while the
+    code they stand for is wrong, which is the one failure a test can't report.
+    So the claim gets checked against the installed package.
+
+    Skipped where amazon-orders isn't installed — which is CI, by design: the
+    workflow runs a bare interpreter with no install step. Locally
+    (`.venv/bin/python -m unittest test_fetch`) these run for real, and that is
+    where a dependency upgrade would be noticed.
+    """
+
+    def setUp(self):
+        try:
+            import amazonorders  # noqa: F401
+        except ImportError:
+            self.skipTest("amazon-orders is not installed (this is CI)")
+
+    def test_the_cookie_we_key_on_is_the_one_amazon_orders_keys_on(self):
+        # `auth_cookies_stored()` walks this list; whatever is in it is what
+        # "signed in" means to the library. Our rollback trigger has to be the
+        # same set, or it fires on losses that cost nothing and sits still for
+        # the one that costs the session. An upgrade that adds a name here
+        # should fail this test, not quietly widen the gap.
+        from amazonorders.conf import AmazonOrdersConfig
+
+        with tempfile.TemporaryDirectory() as d:
+            config = AmazonOrdersConfig(config_path=os.path.join(d, "amazon-orders.yml"))
+            self.assertEqual(list(config.constants.COOKIES_SET_WHEN_AUTHENTICATED),
+                             [fetch.AUTH_COOKIE])
+
+    def test_the_fixtures_are_jars_amazon_orders_could_have_written(self):
+        # session.py writes `json.dumps(dict_from_cookiejar(...))` and reads it
+        # back with `cookiejar_from_dict(json.loads(...))`. A fixture that
+        # doesn't survive that round trip isn't a cookie jar.
+        from requests.utils import cookiejar_from_dict, dict_from_cookiejar
+
+        for fixture in (GOOD, WIPED, BOUNCED, FRESH):
+            loaded = dict_from_cookiejar(cookiejar_from_dict(json.loads(fixture)))
+            self.assertEqual(loaded, json.loads(fixture), fixture)
+
+    def test_a_deleted_cookie_really_does_read_back_as_an_empty_value(self):
+        # What finding 9 rests on. Amazon deletes `x-main` by setting it empty
+        # on a narrower domain; `dict_from_cookiejar` collapses duplicate names
+        # and the later one wins, so the jar on disk keeps the name with `""`
+        # in it — which is why the name alone can't be read as a session.
+        import requests
+        from requests.utils import dict_from_cookiejar
+
+        session = requests.Session()
+        session.cookies.set("x-main", "v", domain=".amazon.com")
+        session.cookies.set("x-main", "", domain="www.amazon.com")
+        self.assertEqual(dict_from_cookiejar(session.cookies), {"x-main": ""})
+        self.assertEqual(jar_cookie_names(json.dumps(dict_from_cookiejar(session.cookies))),
+                         set())
+
+
 class FakeOrder:
     """The attributes `order_to_dict` and `_emit_progress` actually read."""
 
