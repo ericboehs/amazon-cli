@@ -277,6 +277,14 @@ class JarGuard:
         The lock lives on a sidecar rather than on the jar itself: `write_jar`
         replaces the file by rename, so a lock held on the jar's inode would
         stop being the lock the next process finds.
+
+        Scope, deliberately: this serialises syncs against each other, and
+        nothing else. `amazon login` (login.py) writes the same cookies.json
+        without taking this lock, so a login racing a sync is still unprotected
+        — it just isn't the collision that motivated this. Closing that gap
+        belongs with the atomic-write helper both files now have a copy of;
+        when those are hoisted into browser.py, a shared `jar_lock()` goes with
+        them and this claim moves to it.
         """
         lock_path = self.cookies_path.with_name(self.cookies_path.name + ".lock")
         try:
