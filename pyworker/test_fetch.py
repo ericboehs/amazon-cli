@@ -7,8 +7,10 @@ decision about when to put the old jar back.
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -100,6 +102,47 @@ class RestoreJarBehaviorTest(unittest.TestCase):
         fresher = json.dumps({"x-main": "v2", "at-main": "v2", "ubid-main": "v2"})
         text, _ = self._restore(GOOD, fresher)
         self.assertEqual(text, fresher)
+
+
+class BareInterpreterImportTest(unittest.TestCase):
+    """fetch.py has to import on an interpreter with no dependencies installed.
+
+    CI runs `python -m unittest discover -s pyworker` against a bare 3.12 with
+    no install step, on the stated grounds that the helpers under test are pure.
+    So a module-scope `from amazonorders...` in fetch.py doesn't fail the one
+    test that needs it — it makes this entire file uncollectable, and the error
+    surfaces as `unittest.loader._FailedTest`, naming the loader rather than the
+    import that broke. Locally it stays invisible, because `uv run pytest`
+    installs amazon-orders and the import succeeds.
+
+    Blocking the module in a subprocess reproduces CI on a machine where the
+    package *is* installed, so the guard is meaningful in both environments.
+    """
+
+    def test_fetch_imports_without_amazonorders(self):
+        script = textwrap.dedent(
+            """
+            import sys
+            from importlib.abc import MetaPathFinder
+
+            class NoAmazonOrders(MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    if name == "amazonorders" or name.startswith("amazonorders."):
+                        raise ImportError("simulating CI: amazon-orders is not installed")
+                    return None
+
+            sys.meta_path.insert(0, NoAmazonOrders())
+            sys.path.insert(0, %r)
+            import fetch
+            print(",".join(sorted(fetch.AUTH_COOKIE_NAMES)))
+            """
+            % os.path.dirname(os.path.abspath(__file__))
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), ",".join(sorted(AUTH_COOKIE_NAMES)))
 
 
 if __name__ == "__main__":
