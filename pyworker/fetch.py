@@ -39,6 +39,38 @@ from amazonorders.orders import AmazonOrders
 
 from browser import session_rejected
 
+# Cookies Amazon only sets for a signed-in session. amazon-orders rewrites the
+# whole jar after every request (session.py:213), so when Amazon bounces a
+# request to sign-in — expiring these in the response — the stripped jar is
+# persisted straight over the good one. The session that `amazon login` just
+# spent a password challenge earning is destroyed by the first failed sync, and
+# the error's own advice ("Run: amazon login") walks you back into the same trap.
+AUTH_COOKIE_NAMES = ("x-main", "at-main", "sess-at-main", "sst-main", "ubid-main")
+
+
+def jar_cookie_names(raw: str | None) -> set[str]:
+    """Cookie *names* in a jar blob. Names only — values are never handled here."""
+    if not raw:
+        return set()
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return set()
+    return set(data) if isinstance(data, dict) else set()
+
+
+def jar_regressed(before: str | None, after: str | None) -> bool:
+    """True when a run stripped sign-in cookies the jar had going in.
+
+    Compares names, not contents: a jar that merely gained or refreshed cookies
+    is a normal, healthy write and must be left alone. Only the loss of an
+    authentication cookie means the run traded a working session for a dead one.
+    """
+    if before is None:
+        return False
+    had = jar_cookie_names(before) & set(AUTH_COOKIE_NAMES)
+    return bool(had - jar_cookie_names(after))
+
 
 def emit(event: str, **fields: Any) -> None:
     sys.stdout.write(json.dumps({"event": event, **fields}, default=_json_default) + "\n")
@@ -210,10 +242,41 @@ def main() -> int:
     config_dir = xdg_path("XDG_CONFIG_HOME", ".config") / "amazon"
     config_dir.mkdir(parents=True, exist_ok=True)
 
+    cookies_path = cache_dir / "cookies.json"
+    # Read the jar before amazon-orders can touch it. Held in memory only, and
+    # written back solely to the file it came from.
+    try:
+        jar_before = cookies_path.read_text() if cookies_path.exists() else None
+    except OSError:
+        jar_before = None
+
+    def restore_jar(reason: str) -> None:
+        """Put the pre-run jar back if this run stripped its sign-in cookies."""
+        if jar_before is None:
+            return
+        try:
+            after = cookies_path.read_text() if cookies_path.exists() else None
+            if not jar_regressed(jar_before, after):
+                return
+            cookies_path.write_text(jar_before)
+            os.chmod(cookies_path, 0o600)
+        except OSError as e:
+            emit("log", level="warn", msg=f"could not restore the cookie jar: {e}")
+            return
+        emit(
+            "log",
+            level="warn",
+            msg=(
+                f"{reason} stripped the saved sign-in cookies from {cookies_path}; "
+                "restored the jar as it was. Your session may still be dead — but "
+                "a failed sync no longer destroys a working one."
+            ),
+        )
+
     config = AmazonOrdersConfig(
         config_path=str(config_dir / "amazon-orders.yml"),
         data={
-            "cookie_jar_path": str(cache_dir / "cookies.json"),
+            "cookie_jar_path": str(cookies_path),
             "output_dir": str(cache_dir / "output"),
             # Cap parallel detail fetches; Amazon 503s above ~7 concurrent.
             "thread_pool_size": 7,
@@ -235,6 +298,7 @@ def main() -> int:
     try:
         session.login()
     except Exception as e:  # noqa: BLE001 — surface any auth failure to parent
+        restore_jar("the login attempt")
         emit("error", msg=f"login failed: {e}")
         return 1
 
@@ -254,6 +318,7 @@ def main() -> int:
             # discovers the session is dead. Its own message tells you to call
             # AmazonSession.login() — useless advice from a CLI.
             if session_rejected(e):
+                restore_jar("the rejected request")
                 emit(
                     "error",
                     kind="not_logged_in",
@@ -264,6 +329,7 @@ def main() -> int:
                     ),
                 )
                 return 1
+            restore_jar(f"the failed {year} history fetch")
             emit("error", msg=f"history fetch failed for {year}: {e}", trace=traceback.format_exc())
             return 1
 
@@ -306,6 +372,12 @@ def main() -> int:
                 _emit_progress(year, completed, new_n, order)
                 emit("order", data=order_to_dict(order, _ao_mod.__version__))
                 total += 1
+
+    # Detail-fetch failures are caught per-order and only logged, so a run that
+    # got bounced part-way through can strip the jar and still exit 0, never
+    # touching an error path. A run that genuinely worked never ends holding
+    # fewer sign-in cookies than it started with, so this is safe to assert.
+    restore_jar("this sync")
 
     emit("done", count=total, skipped=skipped)
     return 0
