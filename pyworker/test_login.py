@@ -20,6 +20,7 @@ from login import (  # noqa: E402
     is_signin_url,
     order_access_ok,
     poll_state,
+    resolve_cookies,
     should_prefill_email,
     should_renavigate,
     timeout_message,
@@ -190,6 +191,26 @@ class PollStateTest(unittest.TestCase):
     def test_falls_back_to_the_tab_we_opened(self):
         self.assertEqual(poll_state([HOME, "https://www.amazon.com/dp/B0747R1M51"]), HOME)
 
+    def test_a_nudge_can_only_ever_be_about_the_tab_the_poll_will_nudge(self):
+        # The poll decides from `poll_state(...)` and acts on `pages[0]`. That is
+        # only safe while the sole tab `should_renavigate` approves is the first
+        # one, which holds because the signin and orders branches return URLs it
+        # always declines. Change the fallback and this is where it breaks —
+        # otherwise the poll approves tab N and reloads tab 0 out from under the
+        # user, with nothing in the output to say it happened.
+        product = "https://www.amazon.com/dp/B0747R1M51"
+        approved = 0
+        for tabs in ([HOME, SIGNIN, ORDERS, product, None], [HOME, product],
+                     [product, HOME], [HOME, None], [HOME, ORDERS], [HOME, SIGNIN]):
+            for i in range(len(tabs)):
+                urls = tabs[i:] + tabs[:i]
+                picked = poll_state(urls)
+                if should_renavigate(picked):
+                    approved += 1
+                    self.assertEqual(picked, urls[0], urls)
+        # The invariant is only worth asserting if the branch is reachable.
+        self.assertTrue(approved, "no arrangement produced a nudge")
+
     def test_no_tabs_at_all(self):
         # Every window closed. Handled rather than IndexError'd, because this is
         # reachable: the user quits the browser between two ticks.
@@ -259,14 +280,18 @@ class UnsavableReasonTest(unittest.TestCase):
         cookie.update(kw)
         return [{"name": "session-id", "value": "1", "expires": self.NOW + 86_400}, cookie]
 
+    def reason(self, cookies):
+        """The gate as `main()` runs it: resolve the list, then judge it."""
+        return unsavable_reason(resolve_cookies(cookies), self.NOW)
+
     def refusal(self, cookies):
         """The reason, asserted to exist. Every caller here wants both halves."""
-        reason = unsavable_reason(cookies, self.NOW)
+        reason = self.reason(cookies)
         self.assertIsNotNone(reason)
         return reason or ""
 
     def test_a_live_session_cookie_is_savable(self):
-        self.assertIsNone(unsavable_reason(self.jar(), self.NOW))
+        self.assertIsNone(self.reason(self.jar()))
 
     def test_a_browser_session_cookie_is_refused(self):
         # Playwright writes -1 for a cookie that dies with the window — which is
@@ -277,16 +302,22 @@ class UnsavableReasonTest(unittest.TestCase):
         self.assertIn("Keep me signed in", self.refusal(self.jar(expires=-1)))
 
     def test_an_already_expired_cookie_is_refused(self):
-        self.assertIsNotNone(unsavable_reason(self.jar(expires=self.NOW - 1), self.NOW))
+        self.assertIsNotNone(self.reason(self.jar(expires=self.NOW - 1)))
+
+    def test_a_cookie_expiring_within_the_minute_is_refused(self):
+        # The gate exists to assert what `sync.rb` asserts — and sync asserts it
+        # strictly later, by definition. A cookie with seconds left passes here
+        # and fails there, which is the exact split this function removes.
+        self.assertIsNotNone(self.reason(self.jar(expires=self.NOW + 5)))
 
     def test_a_non_numeric_expiry_is_refused(self):
-        self.assertIsNotNone(unsavable_reason(self.jar(expires="soon"), self.NOW))
-        self.assertIsNotNone(unsavable_reason(self.jar(expires=None), self.NOW))
+        self.assertIsNotNone(self.reason(self.jar(expires="soon")))
+        self.assertIsNotNone(self.reason(self.jar(expires=None)))
 
     def test_a_bool_expiry_is_refused(self):
         # `True` is an int in Python and would otherwise sail past the numeric
         # check and compare as 1 — i.e. epoch, i.e. long expired, read as valid.
-        self.assertIsNotNone(unsavable_reason(self.jar(expires=True), self.NOW))
+        self.assertIsNotNone(self.reason(self.jar(expires=True)))
 
     def test_the_auth_cookie_missing_is_refused(self):
         others = [{"name": "session-id", "value": "1", "expires": self.NOW + 86_400}]
@@ -304,7 +335,58 @@ class UnsavableReasonTest(unittest.TestCase):
         # request context, and requiring it would refuse working sessions —
         # amazon-orders' own COOKIES_SET_WHEN_AUTHENTICATED is just ["x-main"].
         just_it = [{"name": "x-main", "value": "v", "expires": self.NOW + 86_400}]
-        self.assertIsNone(unsavable_reason(just_it, self.NOW))
+        self.assertIsNone(self.reason(just_it))
+
+
+class ResolveCookiesTest(unittest.TestCase):
+    """`context.cookies()` is a list, and Amazon puts the same name in it twice.
+
+    A host-scoped `www.amazon.com` duplicate can sit alongside the domain-scoped
+    `.amazon.com` cookie during sign-in. The gate and the jar used to resolve
+    that collision independently — `next(...)` took the first match, the dict
+    comprehension took the last — so the entry that was validated and the entry
+    that was stored could be different cookies with different expiries.
+    """
+
+    NOW = 1_700_000_000.0
+
+    def dup(self, first_expires, second_expires):
+        return [
+            {"name": "x-main", "value": "first", "domain": "www.amazon.com",
+             "expires": first_expires},
+            {"name": "x-main", "value": "second", "domain": ".amazon.com",
+             "expires": second_expires},
+        ]
+
+    def test_the_durable_duplicate_wins_whichever_way_round_it_is(self):
+        live, dead = self.NOW + 86_400, -1
+        self.assertEqual(resolve_cookies(self.dup(dead, live))["x-main"]["value"], "second")
+        self.assertEqual(resolve_cookies(self.dup(live, dead))["x-main"]["value"], "first")
+
+    def test_a_session_duplicate_no_longer_refuses_a_good_login(self):
+        # The false refusal: the gate read the host-scoped session cookie and
+        # told the user to check "Keep me signed in" — a box that was already
+        # checked, about a session that was fine.
+        resolved = resolve_cookies(self.dup(-1, self.NOW + 86_400))
+        self.assertIsNone(unsavable_reason(resolved, self.NOW))
+
+    def test_a_session_duplicate_no_longer_passes_a_dead_one_through(self):
+        # And the mirror image: gate validates the durable cookie, jar stores
+        # the session one, login reports success, sync rejects the jar.
+        resolved = resolve_cookies(self.dup(self.NOW + 86_400, -1))
+        self.assertIsNone(unsavable_reason(resolved, self.NOW))
+        self.assertEqual(resolved["x-main"]["value"], "first")
+
+    def test_the_broader_domain_breaks_a_tie(self):
+        same = self.NOW + 86_400
+        self.assertEqual(resolve_cookies(self.dup(same, same))["x-main"]["value"], "second")
+
+    def test_unnamed_cookies_are_dropped(self):
+        self.assertEqual(resolve_cookies([{"value": "v"}, {"name": "", "value": "v"}]), {})
+
+    def test_distinct_names_all_survive(self):
+        cookies = [{"name": "x-main", "value": "a"}, {"name": "session-id", "value": "b"}]
+        self.assertEqual(set(resolve_cookies(cookies)), {"x-main", "session-id"})
 
 
 class WritePrivateTest(unittest.TestCase):

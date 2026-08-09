@@ -155,16 +155,70 @@ def order_access_ok(url: str | None, order_cards: int) -> bool:
 # a working session into a refusal.
 AUTH_COOKIE = "x-main"
 
+# The gate runs now, `sync.rb` runs later — so a cookie with seconds left would
+# pass a check whose entire purpose is to assert what sync asserts.
+EXPIRY_MARGIN = 60.0
 
-def unsavable_reason(cookies: Sequence[Mapping[str, Any]], now: float) -> str | None:
+
+def cookie_lifetime(cookie: Mapping[str, Any]) -> float:
+    """How far into the future this cookie survives a round-trip through disk.
+
+    `-inf` for one that doesn't survive at all: a missing, non-numeric or
+    negative expiry is Playwright's way of saying "dies with the window", and
+    the jar's whole job is being read back after the window is gone.
+    """
+    expires = cookie.get("expires")
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        return float("-inf")
+    return float(expires) if expires >= 0 else float("-inf")
+
+
+def resolve_cookies(cookies: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    """One cookie per name, keeping the entry worth writing down.
+
+    `context.cookies()` is a flat list, not a map, and Amazon puts the same name
+    in it twice: a host-scoped `www.amazon.com` duplicate alongside the
+    domain-scoped `.amazon.com` cookie during some sign-in flows. The gate and
+    the jar used to resolve that collision independently and in opposite
+    directions — `next(...)` took the first match, a name-keyed dict
+    comprehension took the last — so the cookie that was validated and the
+    cookie that was stored could be different objects with different expiries.
+
+    Both directions are bugs the user cannot diagnose. Validate the session
+    duplicate and a perfectly good login is refused with advice to check a box
+    that was already checked; validate the durable one and store the session
+    one, and login reports success on a jar `amazon order sync` will reject —
+    the original bug, surviving its own fix.
+
+    Resolving once, here, makes the disagreement unrepresentable. Longest-lived
+    wins; the broader (domain-scoped) cookie breaks a tie.
+    """
+    best: dict[str, Mapping[str, Any]] = {}
+    for cookie in cookies:
+        name = cookie.get("name")
+        if not name:
+            continue
+        current = best.get(name)
+        if current is None or _rank(cookie) > _rank(current):
+            best[name] = cookie
+    return best
+
+
+def _rank(cookie: Mapping[str, Any]) -> tuple[float, int]:
+    domain = cookie.get("domain") or ""
+    return (cookie_lifetime(cookie), 1 if domain.startswith(".") else 0)
+
+
+def unsavable_reason(cookies: Mapping[str, Mapping[str, Any]], now: float) -> str | None:
     """None when this jar is worth writing; otherwise why it isn't.
 
     Asserts, before writing, the same predicate `sync.rb` will apply after —
-    `x-main` present, with an `expires` that is numeric, non-negative and in the
-    future. Login had every one of those timestamps in `context.cookies()` and
-    read none of them, so it printed "saved 47 cookies, run `amazon order sync`"
-    for a session the next sync would immediately call unauthenticated and
-    replace with a full password login. That is the loop 4bff129 exists to break.
+    `x-main` present, with an `expires` that is numeric, non-negative and far
+    enough in the future to still be there when sync looks. Login had every one
+    of those timestamps in `context.cookies()` and read none of them, so it
+    printed "saved 47 cookies, run `amazon order sync`" for a session the next
+    sync would immediately call unauthenticated and replace with a full password
+    login. That is the loop 4bff129 exists to break.
 
     The likely trigger is signing in without "Keep me signed in" checked: Amazon
     issues the auth cookies as *session* cookies, which Playwright records as
@@ -183,7 +237,7 @@ def unsavable_reason(cookies: Sequence[Mapping[str, Any]], now: float) -> str | 
             "overwrite the session you already had. Try `amazon login` again."
         )
 
-    match = next((c for c in cookies if c.get("name") == AUTH_COOKIE), None)
+    match = cookies.get(AUTH_COOKIE)
     if match is None:
         return (
             f"order history loaded but Amazon never issued the `{AUTH_COOKIE}` "
@@ -197,12 +251,18 @@ def unsavable_reason(cookies: Sequence[Mapping[str, Any]], now: float) -> str | 
             f"the `{AUTH_COOKIE}` cookie has no usable expiry, so `amazon order "
             "sync` would reject it. Nothing was saved."
         )
-    if expires < 0 or expires <= now:
+    if expires < 0:
         # Playwright writes -1 for a session cookie.
         return (
             "signed in, but Amazon issued a browser-session cookie that dies with "
             "this window — `amazon order sync` would reject it, so nothing was "
             "saved. Sign in again with \"Keep me signed in\" checked."
+        )
+    if expires <= now + EXPIRY_MARGIN:
+        return (
+            f"the `{AUTH_COOKIE}` cookie expires in under a minute, so `amazon "
+            "order sync` would reject it before you could run it. Nothing was "
+            "saved. Try `amazon login` again."
         )
     return None
 
@@ -288,6 +348,12 @@ def poll_state(urls: Sequence[str | None]) -> str | None:
     for url in urls:
         if is_order_history_url(url):
             return url
+    # Load-bearing, not arbitrary. The poll decides with this and then acts on
+    # `pages[0]`, and those are only the same tab because the two branches above
+    # return URLs `should_renavigate` always declines — so a nudge can only ever
+    # come from this one. Prefer some other tab here (most-recently-opened, say)
+    # and the poll starts approving tab N while `goto` still fires on tab 0,
+    # yanking a page the user was in the middle of.
     return urls[0] if urls else None
 
 
@@ -540,11 +606,11 @@ def main() -> int:
             close_quietly(context, browser)
             return 1
 
-        amazon_cookies = [
-            c
-            for c in context.cookies()
-            if c.get("domain", "").endswith("amazon.com") and c.get("name")
-        ]
+        # Collapse duplicate names once, here, so the cookie the gate judges and
+        # the cookie the jar records are the same object by construction.
+        amazon_cookies = resolve_cookies(
+            [c for c in context.cookies() if c.get("domain", "").endswith("amazon.com")]
+        )
 
         # Check before writing. Order history rendering proves this *window* can
         # read orders; it does not prove the cookies outlive it.
@@ -557,7 +623,7 @@ def main() -> int:
         # Persist in two places:
         #   1) amazon-orders cookie_jar_path: simple {name: value} dict
         #   2) Playwright storageState: full storage for future Playwright runs (e.g., `amazon buy`)
-        ao_cookies = {c.get("name", ""): c.get("value", "") for c in amazon_cookies}
+        ao_cookies = {name: c.get("value", "") for name, c in amazon_cookies.items()}
         write_private(cookies_path, json.dumps(ao_cookies))
 
         # Playwright writes this one itself, so it goes to a temp path and gets
