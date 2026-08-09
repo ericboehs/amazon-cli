@@ -555,8 +555,10 @@ def _fetch_with_retry(api: Any, order: Any, backoff: list[float],
                     msg=f"detail fetch skipped for {order.order_number}: {e}")
             return None, classify_failure(e)
         # A library that returns nothing without raising has said nothing about
-        # why, and unexplained is loud.
-        return (fetched, None) if fetched else (None, TRANSIENT)
+        # why, and unexplained is loud. `is None` and not truthiness: an `Order`
+        # that grew a `__len__` over its items would make a real zero-item order
+        # falsy, and it would come back here as a loss that fails the sync.
+        return (fetched, None) if fetched is not None else (None, TRANSIENT)
     return None, TRANSIENT
 
 

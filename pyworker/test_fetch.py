@@ -863,6 +863,23 @@ class WorkerRunTest(unittest.TestCase):
         warnings = [e["msg"] for e in self.kinds(events, "log") if e.get("level") == "warn"]
         self.assertTrue(any("222" in m for m in warnings), warnings)
 
+    def test_an_order_that_is_merely_falsy_is_still_an_order(self):
+        # `if fetched` asks whether the object is truthy; the question is
+        # whether the library returned anything. Today's `Order` has neither
+        # `__bool__` nor `__len__` so the two agree, but an `Order` that grows a
+        # `__len__` over its items turns a real zero-item order into a loss that
+        # fails the sync — and nothing would point at this line.
+        class EmptyOrder(FakeOrder):
+            def __len__(self):
+                return 0
+
+        code, events, _ = self.run_worker(
+            orders=[FakeOrder("111")],
+            get_order=lambda number, clone: EmptyOrder(number, detailed=True),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.order_ids(events), ["111"])
+
     def test_a_run_amazon_throttled_out_of_an_order_still_fails(self):
         # The other half: same `None` at the same call site, but this one is
         # Amazon bouncing us and it is exactly what exit 1 exists for. The zero
