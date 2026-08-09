@@ -1285,6 +1285,24 @@ class WorkerProtocolTest < Minitest::Test
     end
   end
 
+  # Every other line this class writes is tagged — `[worker:warn]`, `[worker]
+  # non-JSON output:`, Progress's `year …`. Raw subprocess output was the one
+  # unlabelled stream, and under -v during a sync it interleaves with the
+  # progress bar: paste that into an issue and nobody can tell which half is
+  # the CLI and which is Python.
+  def test_forwarded_worker_stderr_says_where_it_came_from
+    body = <<~SCRIPT
+      STDIN.gets
+      STDERR.puts 'Traceback (most recent call last):'
+      STDERR.flush
+      puts({event: 'done', count: 0}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      _, err = capture_io_streams { assert_empty worker(verbose: true).search('q') }
+      assert_includes err, '[worker:stderr] Traceback (most recent call last):'
+    end
+  end
+
   def test_item_reads_the_item_event
     body = <<~SCRIPT
       STDIN.gets
