@@ -48,25 +48,39 @@ class IsSigninUrlTest(unittest.TestCase):
 
 class OrderAccessOkTest(unittest.TestCase):
     def test_rendered_orders_pass(self):
-        self.assertTrue(order_access_ok(ORDERS, signout_links=1, order_cards=12))
+        self.assertTrue(order_access_ok(ORDERS, order_cards=12))
 
-    def test_either_marker_alone_is_enough(self):
-        self.assertTrue(order_access_ok(ORDERS, signout_links=1, order_cards=0))
-        self.assertTrue(order_access_ok(ORDERS, signout_links=0, order_cards=12))
+    def test_a_signed_in_page_that_is_not_orders_is_not_proof(self):
+        # The tier this whole module exists to reject. Amazon renders the global
+        # Sign Out link on every page it serves a *recognized* session — the
+        # homepage, the cart, a product page — while bouncing that same session
+        # from order history. Reading it as proof of order access saves exactly
+        # the cookies `amazon order sync` will be rejected with.
+        self.assertFalse(order_access_ok(HOME, order_cards=0))
+        self.assertFalse(order_access_ok("https://www.amazon.com/gp/cart/view.html", 0))
+        self.assertFalse(order_access_ok("https://www.amazon.com/dp/B0747R1M51", 0))
+
+    def test_order_shaped_nodes_elsewhere_are_not_proof_either(self):
+        # Marker counts are only meaningful once the URL says we are looking at
+        # order history; other pages carry card-shaped nodes of their own.
+        self.assertFalse(order_access_ok(HOME, order_cards=12))
 
     def test_a_signin_bounce_fails_even_with_markers_present(self):
         # This is the regression. The sign-in page really does contain a node
         # matching the order-card selector, so counting markers without
         # checking the URL declared a recognized-only session authenticated —
         # and `amazon order sync` was then rejected with the cookies it saved.
-        self.assertFalse(order_access_ok(SIGNIN, signout_links=0, order_cards=1))
-        self.assertFalse(order_access_ok(SIGNIN, signout_links=1, order_cards=12))
+        self.assertFalse(order_access_ok(SIGNIN, order_cards=1))
+        self.assertFalse(order_access_ok(SIGNIN, order_cards=12))
 
     def test_a_page_with_no_markers_fails(self):
-        self.assertFalse(order_access_ok(ORDERS, signout_links=0, order_cards=0))
+        # On the orders URL with nothing rendered: the navigation is in flight,
+        # or Amazon served a shell. Either way there is nothing to conclude yet.
+        self.assertFalse(order_access_ok(ORDERS, order_cards=0))
 
     def test_missing_url_fails(self):
-        self.assertFalse(order_access_ok(None, signout_links=1, order_cards=1))
+        self.assertFalse(order_access_ok(None, order_cards=1))
+        self.assertFalse(order_access_ok("", order_cards=1))
 
 
 class ShouldPrefillEmailTest(unittest.TestCase):
@@ -96,12 +110,47 @@ class ShouldRenavigateTest(unittest.TestCase):
         self.assertFalse(should_renavigate(SIGNIN))
         self.assertFalse(should_renavigate("https://www.amazon.com/ap/mfa"))
 
+    def test_a_captcha_is_left_alone(self):
+        # The regression, and the worst one in this file: the bot check is served
+        # from /errors/validateCaptcha, which is not under /ap/, so the old
+        # "anything outside /ap/ is idle" rule nudged it every ten seconds. Each
+        # nudge throws away the characters the user has typed and makes Amazon
+        # mint a fresh captcha, so the login cannot be completed at all — it
+        # burns the full ten minutes and then reports a timeout.
+        self.assertFalse(
+            should_renavigate("https://www.amazon.com/errors/validateCaptcha?x=1")
+        )
+
+    def test_the_other_account_pages_are_left_alone(self):
+        # Same hijack, less dramatic: steering away from a password reset or an
+        # account-fixup step abandons a flow the user is partway through.
+        for path in ("/ap/forgotpassword", "/ap/accountfixup", "/ap/switchaccount"):
+            self.assertFalse(should_renavigate(f"https://www.amazon.com{path}"), path)
+
+    def test_an_unrecognized_page_is_left_alone(self):
+        # The allowlist's whole purpose. A URL nobody anticipated is far more
+        # likely a challenge we haven't seen than an idle tab, and the two
+        # mistakes do not cost the same.
+        self.assertFalse(should_renavigate("https://www.amazon.com/some/new/hold"))
+
+    def test_a_non_amazon_page_is_left_alone(self):
+        # Amazon hands 2FA off to third-party identity pages; a `goto` there is
+        # both useless and destructive.
+        self.assertFalse(should_renavigate("https://example.com/"))
+
     def test_already_on_orders_needs_no_nudge(self):
         self.assertFalse(should_renavigate(ORDERS))
         self.assertFalse(should_renavigate(ORDERS_URL))
+        # The legacy order-history paths Amazon still redirects some accounts to.
+        # Treating them as "somewhere else" would steer away from the very page
+        # the poll is waiting for.
+        self.assertFalse(
+            should_renavigate("https://www.amazon.com/gp/css/order-history?ref=nav")
+        )
 
     def test_no_url_yet(self):
         self.assertFalse(should_renavigate(None))
+        self.assertFalse(should_renavigate(""))
 
 
 class DescribeStateTest(unittest.TestCase):

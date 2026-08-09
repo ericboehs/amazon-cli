@@ -26,6 +26,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+from browser import SIGNIN_URLS
 
 
 def emit(event: str, **fields: Any) -> None:
@@ -64,8 +67,18 @@ def load_email() -> str | None:
 # no longer be saved as if it could.
 ORDERS_URL = "https://www.amazon.com/your-orders/orders"
 
-# Amazon's sign-in lives under /ap/ (signin, mfa, challenge, forgotpassword).
-SIGNIN_PATHS = ("/ap/signin", "/ap/mfa", "/ap/challenge", "/ap/cvf")
+# Where order history can legitimately live. Amazon still redirects some
+# accounts to the legacy paths, and treating those as "somewhere else" would
+# make the poll steer away from the page it was waiting for.
+ORDER_HISTORY_PATHS = (
+    "/your-orders",
+    "/gp/your-account/order-history",
+    "/gp/css/order-history",
+)
+
+# Pages it is safe to steer away from: an idle tab sitting on the storefront.
+# Deliberately an allowlist — see `should_renavigate`.
+IDLE_PATHS = ("", "/", "/gp/css/homepage.html", "/gp/css/homepage")
 
 # Markers that the order list itself rendered. Several, because this layout is
 # A/B tested like the rest of the site and a single miss here costs the user ten
@@ -90,20 +103,39 @@ def describe_state(url: str | None) -> str:
 
 
 def is_signin_url(url: str | None) -> bool:
-    return bool(url) and any(p in url for p in SIGNIN_PATHS)
+    return bool(url) and any(p in url for p in SIGNIN_URLS)
 
 
-def order_access_ok(url: str | None, signout_links: int, order_cards: int) -> bool:
+def is_order_history_url(url: str | None) -> bool:
+    return bool(url) and any(p in url for p in ORDER_HISTORY_PATHS)
+
+
+def order_access_ok(url: str | None, order_cards: int) -> bool:
     """True only when order history actually rendered for this session.
 
-    The sign-in page carries nodes that match the order-card selector, so a
-    marker count on its own says nothing — the URL check has to come first.
-    That false positive is exactly how a recognized-but-unauthenticated session
-    used to pass for a real one.
+    Both halves are load-bearing and neither is sufficient.
+
+    The URL, because the sign-in page carries nodes that match the order-card
+    selector — counting markers without checking where we are is how a
+    recognized-but-unauthenticated session used to pass for a real one.
+
+    The markers, because the URL alone only says what we asked for, not what
+    Amazon served.
+
+    Note what is deliberately *not* consulted: `#nav-item-signout`. Amazon
+    renders that on every page it serves a session it recognizes, including the
+    ones it bounces from order history — it is the signature of precisely the
+    tier this module exists to reject, so it can never be evidence for the
+    opposite conclusion. It used to be accepted here on its own, which meant a
+    signed-in homepage counted as proof of order access.
+
+    An account with no orders still passes: `#your-orders-content` is the page
+    container and renders empty, so "your order list is empty" is distinguished
+    from "you cannot see your order list" by the same probe.
     """
-    if not url or is_signin_url(url):
+    if not url or is_signin_url(url) or not is_order_history_url(url):
         return False
-    return signout_links > 0 or order_cards > 0
+    return order_cards > 0
 
 
 def should_prefill_email(email_visible: bool, password_visible: bool) -> bool:
@@ -124,12 +156,30 @@ def should_renavigate(url: str | None) -> bool:
 
     Amazon sometimes returns you to the homepage after sign-in instead of the
     page you asked for. Without this the poll would watch a signed-in homepage
-    until it timed out, having never tested the thing it cares about. A tab
-    still inside /ap/ is mid-challenge and must be left alone.
+    until it timed out, having never tested the thing it cares about.
+
+    An allowlist, not a blocklist, and that is the whole point. This used to
+    nudge anything outside /ap/, which meant it also nudged the bot captcha —
+    served from /errors/validateCaptcha, not /ap/ — every ten seconds. The user
+    types the characters, `page.goto` throws the input away, Amazon mints a
+    fresh captcha, and the login cannot be completed no matter what they do; it
+    burns the full ten minutes and then blames the password. /ap/forgotpassword,
+    /ap/accountfixup and /ap/switchaccount were hijacked the same way.
+
+    A URL we don't recognize is far more likely a challenge we haven't seen than
+    an idle tab, and the cost of the two mistakes is not symmetric: failing to
+    nudge costs a nudge, and nudging a challenge costs the whole login. So
+    steer only from pages known to be idle, and leave everything else alone.
     """
-    if not url or is_signin_url(url):
+    if not url or is_order_history_url(url):
         return False
-    return "/your-orders" not in url
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return False
+    if "amazon." not in (parts.netloc or ""):
+        return False
+    return parts.path in IDLE_PATHS
 
 
 def main() -> int:
@@ -242,11 +292,17 @@ def main() -> int:
         authenticated = False
         last_nudge = 0.0
         last_report = time.time()
+        # `#your-orders-content` is the page *container*, so Amazon can render it
+        # a tick before it knows whether it will show you the list or bounce you.
+        # Requiring two consecutive passing ticks costs two seconds and removes
+        # the only way this check can fire on a shell.
+        streak = 0
         while time.time() < deadline:
             try:
                 url = page.url
                 cards = sum(page.locator(sel).count() for sel in ORDER_MARKERS)
-                if order_access_ok(url, page.locator("#nav-item-signout").count(), cards):
+                streak = streak + 1 if order_access_ok(url, cards) else 0
+                if streak >= 2:
                     authenticated = True
                     break
 
