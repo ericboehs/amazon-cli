@@ -131,8 +131,14 @@ module Amazon
         # Bigrams are taken within a clause, never across one. Joining title to
         # body or running through a comma manufactures phrases nobody wrote
         # ("great stopped", from "Great product" + "Stopped working").
+        #
+        # `.uniq` per review, as the unigrams below already were: the heading
+        # this feeds says "What critical reviews mention", so the count has to
+        # be reviewers, not occurrences. Without it one person writing
+        # "filament jammed" three times cleared the two-mention bar alone and
+        # printed as "(3x)" — indistinguishable from three people.
         bigrams = tally(critical.flat_map { |r|
-          segments("#{r["title"]}. #{r["body"]}").flat_map { |seg| seg.each_cons(2).map { |a, b| "#{a} #{b}" } }
+          segments("#{r["title"]}. #{r["body"]}").flat_map { |seg| seg.each_cons(2).map { |a, b| "#{a} #{b}" } }.uniq
         })
         unigrams = tally(critical.flat_map { |r| content_words("#{r["title"]} #{r["body"]}").uniq })
         picked = bigrams.select { |_, n| n >= 2 }.first(limit)
