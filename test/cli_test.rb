@@ -1789,14 +1789,38 @@ class ReviewsHistogramSignalTest < Minitest::Test
   end
 
   def test_five_star_wall_with_no_middle_scores_full
-    s = points('5' => 94, '4' => 3, '3' => 1, '2' => 0, '1' => 2)
+    s = points('5' => 96, '4' => 2, '3' => 1, '2' => 0, '1' => 1)
     assert_equal 20, s['points']
     assert_includes s['detail'], 'fatter middle'
   end
 
+  def test_real_listings_score_zero
+    # Measured off four unrelated, apparently legitimate products, one of them
+    # a 30k-rating Anker charger. ~80% five-star with a mid-teens middle is the
+    # Amazon baseline for consumer goods; scoring it would fire on everything
+    # and teach the reader to ignore the report.
+    [['5' => 79, '4' => 12, '3' => 5, '2' => 1, '1' => 3],
+     ['5' => 81, '4' => 9, '3' => 4, '2' => 2, '1' => 4],
+     ['5' => 80, '4' => 11, '3' => 4, '2' => 2, '1' => 3],
+     ['5' => 83, '4' => 9, '3' => 3, '2' => 1, '1' => 4]].each do |(hist)|
+      assert_equal 0, points(hist)['points'], hist.inspect
+    end
+  end
+
   def test_intermediate_bands
-    assert_equal 15, points('5' => 84, '4' => 4, '3' => 1, '2' => 0, '1' => 11)['points']
-    assert_equal 11, points('5' => 82, '4' => 6, '3' => 2, '2' => 1, '1' => 9)['points']
+    assert_equal 16, points('5' => 92, '4' => 5, '3' => 2, '2' => 0, '1' => 1)['points']
+    # A baseline five-star share can still be flagged by an implausibly thin
+    # middle on its own -- but only weakly, since it is one tell rather than two.
+    assert_equal 4, points('5' => 84, '4' => 4, '3' => 1, '2' => 0, '1' => 11)['points']
+  end
+
+  def test_a_missing_one_star_tail_is_itself_a_tell
+    # Same five-star share and middle, only the tail differs: a product this
+    # popular still collects duds, and a farm has no reason to buy them.
+    with_tail = points('5' => 88, '4' => 6, '3' => 3, '2' => 0, '1' => 3)['points']
+    without = points('5' => 88, '4' => 6, '3' => 3, '2' => 2, '1' => 1)['points']
+    assert_equal 0, with_tail
+    assert_equal 5, without
   end
 
   def test_missing_histogram_is_not_computable_rather_than_clean
@@ -1815,7 +1839,7 @@ class ReviewsHistogramSignalTest < Minitest::Test
   def test_string_percentages_are_accepted
     # The worker emits ints, but a hand-edited cache entry or a JSON round trip
     # through the web UI can hand us strings.
-    assert_equal 20, points('5' => '94', '4' => '3', '3' => '1', '2' => '0', '1' => '2')['points']
+    assert_equal 20, points('5' => '96', '4' => '2', '3' => '1', '2' => '0', '1' => '1')['points']
   end
 end
 
@@ -2348,6 +2372,21 @@ class ReviewsCommandTest < Minitest::Test
     refute_includes out, 'Prints beautifully'
     # Scoring still ran on all five, not the three that got printed.
     assert_includes out, '5-review sample'
+  end
+
+  def test_critical_with_no_low_ratings_explains_the_empty_result
+    # Amazon's product-page picks skew positive, so this is common on real
+    # listings; printing nothing would read as "no complaints exist".
+    happy = Class.new do
+      def item(_asin, **kw)
+        d = FakeWorker.new.item('B1', **kw)
+        d.merge('reviews_sample' => d['reviews_sample'].map { |r| r.merge('rating' => 5.0) })
+      end
+    end.new
+    out, err = run_cli('reviews', 'B0HAPPY', '--critical', '--fresh', worker: happy)
+    assert_includes err, 'no 1-3 star reviews'
+    assert_includes err, '--pages 3'
+    refute_includes out, 'Reviews ('
   end
 
   def test_limit_caps_verbatim_output

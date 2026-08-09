@@ -86,11 +86,13 @@ REVIEW_COUNTRY_RE = re.compile(r"reviewed in\s+(.+?)\s+on\b", re.IGNORECASE)
 HELPFUL_RE = re.compile(r"([\d,]*\d)\s+(?:person|people)\s+found", re.IGNORECASE)
 HELPFUL_ONE_RE = re.compile(r"\bone person found\b", re.IGNORECASE)
 
-# The histogram renders as either an aria-label ("5 stars represent 71% of
-# rating") or a bare row ("5 star  71%"), depending on which layout Amazon
-# serves. Both shapes reduce to the same (stars, percent) pair.
-HISTOGRAM_RE = re.compile(r"(?P<stars>[1-5])\s*stars?\b.*?(?P<pct>\d{1,3})\s*%", re.IGNORECASE | re.DOTALL)
-HISTOGRAM_PCT_FIRST_RE = re.compile(r"(?P<pct>\d{1,3})\s*%.*?(?P<stars>[1-5])\s*stars?\b", re.IGNORECASE | re.DOTALL)
+# The histogram renders as an aria-label in either order ("5 stars represent
+# 71% of rating", "71 percent of reviews have 5 stars") or as a bare row
+# ("5 star  71%"). The share is spelled "%" or "percent" depending on the
+# layout. All of these reduce to the same (stars, percent) pair.
+PCT = r"(?P<pct>\d{1,3})\s*(?:%|percent\b)"
+HISTOGRAM_RE = re.compile(rf"(?P<stars>[1-5])\s*stars?\b.*?{PCT}", re.IGNORECASE | re.DOTALL)
+HISTOGRAM_PCT_FIRST_RE = re.compile(rf"{PCT}.*?(?P<stars>[1-5])\s*stars?\b", re.IGNORECASE | re.DOTALL)
 
 # The review-title hook's text often leads with the star rating on its own line
 # ("5.0 out of 5 stars\nWorks great"). That prefix is the rating, not the title.
@@ -260,7 +262,17 @@ def scrape_review_cards(scope: Any) -> list[dict[str, Any]]:
         card = cards.nth(i)
         try:
             dateline = text(card, "[data-hook=review-date]")
-            body = text(card, "[data-hook=review-body]", ".review-text-content")
+            # reviewRichContentContainer holds just the prose; reviewText wraps
+            # it in a card deck that also carries "double tap to read full
+            # content" teaser copy. That copy is display:none, so inner_text
+            # drops it, but preferring the inner hook keeps us off that ledge.
+            body = text(
+                card,
+                "[data-hook=reviewRichContentContainer]",
+                "[data-hook=reviewText]",
+                "[data-hook=review-body]",
+                ".review-text-content",
+            )
             # The Vine badge marks a review Amazon itself incentivized with a
             # free product. That is disclosed and legitimate, so it is reported
             # separately rather than folded into the paid-review signals.
@@ -268,7 +280,12 @@ def scrape_review_cards(scope: Any) -> list[dict[str, Any]]:
             record = {
                     "id": _review_id(card),
                     "title": strip_star_prefix(
-                        text(card, "[data-hook=review-title] span:last-child", "[data-hook=review-title]")
+                        text(
+                            card,
+                            "[data-hook=reviewTitle]",
+                            "[data-hook=review-title] span:last-child",
+                            "[data-hook=review-title]",
+                        )
                     ),
                     "rating": _first_float(
                         text(card, "[data-hook=review-star-rating]", "[data-hook=cmps-review-star-rating]", ".a-icon-alt")
@@ -307,9 +324,18 @@ def scrape_reviews(page: Any, asin: str, pages: int = 0, sort: str = "helpful") 
     seen = {r["id"] for r in collected if r["id"]}
 
     for n in range(1, max(pages, 0) + 1):
-        page.goto(reviews_url(asin, n, sort), wait_until="domcontentloaded", timeout=45000)
-        page.wait_for_timeout(1200)
-        guard(page)
+        try:
+            page.goto(reviews_url(asin, n, sort), wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(1200)
+            guard(page)
+        except Exception as exc:  # noqa: BLE001
+            # /product-reviews/ demands a signed-in session even when /dp/ will
+            # still render for a stale one, so this leg fails on its own. The
+            # sample from the product page is already in hand and is exactly
+            # what `--pages 0` would have returned — reporting on it beats
+            # discarding a good partial answer over the depth we couldn't get.
+            emit("log", level="warn", msg=f"could not load review page {n} ({exc}) — reporting on {len(collected)} from the product page")
+            break
         batch = [r for r in scrape_review_cards(page) if not r["id"] or r["id"] not in seen]
         if not batch:
             # Amazon caps review pagination and serves the last page repeatedly

@@ -52,15 +52,15 @@ B0DEMO1234  ·  https://www.amazon.com/dp/B0DEMO1234
   Vine:      1 review(s) from Amazon's Vine programme
 
 Rating distribution
-  5★ ████████████████████      82%
-  4★ █                          6%
-  3★                            2%
-  2★                            2%
-  1★ ██                         8%
+  5★ ███████████████████████   96%
+  4★                            2%
+  3★                            1%
+  2★                            0%
+  1★                            1%
 
 Authenticity
-  high risk (76/100, low confidence)
-    !  Rating distribution: 82% five-star and only 10% two-to-four-star; organic ratings keep a fatter middle [+11/20]
+  high risk (89/100, low confidence)
+    !  Rating distribution: 96% five-star with only 3% two-to-four-star and a 1% one-star tail; organic ratings keep a fatter middle [+20/20]
     !  Verified purchases: 5/10 sampled reviews are unverified (5 of them 4★ or better) [+20/20]
     ?  Review timing: needs 15+ dated reviews (have 10) — re-run with --pages 3
     !  Distinct wording: 2/6 reviews share heavily overlapping wording with another [+12/15]
@@ -272,6 +272,18 @@ rather than scoring zero — so a thin sample reports "low confidence" and
 lists what it couldn't test, instead of reading as a clean bill of health.
 Vine reviews are tracked separately from undisclosed compensation: Vine is
 disclosed and legitimate, it just isn't a purchase.
+
+Thresholds are calibrated against real listings, not intuition. Four
+unrelated and apparently legitimate products — including a 30k-rating Anker
+charger — all sat at 79-83% five-star with a mid-teens middle and a 3-4%
+one-star tail. That is simply the Amazon baseline for consumer goods, so
+the histogram check only scores a shape well past it. A signal that fires
+on everything teaches you to ignore the report.
+
+`--pages N` needs a currently valid session; `/product-reviews/` redirects
+to sign-in even when `/dp/` still renders for a stale one. When that leg
+fails the report is still produced from the product-page sample, with a
+warning, rather than thrown away.
 
 `Adjusted` re-averages only the verified, non-Vine, uncompensated reviews
 *in the sample* — it is not a corrected sitewide rating, and it's omitted

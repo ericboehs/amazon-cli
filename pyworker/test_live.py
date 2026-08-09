@@ -29,6 +29,7 @@ from live import (
     reviews_url,
     scrape_histogram,
     scrape_review_cards,
+    scrape_reviews,
     strip_star_prefix,
     _first_float,
     _first_int,
@@ -649,3 +650,80 @@ class ScrapeReviewCardsTest(unittest.TestCase):
         results = self.scrape([Boom(), self.card()])
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["id"], "R1")
+
+
+class LiveMarkup2026Test(unittest.TestCase):
+    """Regressions pinned to markup observed on a real product page.
+
+    Every one of these silently produced None or {} against the selectors and
+    patterns written from the older layout, which is exactly the failure mode
+    that is invisible in a unit test written from the same assumption.
+    """
+
+    def scrape_card(self, mapping):
+        card = FakeScope(mapping, attrs={"id": "customer_review-R1"})
+        scope = FakeScope({"[data-hook=review], [data-hook=cmps-review]": FakeCardList([card])})
+        return scrape_review_cards(scope)[0]
+
+    def test_histogram_label_spells_out_percent(self):
+        # "79 percent of reviews have 5 stars" — no "%" anywhere in the label.
+        self.assertEqual(parse_histogram_label("79 percent of reviews have 5 stars"), (5, 79))
+        self.assertEqual(parse_histogram_label("5 stars represent 79 percent of rating"), (5, 79))
+
+    def test_percent_word_still_rejects_impossible_shares(self):
+        self.assertIsNone(parse_histogram_label("5 stars, 900 percent growth"))
+
+    def test_title_comes_from_the_reviewTitle_hook(self):
+        r = self.scrape_card({"[data-hook=reviewTitle]": FakeTextLocator(text="Not a good purchase")})
+        self.assertEqual(r["title"], "Not a good purchase")
+
+    def test_body_comes_from_the_rich_content_hook(self):
+        r = self.scrape_card(
+            {"[data-hook=reviewRichContentContainer]": FakeTextLocator(text="Died in a month.")}
+        )
+        self.assertEqual(r["body"], "Died in a month.")
+
+    def test_body_falls_back_to_the_review_text_deck(self):
+        r = self.scrape_card({"[data-hook=reviewText]": FakeTextLocator(text="Died in a month.")})
+        self.assertEqual(r["body"], "Died in a month.")
+
+    def test_older_hooks_still_win_when_the_new_ones_are_absent(self):
+        r = self.scrape_card(
+            {
+                "[data-hook=review-title] span:last-child": FakeTextLocator(text="Old layout"),
+                "[data-hook=review-body]": FakeTextLocator(text="Old body"),
+            }
+        )
+        self.assertEqual(r["title"], "Old layout")
+        self.assertEqual(r["body"], "Old body")
+
+
+class ScrapeReviewsPaginationFailureTest(unittest.TestCase):
+    class Page:
+        """A product page whose /product-reviews/ leg is unreachable."""
+
+        def __init__(self, cards):
+            self._cards = cards
+
+        def locator(self, sel):
+            if sel == "[data-hook=review], [data-hook=cmps-review]":
+                return FakeCardList(self._cards)
+            return FakeTextLocator(count=0)
+
+        def goto(self, *_a, **_kw):
+            raise RuntimeError("redirected to sign-in")
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    def test_a_dead_pagination_leg_keeps_the_product_page_sample(self):
+        # /product-reviews/ demands a live session even when /dp/ renders for a
+        # stale one. Losing the whole report over the depth we couldn't reach
+        # would throw away an answer we already had in hand.
+        card = FakeScope(
+            {"[data-hook=reviewTitle]": FakeTextLocator(text="Works great")},
+            attrs={"id": "customer_review-R1"},
+        )
+        got = scrape_reviews(self.Page([card]), "B0TEST00001", pages=3)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["title"], "Works great")
