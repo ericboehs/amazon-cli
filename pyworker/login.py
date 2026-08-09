@@ -20,10 +20,13 @@ Output format on stdout (NDJSON):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
 import time
+import traceback
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -91,13 +94,20 @@ ORDER_MARKERS = (
 )
 
 
+# Consecutive poll ticks in which every DOM probe raised. At the 2s tick that is
+# ten seconds — long enough that a frame detaching mid-navigation rides through
+# it, short enough that a dropped connection doesn't buy ten minutes of a
+# heartbeat cheerfully reporting the page it can no longer read.
+MAX_PROBE_FAILURES = 5
+
+
 def describe_state(url: str | None) -> str:
     """Short human-readable "where are we" for the waiting heartbeat."""
     if not url:
         return "no page loaded yet"
     if is_signin_url(url):
         return "on Amazon's sign-in / verification page"
-    if "/your-orders" in url:
+    if is_order_history_url(url):
         return "on the orders page, but the order list hasn't rendered"
     return f"on {url[:60]}"
 
@@ -136,6 +146,149 @@ def order_access_ok(url: str | None, order_cards: int) -> bool:
     if not url or is_signin_url(url) or not is_order_history_url(url):
         return False
     return order_cards > 0
+
+
+# The one cookie every consumer actually requires: amazon-orders'
+# `COOKIES_SET_WHEN_AUTHENTICATED` is exactly `["x-main"]`, and `sync.rb`'s
+# `cookies_authenticated?` tests the same name. Deliberately not a longer list —
+# names Amazon doesn't set in every request context (`sess-at-main`) would turn
+# a working session into a refusal.
+AUTH_COOKIE = "x-main"
+
+
+def unsavable_reason(cookies: Sequence[Mapping[str, Any]], now: float) -> str | None:
+    """None when this jar is worth writing; otherwise why it isn't.
+
+    Asserts, before writing, the same predicate `sync.rb` will apply after —
+    `x-main` present, with an `expires` that is numeric, non-negative and in the
+    future. Login had every one of those timestamps in `context.cookies()` and
+    read none of them, so it printed "saved 47 cookies, run `amazon order sync`"
+    for a session the next sync would immediately call unauthenticated and
+    replace with a full password login. That is the loop 4bff129 exists to break.
+
+    The likely trigger is signing in without "Keep me signed in" checked: Amazon
+    issues the auth cookies as *session* cookies, which Playwright records as
+    `expires: -1`, and a session cookie proves nothing about a jar reloaded from
+    disk later.
+
+    A reason string rather than a bool, because the two failures have different
+    fixes and a user can act on the difference.
+    """
+    if not cookies:
+        # Enumeration raced a navigation. Writing `{}` here overwrote a working
+        # jar, emitted `done` with count=0, and exited 0 — destroying the
+        # session while reporting success.
+        return (
+            "the browser returned no cookies, so nothing was saved rather than "
+            "overwrite the session you already had. Try `amazon login` again."
+        )
+
+    match = next((c for c in cookies if c.get("name") == AUTH_COOKIE), None)
+    if match is None:
+        return (
+            f"order history loaded but Amazon never issued the `{AUTH_COOKIE}` "
+            "session cookie, which `amazon order sync` requires. Nothing was "
+            "saved. Try `amazon login` again."
+        )
+
+    expires = match.get("expires")
+    if not isinstance(expires, (int, float)) or isinstance(expires, bool):
+        return (
+            f"the `{AUTH_COOKIE}` cookie has no usable expiry, so `amazon order "
+            "sync` would reject it. Nothing was saved."
+        )
+    if expires < 0 or expires <= now:
+        # Playwright writes -1 for a session cookie.
+        return (
+            "signed in, but Amazon issued a browser-session cookie that dies with "
+            "this window — `amazon order sync` would reject it, so nothing was "
+            "saved. Sign in again with \"Keep me signed in\" checked."
+        )
+    return None
+
+
+def write_private(path: Path, content: str) -> None:
+    """Write 0600, atomically. A half-written jar is indistinguishable from a
+    corrupt one, and the failure lands on the next command rather than this one.
+
+    The mode is set on the temp file before any content goes into it: the 0700
+    on the parent directory is applied under `except OSError: pass`, so on a
+    filesystem that rejects chmod it silently isn't there to fall back on.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def timeout_message(url: str | None, last_error: str | None) -> str:
+    """What to say when ten minutes pass without order history rendering.
+
+    This used to assert one cause unconditionally — "Amazon asks for the
+    password again before it will show orders". Under a hijacked captcha, a
+    closed window, a dropped connection or a stale first tab that sentence is
+    simply false, and a user who acts on it retries the password and fails the
+    same way. So: say where it stopped, offer the password explanation only when
+    the page it stopped on supports it, and carry the last swallowed exception —
+    which is worth more than the state on its own.
+    """
+    parts = [
+        f"timed out waiting for sign-in (10 min) — {describe_state(url)}.",
+        "Order history never rendered, so nothing was saved.",
+    ]
+    if is_signin_url(url):
+        parts.append(
+            "Amazon guards order history separately and will ask for the password "
+            "again even when the browser already looks signed in."
+        )
+    if last_error:
+        parts.append(f"Last error while checking the page: {last_error}")
+    return " ".join(parts)
+
+
+def close_quietly(*closeables: Any) -> None:
+    """Shut down without letting teardown overwrite the diagnosis.
+
+    On the closed-window path these are already gone, so `close()` raises and
+    replaces a clear `error` event with a Playwright traceback on stderr — which
+    the Ruby side only shows under -v, leaving the user with a bare exit code.
+    """
+    for c in closeables:
+        try:
+            c.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def poll_state(urls: Sequence[str | None]) -> str | None:
+    """Which open tab describes where the login flow actually is.
+
+    The poll used to look at one tab — the one it opened. Amazon's challenges
+    open new ones (and the user opens their own), so the original tab can sit on
+    an untouched homepage for ten minutes while the whole sign-in happens
+    somewhere else. Everything the poll reports and everything it does was being
+    decided from the least interesting window on screen.
+
+    A tab mid-sign-in wins, because that is where the user is and because
+    `should_renavigate` reads this: nudging while a 2FA prompt is open in
+    another tab throws away a code they have already been sent. Order history
+    next. Otherwise the first tab, which is the one we opened.
+    """
+    for url in urls:
+        if is_signin_url(url):
+            return url
+    for url in urls:
+        if is_order_history_url(url):
+            return url
+    return urls[0] if urls else None
 
 
 def should_prefill_email(email_visible: bool, password_visible: bool) -> bool:
@@ -290,74 +443,150 @@ def main() -> int:
         # was then rejected with. Nothing short of loading the page proves it.
         deadline = time.time() + 600  # 10 minutes
         authenticated = False
+        window_closed = False
         last_nudge = 0.0
         last_report = time.time()
+        last_state: str | None = None
         # `#your-orders-content` is the page *container*, so Amazon can render it
         # a tick before it knows whether it will show you the list or bounce you.
         # Requiring two consecutive passing ticks costs two seconds and removes
         # the only way this check can fire on a shell.
         streak = 0
+        last_error: str | None = None
+        probe_failures = 0
         while time.time() < deadline:
-            try:
-                url = page.url
-                cards = sum(page.locator(sel).count() for sel in ORDER_MARKERS)
-                streak = streak + 1 if order_access_ok(url, cards) else 0
-                if streak >= 2:
-                    authenticated = True
-                    break
+            # Above the try, because closing the window is not an error to retry
+            # past. The blanket `except` below used to swallow it, buying ten more
+            # minutes of waiting on a browser that no longer exists.
+            if not browser.is_connected() or not context.pages:
+                window_closed = True
+                break
 
-                # Ten minutes of silence gives the user nothing to act on and
-                # leaves a timeout undiagnosable afterwards. Say where we are.
-                if time.time() - last_report > 30:
-                    last_report = time.time()
-                    left = int(deadline - time.time())
-                    emit("log", msg=f"waiting ({left}s left) — {describe_state(url)}")
+            # Read the URLs and report *before* touching the DOM. `page.url` is
+            # cached client-side and does not raise — every locator call does, and
+            # with the heartbeat below the probes a dead network or a closing
+            # window took the entire loop silent until t=600s. That is the one
+            # case where the heartbeat is the only thing the user has.
+            open_pages = list(context.pages)
+            last_state = poll_state([p.url for p in open_pages])
+            if time.time() - last_report > 30:
+                last_report = time.time()
+                left = int(deadline - time.time())
+                emit("log", msg=f"waiting ({left}s left) — {describe_state(last_state)}")
+
+            try:
+                # Every tab, not just the one we opened. Amazon's challenges open
+                # their own windows and the user opens theirs; `page` was bound
+                # once at launch, so the original tab sat on /ap/signin — where
+                # `should_renavigate` declines to steer it — while a working
+                # session was authenticating in the tab beside it. Nothing has to
+                # change about saving: `context.cookies()` is context-wide and
+                # already sees it.
+                proved = any(
+                    order_access_ok(
+                        p.url, sum(p.locator(sel).count() for sel in ORDER_MARKERS)
+                    )
+                    for p in open_pages
+                )
                 # Give the tab a few seconds to settle before steering it, so a
                 # redirect in flight isn't mistaken for an idle page.
-                if should_renavigate(url) and time.time() - last_nudge > 10:
+                # `last_state` is `poll_state`'s pick, so a sign-in tab anywhere
+                # suppresses the nudge — not only one in the tab we would steer.
+                if should_renavigate(last_state) and time.time() - last_nudge > 10:
                     last_nudge = time.time()
-                    page.goto(ORDERS_URL, wait_until="domcontentloaded")
-            except Exception:  # noqa: BLE001
-                # A navigation mid-poll detaches the frame; try again next tick.
-                pass
+                    open_pages[0].goto(ORDERS_URL, wait_until="domcontentloaded")
+                probe_failures = 0
+            except Exception as e:  # noqa: BLE001
+                # A navigation mid-poll detaches the frame, so one failure means
+                # nothing. A run of them means no probe is completing and the
+                # loop is testing nothing while claiming to wait — `guard()`
+                # refuses to guess in exactly this situation, and this loop used
+                # to fail open into a ten-minute wait instead. Fail closed.
+                proved = False
+                last_error = f"{type(e).__name__}: {e}"
+                probe_failures += 1
+                if probe_failures >= MAX_PROBE_FAILURES:
+                    emit(
+                        "error",
+                        msg=(
+                            f"gave up checking the browser — {MAX_PROBE_FAILURES} "
+                            f"consecutive probes failed ({last_error}). Nothing was "
+                            "saved. This is usually a dropped network connection."
+                        ),
+                    )
+                    close_quietly(context, browser)
+                    return 1
+
+            streak = streak + 1 if proved else 0
+            if streak >= 2:
+                authenticated = True
+                break
             time.sleep(2)
 
-        if not authenticated:
+        if window_closed:
             emit(
                 "error",
                 msg=(
-                    "timed out waiting for sign-in (10 min) — order history never "
-                    "loaded, so nothing was saved. Amazon asks for the password "
-                    "again before it will show orders, even when the browser "
-                    "already looks signed in."
+                    "the browser window was closed before order history loaded, so "
+                    "nothing was saved. Run `amazon login` again and leave the "
+                    "window open until your orders appear."
                 ),
             )
-            context.close()
-            browser.close()
+            close_quietly(context, browser)
             return 1
 
-        # Persist cookies in two places:
+        if not authenticated:
+            emit("error", msg=timeout_message(last_state, last_error))
+            close_quietly(context, browser)
+            return 1
+
+        amazon_cookies = [
+            c
+            for c in context.cookies()
+            if c.get("domain", "").endswith("amazon.com") and c.get("name")
+        ]
+
+        # Check before writing. Order history rendering proves this *window* can
+        # read orders; it does not prove the cookies outlive it.
+        reason = unsavable_reason(amazon_cookies, time.time())
+        if reason:
+            emit("error", msg=reason)
+            close_quietly(context, browser)
+            return 1
+
+        # Persist in two places:
         #   1) amazon-orders cookie_jar_path: simple {name: value} dict
         #   2) Playwright storageState: full storage for future Playwright runs (e.g., `amazon buy`)
-        cookies = context.cookies()
-        ao_cookies = {
-            c.get("name", ""): c.get("value", "")
-            for c in cookies
-            if c.get("domain", "").endswith("amazon.com") and c.get("name")
-        }
-        cookies_path.write_text(json.dumps(ao_cookies))
-        os.chmod(cookies_path, 0o600)
+        ao_cookies = {c.get("name", ""): c.get("value", "") for c in amazon_cookies}
+        write_private(cookies_path, json.dumps(ao_cookies))
 
-        context.storage_state(path=str(storage_state_path))
-        os.chmod(storage_state_path, 0o600)
+        # Playwright writes this one itself, so it goes to a temp path and gets
+        # moved into place — same reason as the jar, and it has to land 0600
+        # before it is readable under its real name.
+        tmp_state = storage_state_path.with_name(storage_state_path.name + ".tmp")
+        context.storage_state(path=str(tmp_state))
+        os.chmod(tmp_state, 0o600)
+        os.replace(tmp_state, storage_state_path)
 
         emit("done", cookies_path=str(cookies_path), count=len(ao_cookies))
 
-        context.close()
-        browser.close()
+        close_quietly(context, browser)
 
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException as e:  # noqa: BLE001
+        # Several statements in `main()` sit outside any handler and raise
+        # straight out — `page.goto`, the two writes, the chmods. A disk-full
+        # `OSError` used to leave the traceback on stderr, which the Ruby side
+        # only prints under -v, so the user got an exit code and no output at
+        # all. Put the failure on the NDJSON channel the parent actually reads;
+        # the traceback still goes to stderr for anyone who wants it.
+        emit("error", msg=f"login worker crashed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        sys.exit(1)
