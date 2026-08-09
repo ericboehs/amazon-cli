@@ -355,8 +355,23 @@ def scrape_reviews(
     listing, made out of our own network error, and one that talks them out of
     the retry that would have worked.
     """
-    collected = scrape_review_cards(page)
-    seen = {r["id"] for r in collected if r["id"]}
+    seen: set[str] = set()
+
+    def fresh(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Cards not already collected, `seen` updated as it goes.
+
+        Running rather than a set comprehension so that one page rendering the
+        same review twice is caught the same way a repeated page is.
+        """
+        out = []
+        for r in cards:
+            key = dedupe_key(r)
+            if key not in seen:
+                seen.add(key)
+                out.append(r)
+        return out
+
+    collected = fresh(scrape_review_cards(page))
     walk = "complete"
 
     for n in range(1, max(pages, 0) + 1):
@@ -381,7 +396,7 @@ def scrape_reviews(
             emit("log", level="warn", msg=f"could not load review page {n} ({exc}) — reporting on {len(collected)} from the product page")
             walk = "failed"
             break
-        batch = [r for r in scrape_review_cards(page) if not r["id"] or r["id"] not in seen]
+        batch = fresh(scrape_review_cards(page))
         if not batch:
             # Amazon serves the same page over again rather than 404ing past the
             # end, so duplicates are the only "no more" signal there is. It does
@@ -399,11 +414,39 @@ def scrape_reviews(
             else:
                 emit("log", level="info", msg=f"no new reviews on page {n} — stopping")
             break
-        seen.update(r["id"] for r in batch if r["id"])
         collected.extend(batch)
         emit("log", level="info", msg=f"review page {n}: +{len(batch)} ({len(collected)} total)")
 
     return collected, walk
+
+
+# Enough of the body to tell two reviews apart without tripping over the
+# "Read more" truncation that the listing applies to long reviews and the
+# product page does not.
+DEDUPE_BODY_CHARS = 120
+
+
+def dedupe_key(review: dict[str, Any]) -> str:
+    """What makes this review the same review as one we already have.
+
+    The id when Amazon gives us one, and the content when it doesn't. There has
+    to be a fallback: keeping every id-less card unconditionally meant the same
+    review came back once per requested page, because Amazon serves the page
+    over again past the end of the listing rather than 404ing. The sample
+    inflated, the "nothing new" end-of-walk signal never fired, and the
+    duplicate-wording check — which reads shared phrasing as bought reviews —
+    was handed a listing's own reviews repeated verbatim. One renamed `id`
+    attribute would have been enough to manufacture that.
+
+    Deliberately over-specified. A re-served card matches on every field, so
+    extra fields cost nothing there, while each one makes it less likely that
+    two people who genuinely bought the same thing collapse into one.
+    """
+    if review["id"]:
+        return f"id:{review['id']}"
+    body = " ".join((review["body"] or "").split())[:DEDUPE_BODY_CHARS]
+    parts = (review["author"], review["date"], review["title"], body)
+    return "content:" + "\x1f".join(p or "" for p in parts)
 
 
 def _review_id(card: Any) -> str | None:
