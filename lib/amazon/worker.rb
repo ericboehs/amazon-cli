@@ -221,7 +221,10 @@ module Amazon
         err_thread = Thread.new do
           stderr.each_line do |l|
             line = l.chomp
-            warn(line) if @verbose
+            # Tagged like every other line this class writes: under -v these
+            # interleave with the progress bar, and an untagged stream in a
+            # pasted log is one nobody can attribute.
+            warn("[worker:stderr] #{line}") if @verbose
             tail << line
             tail.shift while tail.size > STDERR_TAIL_LINES
           end
