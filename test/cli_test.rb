@@ -2329,6 +2329,23 @@ class ReviewsScoringTest < Minitest::Test
     assert_equal 1, result['vine_count']
     assert_equal 10, result['sample_size']
   end
+
+  # The signal stopped counting an unreadable badge as an unverified purchase;
+  # this headline number did not, and it is the one people read first. A run
+  # where the badge probe failed on half the cards announced "Verified: 50%"
+  # over a listing where every readable card was verified.
+  def test_the_verified_headline_ignores_badges_that_could_not_be_read
+    reviews = sample(10).each_with_index.map { |r, i| r.merge('verified' => i < 5 ? true : nil) }
+    result = analyze(reviews: reviews)
+    assert_equal 100, result['verified_pct']
+    assert_equal 5, result['verified_readable']
+    assert_equal 10, result['sample_size']
+  end
+
+  def test_a_sample_with_no_readable_badges_has_no_percentage_to_report
+    reviews = sample(10).map { |r| r.merge('verified' => nil) }
+    assert_nil analyze(reviews: reviews)['verified_pct']
+  end
 end
 
 class ReviewsAdjustedRatingTest < Minitest::Test
@@ -2455,6 +2472,22 @@ class ReviewsFormatterTest < Minitest::Test
     analysis = Amazon::Reviews.analyze(payload)
     out, = capture_io_streams { fmt(**kw.slice(:json)).reviews(payload, analysis, **kw.except(:json)) }
     out
+  end
+
+  def test_the_verified_line_says_when_it_judged_fewer_cards_than_it_sampled
+    sample = FakeWorker::REVIEW_SAMPLE.map(&:dup)
+    sample[0]['verified'] = nil
+    out = render(data('reviews_sample' => sample))
+    # Reporting a percentage of 4 as "of 5 sampled" would overstate what was
+    # actually read, which is the whole complaint against the old denominator.
+    assert_includes out, 'of 4 readable'
+    assert_includes out, '5 sampled'
+  end
+
+  def test_the_verified_line_stays_plain_when_every_badge_was_readable
+    out = render
+    assert_includes out, 'of 5 sampled'
+    refute_includes out, 'readable'
   end
 
   def test_renders_the_whole_report

@@ -106,6 +106,7 @@ module Amazon
           mismatch_signal(data["title"], reviews, walk, pages),
           repeat_reviewer_signal(reviews)
         ]
+        verified_readable = readable_badges(reviews)
         scored = signals.select(&:computable?)
         denominator = scored.sum(&:max)
         score = denominator.zero? ? nil : ((scored.sum(&:points) / denominator.to_f) * 100).round
@@ -118,7 +119,13 @@ module Amazon
           "level" => level_for(score),
           "confidence" => confidence_for(reviews, scored.size, signals.size),
           "signals" => signals.map(&:as_json),
-          "verified_pct" => percentage(reviews.count { |r| r["verified"] }, reviews.size),
+          # Over the cards whose badge we could actually read, matching
+          # `unverified_signal`. Counting an unreadable badge as an unverified
+          # purchase put the two in open disagreement inside one report — the
+          # signal abstaining on 4 readable cards while the headline number,
+          # the one people read first, announced "Verified: 60% of 5 sampled".
+          "verified_pct" => percentage(verified_readable.count { |r| r["verified"] }, verified_readable.size),
+          "verified_readable" => verified_readable.size,
           "vine_count" => reviews.count { |r| r["vine"] },
           "reported_rating" => data["rating"],
           "adjusted_rating" => adjusted_rating(reviews),
@@ -221,11 +228,15 @@ module Amazon
       # we stopped understanding than a farm that bought nothing.
       BADGE_ROT_SAMPLE = 15
 
+      # nil means the badge probe never completed on that card, which is not
+      # evidence either way. Judging only the reviews we could actually read
+      # keeps an unreadable card from reading as an unverified one. Shared with
+      # `analyze`, so the headline percentage and the signal can't be computed
+      # over different populations and contradict each other in one report.
+      def readable_badges(reviews) = reviews.reject { |r| r["verified"].nil? }
+
       def unverified_signal(reviews)
-        # nil means the badge probe never completed on that card, which is not
-        # evidence either way. Judging only the reviews we could actually read
-        # keeps an unreadable card from reading as an unverified one.
-        readable = reviews.reject { |r| r["verified"].nil? }
+        readable = readable_badges(reviews)
         return thin(:unverified, "Verified purchases") if readable.size < MIN_SAMPLE
 
         unverified = readable.reject { |r| r["verified"] }

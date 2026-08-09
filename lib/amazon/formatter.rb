@@ -123,7 +123,13 @@ module Amazon
         puts "  Adjusted:  #{bold("#{adjusted}★")}#{dim("  verified, uncompensated reviews in this sample only")}"
       end
       if (verified = analysis["verified_pct"])
-        puts "  Verified:  #{verified}% of #{analysis["sample_size"]} sampled"
+        # The percentage is over the cards whose badge we could read, so when
+        # that is fewer than we sampled the line has to say so — quoting a
+        # share of four as "of 5 sampled" overstates what was actually read.
+        sampled = analysis["sample_size"]
+        readable = analysis["verified_readable"] || sampled
+        scope = readable == sampled ? "#{sampled} sampled" : "#{readable} readable of #{sampled} sampled"
+        puts "  Verified:  #{verified}% of #{scope}"
       end
       puts "  Vine:      #{analysis["vine_count"]} review(s) from Amazon's Vine programme" if analysis["vine_count"].to_i.positive?
 
