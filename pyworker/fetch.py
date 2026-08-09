@@ -214,8 +214,26 @@ class JarGuard:
         self.dead = False
         # Read before amazon-orders can touch the file. Held in memory only,
         # and written back solely to the file it came from.
+        self.jar_before = self._snapshot()
+
+    def resnapshot(self) -> None:
+        """Start protecting the jar as it stands now.
+
+        Called once a real sign-in has succeeded. amazon-orders persists the
+        jar after every request, including the ones inside a password login, so
+        a run that authenticates for real has already written a *better* jar
+        than the one this guard was constructed with. Without this, a later
+        bounce rolls that fresh session back to the stale pre-login one — and
+        the stale `x-main` is enough for `cookies_authenticated?`, so the next
+        run walks into the placeholder-password loop. The fix would be handing
+        back the harm it exists to prevent, on the one path that just spent a
+        password challenge earning something worth keeping.
+        """
+        self.jar_before = self._snapshot()
+
+    def _snapshot(self) -> str | None:
         try:
-            self.jar_before = cookies_path.read_text() if cookies_path.exists() else None
+            return self.cookies_path.read_text() if self.cookies_path.exists() else None
         except (OSError, ValueError) as e:
             # Say so. `None` is also how "first-ever sync, nothing to protect"
             # is spelled, so swallowing this left the two indistinguishable and
@@ -224,11 +242,12 @@ class JarGuard:
             # suggests the net was never strung up. Reachable through a jar
             # written by an earlier run under sudo or launchd, an NFS
             # `XDG_DATA_HOME` going stale, or EMFILE under load.
-            self.jar_before = None
             emit("log", level="warn", msg=(
-                f"cannot read {cookies_path} ({e}) — if Amazon bounces this sync "
-                "it will leave the stripped jar there instead of putting yours back"
+                f"cannot read {self.cookies_path} ({e}) — if Amazon bounces this "
+                "sync it will leave the stripped jar there instead of putting "
+                "yours back"
             ))
+            return None
 
     def restore(self, reason: str) -> bool:
         """Undo a strip, unless Amazon has told us there's nothing worth undoing."""
@@ -472,6 +491,10 @@ def main() -> int:
             emit("error", msg=f"login failed: {e}")
             guard.restore("the login attempt")
             return 1
+
+        # Whatever is on disk now is the session we just proved good. Anything
+        # older than this line is only worth putting back if this line never ran.
+        guard.resnapshot()
 
         api = AmazonOrders(session, config=config)
 

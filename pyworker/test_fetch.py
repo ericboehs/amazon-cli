@@ -36,6 +36,8 @@ WIPED = json.dumps({})
 # What a sign-in bounce actually leaves: the anonymous cookies survive, the
 # authenticated ones are expired out.
 BOUNCED = json.dumps({"session-id": "v", "session-id-time": "v"})
+# A jar amazon-orders wrote partway through the run, after a real sign-in.
+FRESH = json.dumps({"x-main": "earned", "at-main": "earned", "session-id": "v"})
 
 
 def emitted(fn):
@@ -306,6 +308,30 @@ class JarGuardTest(unittest.TestCase):
         self.assertNotIn("x-main", json.loads(path.read_text()))
         self.assertFalse(silently(lambda: guard.restore("the test")))
         self.assertNotIn("x-main", json.loads(path.read_text()))
+
+    def test_a_session_earned_during_the_run_is_the_one_protected(self):
+        # The run that matters most is the one that had no usable jar: it spent
+        # a real password (and possibly an OTP) and amazon-orders wrote the
+        # result to disk mid-run. Restoring the jar this guard was *constructed*
+        # with would throw that away and put the stale one back — and a stale
+        # `x-main` still satisfies `cookies_authenticated?`, so the next run
+        # skips login and feeds Amazon the placeholder password instead.
+        guard, path = self.guard()
+        path.write_text(FRESH)
+        guard.resnapshot()
+        path.write_text(BOUNCED)
+        self.assertTrue(silently(lambda: guard.restore("the test")))
+        self.assertEqual(path.read_text(), FRESH)
+
+    def test_resnapshotting_a_jar_that_is_gone_protects_nothing(self):
+        # Not every login leaves a jar behind — and "nothing there" must not
+        # mean "keep protecting the stale copy I read at startup".
+        guard, path = self.guard()
+        path.unlink()
+        guard.resnapshot()
+        self.assertIsNone(guard.jar_before)
+        path.write_text(BOUNCED)
+        self.assertFalse(silently(lambda: guard.restore("the test")))
 
     def test_the_latch_is_one_way(self):
         guard, path = self.guard()
