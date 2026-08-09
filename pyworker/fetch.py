@@ -126,6 +126,37 @@ def clear_dead_session(cookies_path: Path) -> bool:
     return True
 
 
+def restore_jar(cookies_path: Path, jar_before: str | None, reason: str) -> bool:
+    """Put the pre-run jar back if this run stripped its sign-in cookies.
+
+    `jar_before` is the snapshot taken before amazon-orders could touch the
+    file. It is held in memory only and written back solely to the file it came
+    from. Returns whether it wrote, which is also whether the caller's run
+    damaged something.
+    """
+    if jar_before is None:
+        return False
+    try:
+        after = cookies_path.read_text() if cookies_path.exists() else None
+        if not jar_regressed(jar_before, after):
+            return False
+        cookies_path.write_text(jar_before)
+        os.chmod(cookies_path, 0o600)
+    except OSError as e:
+        emit("log", level="warn", msg=f"could not restore the cookie jar: {e}")
+        return False
+    emit(
+        "log",
+        level="warn",
+        msg=(
+            f"{reason} stripped the saved sign-in cookies from {cookies_path}; "
+            "restored the jar as it was. Your session may still be dead — but "
+            "a failed sync no longer destroys a working one."
+        ),
+    )
+    return True
+
+
 def emit(event: str, **fields: Any) -> None:
     sys.stdout.write(json.dumps({"event": event, **fields}, default=_json_default) + "\n")
     sys.stdout.flush()
@@ -332,28 +363,8 @@ def main() -> int:
     except OSError:
         jar_before = None
 
-    def restore_jar(reason: str) -> None:
-        """Put the pre-run jar back if this run stripped its sign-in cookies."""
-        if jar_before is None:
-            return
-        try:
-            after = cookies_path.read_text() if cookies_path.exists() else None
-            if not jar_regressed(jar_before, after):
-                return
-            cookies_path.write_text(jar_before)
-            os.chmod(cookies_path, 0o600)
-        except OSError as e:
-            emit("log", level="warn", msg=f"could not restore the cookie jar: {e}")
-            return
-        emit(
-            "log",
-            level="warn",
-            msg=(
-                f"{reason} stripped the saved sign-in cookies from {cookies_path}; "
-                "restored the jar as it was. Your session may still be dead — but "
-                "a failed sync no longer destroys a working one."
-            ),
-        )
+    def restore(reason: str) -> None:
+        restore_jar(cookies_path, jar_before, reason)
 
     config = AmazonOrdersConfig(
         config_path=str(config_dir / "amazon-orders.yml"),
@@ -380,7 +391,7 @@ def main() -> int:
     try:
         session.login()
     except Exception as e:  # noqa: BLE001 — surface any auth failure to parent
-        restore_jar("the login attempt")
+        restore("the login attempt")
         emit("error", msg=f"login failed: {e}")
         return 1
 
@@ -414,7 +425,7 @@ def main() -> int:
                     ),
                 )
                 return 1
-            restore_jar(f"the failed {year} history fetch")
+            restore(f"the failed {year} history fetch")
             emit("error", msg=f"history fetch failed for {year}: {e}", trace=traceback.format_exc())
             return 1
 
@@ -462,7 +473,7 @@ def main() -> int:
     # got bounced part-way through can strip the jar and still exit 0, never
     # touching an error path. A run that genuinely worked never ends holding
     # fewer sign-in cookies than it started with, so this is safe to assert.
-    restore_jar("this sync")
+    restore("this sync")
 
     emit("done", count=total, skipped=skipped)
     return 0
