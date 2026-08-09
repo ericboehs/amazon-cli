@@ -320,7 +320,12 @@ class JarGuardTest(unittest.TestCase):
         path = Path(d) / "cookies.json"
         if text is not None:
             path.write_text(text)
-        return JarGuard(path), path
+        return self.guard_on(path), path
+
+    def guard_on(self, path):
+        guard = JarGuard(path)
+        self.addCleanup(guard.close)
+        return guard
 
     def test_it_snapshots_what_was_there(self):
         guard, _ = self.guard()
@@ -390,6 +395,31 @@ class JarGuardTest(unittest.TestCase):
         self.assertIsNone(guard.jar_before)
         path.write_text(BOUNCED)
         self.assertFalse(silently(lambda: guard.restore("the test")))
+
+    def test_a_second_run_cannot_take_the_jar(self):
+        # Two syncs at once — a cron job and a hand-run one, the ordinary case —
+        # each snapshot the jar, and whichever finishes second writes its
+        # snapshot over the other's work. Every fix in this file assumes the
+        # file only changes because of this run.
+        first, path = self.guard()
+        second = self.guard_on(path)
+        self.assertTrue(first.locked)
+        self.assertFalse(second.locked)
+        self.assertIsNone(second.jar_before)
+
+    def test_a_run_that_does_not_hold_the_jar_never_writes_to_it(self):
+        first, path = self.guard()
+        second = self.guard_on(path)
+        path.write_text(BOUNCED)
+        self.assertFalse(silently(lambda: second.restore("the test")))
+        self.assertFalse(silently(second.clear))
+        self.assertEqual(path.read_text(), BOUNCED)
+        self.assertTrue(first.locked)  # the holder is unaffected
+
+    def test_the_claim_is_dropped_when_the_run_ends(self):
+        first, path = self.guard()
+        first.close()
+        self.assertTrue(self.guard_on(path).locked)
 
     def test_the_latch_is_one_way(self):
         guard, path = self.guard()
@@ -556,13 +586,18 @@ def _module(name, **attrs):
 class WorkerRunTest(unittest.TestCase):
     """End-to-end `main()` runs against the fake package above."""
 
-    def run_worker(self, *, orders=(), login=None, get_order=None, jar=None, **overrides):
+    def run_worker(self, *, orders=(), login=None, get_order=None, jar=None, busy=False,
+                   **overrides):
         home = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, home, True)
         cookies = home / "amazon" / "cache" / "cookies.json"
         cookies.parent.mkdir(parents=True)
         if jar is not None:
             cookies.write_text(jar)
+        if busy:
+            # A stand-in for the other sync. The cleanup keeps it alive — and
+            # so holding the claim — for the length of the run.
+            self.addCleanup(JarGuard(cookies).close)
 
         request = {
             "action": "sync",
@@ -648,6 +683,16 @@ class WorkerRunTest(unittest.TestCase):
         self.assertEqual(code, 0)
         done = self.kinds(events, "done")[0]
         self.assertEqual((done["count"], done["skipped"]), (1, 1))
+
+    def test_a_second_sync_is_refused_rather_than_racing_the_first(self):
+        code, events, cookies = self.run_worker(
+            orders=[FakeOrder("111")], jar=GOOD, busy=True
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("already running", self.kinds(events, "error")[0]["msg"])
+        # It got as far as refusing and no further: no fetch, no write.
+        self.assertEqual(self.kinds(events, "order"), [])
+        self.assertEqual(cookies.read_text(), GOOD)
 
     def test_a_session_earned_this_run_survives_a_later_failure(self):
         # Finding 7 end to end: the run starts with a stale jar, signs in for
