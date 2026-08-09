@@ -49,6 +49,7 @@ $LOAD_PATH.unshift(File.join(ROOT, 'lib'))
 require 'amazon/config'
 require 'amazon/cache'
 require 'amazon/store'
+require 'amazon/reviews'
 require 'amazon/worker'
 require 'amazon/formatter'
 require 'amazon/cli'
@@ -57,6 +58,7 @@ require 'amazon/commands/login'
 require 'amazon/commands/config'
 require 'amazon/commands/buy'
 require 'amazon/commands/item'
+require 'amazon/commands/reviews'
 require 'amazon/commands/search'
 require 'amazon/commands/order'
 require 'amazon/commands/order/sync'
@@ -714,8 +716,42 @@ class FakeWorker
     { 'asin' => 'B0000000AD', 'title' => 'Sponsored thing', 'price' => 99.0, 'sponsored' => true }
   ].freeze
 
-  def item(_asin) = ITEM.dup
+  # Mirrors the real signature: reviews ride along on the item lookup rather
+  # than costing a second page load.
+  def item(_asin, reviews: false, review_pages: 0, sort: 'helpful')
+    data = ITEM.dup
+    return data unless reviews
+
+    @last_review_args = { pages: review_pages, sort: sort }
+    data.merge(
+      'rating' => 4.8,
+      'reviews' => 2400,
+      'histogram' => { '5' => 94, '4' => 3, '3' => 1, '2' => 0, '1' => 2 },
+      'reviews_sample' => REVIEW_SAMPLE.map(&:dup)
+    )
+  end
+
+  attr_reader :last_review_args
+
   def search(_query, limit: 10) = RESULTS.first(limit).map(&:dup)
+
+  REVIEW_SAMPLE = [
+    { 'id' => 'R1', 'rating' => 5.0, 'verified' => true, 'vine' => false, 'author' => 'Ann',
+      'date' => '2026-03-01', 'title' => 'Great', 'helpful_votes' => 4,
+      'body' => 'Prints beautifully and the colours came out vivid across every spool.' },
+    { 'id' => 'R2', 'rating' => 5.0, 'verified' => false, 'vine' => false, 'author' => 'Bob',
+      'date' => '2026-03-02', 'title' => 'Great', 'helpful_votes' => nil,
+      'body' => 'Prints beautifully and the colours came out vivid across every spool.' },
+    { 'id' => 'R3', 'rating' => 1.0, 'verified' => true, 'vine' => true, 'author' => 'Cal',
+      'date' => '2026-03-03', 'title' => 'Jammed', 'helpful_votes' => 9,
+      'body' => 'The filament jammed the extruder twice. Filament diameter varies wildly.' },
+    { 'id' => 'R4', 'rating' => 2.0, 'verified' => true, 'vine' => false, 'author' => 'Dee',
+      'date' => '2026-03-04', 'title' => 'Jammed again', 'helpful_votes' => 2,
+      'body' => 'The filament jammed the extruder on my third print. Diameter varies wildly.' },
+    { 'id' => 'R5', 'rating' => 3.0, 'verified' => true, 'vine' => false, 'author' => 'Eli',
+      'date' => '2026-03-05', 'title' => 'Mixed', 'helpful_votes' => nil,
+      'body' => 'Fine for rough drafts, though the filament jammed once during a long run.' }
+  ].freeze
 end
 
 class LiveCommandsTest < Minitest::Test
@@ -744,7 +780,7 @@ class LiveCommandsTest < Minitest::Test
   end
 
   def test_item_exits_1_when_worker_returns_nothing
-    nil_worker = Class.new { def item(_asin) = nil }.new
+    nil_worker = Class.new { def item(_asin, **) = nil }.new
     with_worker(->(*) { nil_worker }) do
       capture_io_streams { assert_equal 1, Amazon::CLI.run(%w[item B0747R1M51 --fresh]) }
     end
@@ -1710,5 +1746,731 @@ class SessionCookieTest < Minitest::Test
     write_jar
     File.write(@dir.join('storage_state.json'), JSON.generate('cookies' => 'nope'))
     refute authenticated?
+  end
+end
+
+# --- Review analysis ---------------------------------------------------
+
+# A unique all-alphabetic token per index. Digits can't be used: they break
+# clauses and fall out of the word scanner, so "body 7" and "body 8" would
+# reduce to the same content words and read as duplicates.
+def tag(i) = "zz#{i.to_s.tr('0123456789', 'abcdefghij')}"
+
+# Builds review samples for the heuristics. Defaults describe a plausibly
+# honest review — distinct wording, verified, spread over the year — and each
+# test perturbs only the field it is about.
+def review(i, **over)
+  {
+    'id' => "R#{i}", 'rating' => 5.0, 'verified' => true, 'vine' => false,
+    'author' => "Buyer #{i}", 'date' => "2025-#{format('%02d', 1 + (i % 12))}-14",
+    'title' => "Review #{tag(i)}",
+    'body' => "Spool #{tag(i)} #{tag(i + 100)} #{tag(i + 200)} #{tag(i + 300)} " \
+              'arrived and printed cleanly overall.'
+  }.merge(over)
+end
+
+def sample(n, **over) = (1..n).map { |i| review(i, **over) }
+
+def analyze(reviews:, title: 'PLA Filament Spool 1.75mm Extruder Safe', **over)
+  Amazon::Reviews.analyze({ 'title' => title, 'reviews_sample' => reviews }.merge(over))
+end
+
+def signal(result, key) = result['signals'].find { |s| s['key'] == key }
+
+class ReviewsHistogramSignalTest < Minitest::Test
+  def points(hist)
+    signal(analyze(reviews: [], 'histogram' => hist), 'histogram')
+  end
+
+  def test_normal_j_curve_scores_zero
+    s = points('5' => 58, '4' => 19, '3' => 9, '2' => 5, '1' => 9)
+    assert_equal 0, s['points']
+    assert_includes s['detail'], 'normal spread'
+  end
+
+  def test_five_star_wall_with_no_middle_scores_full
+    s = points('5' => 94, '4' => 3, '3' => 1, '2' => 0, '1' => 2)
+    assert_equal 20, s['points']
+    assert_includes s['detail'], 'fatter middle'
+  end
+
+  def test_intermediate_bands
+    assert_equal 15, points('5' => 84, '4' => 4, '3' => 1, '2' => 0, '1' => 11)['points']
+    assert_equal 11, points('5' => 82, '4' => 6, '3' => 2, '2' => 1, '1' => 9)['points']
+  end
+
+  def test_missing_histogram_is_not_computable_rather_than_clean
+    # The distinction matters: a signal scored 0 says "checked, looks fine";
+    # nil says "couldn't check", and only nil leaves the denominator.
+    s = points(nil)
+    assert_nil s['points']
+    assert_includes s['detail'], "didn't render"
+    assert_nil points({})['points']
+  end
+
+  def test_junk_keys_and_values_are_discarded
+    assert_nil points('rating' => 'lots', '9' => 50)['points']
+  end
+
+  def test_string_percentages_are_accepted
+    # The worker emits ints, but a hand-edited cache entry or a JSON round trip
+    # through the web UI can hand us strings.
+    assert_equal 20, points('5' => '94', '4' => '3', '3' => '1', '2' => '0', '1' => '2')['points']
+  end
+end
+
+class ReviewsUnverifiedSignalTest < Minitest::Test
+  def test_all_verified_scores_zero
+    s = signal(analyze(reviews: sample(10)), 'unverified')
+    assert_equal 0, s['points']
+    assert_includes s['detail'], 'all 10 sampled reviews are verified'
+  end
+
+  def test_mostly_unverified_scores_high
+    reviews = sample(10).each_with_index.map { |r, i| r.merge('verified' => i < 2) }
+    s = signal(analyze(reviews: reviews), 'unverified')
+    assert_equal 20, s['points']
+    assert_includes s['detail'], '8/10'
+  end
+
+  def test_glowing_unverified_reviews_are_called_out
+    reviews = sample(10).each_with_index.map { |r, i| r.merge('verified' => i < 5) }
+    assert_includes signal(analyze(reviews: reviews), 'unverified')['detail'], '5 of them 4★ or better'
+  end
+
+  def test_unverified_low_star_reviews_omit_the_glowing_note
+    reviews = sample(10).each_with_index.map { |r, i| r.merge('verified' => i < 5, 'rating' => 1.0) }
+    refute_includes signal(analyze(reviews: reviews), 'unverified')['detail'], 'or better'
+  end
+
+  def test_thin_sample_is_not_computable
+    s = signal(analyze(reviews: sample(3)), 'unverified')
+    assert_nil s['points']
+    assert_includes s['detail'], '5+ reviews'
+  end
+end
+
+class ReviewsBurstSignalTest < Minitest::Test
+  def test_needs_a_deep_sample_and_says_how_to_get_one
+    s = signal(analyze(reviews: sample(8)), 'burst')
+    assert_nil s['points']
+    assert_includes s['detail'], '--pages 3'
+  end
+
+  def test_tight_cluster_scores_full
+    reviews = (1..20).map { |i| review(i, 'date' => '2026-03-0%d' % (1 + (i % 3))) }
+    s = signal(analyze(reviews: reviews), 'burst')
+    assert_equal 20, s['points']
+    assert_includes s['detail'], '(100%)'
+  end
+
+  def test_spread_out_reviews_score_zero
+    reviews = (1..20).map { |i| review(i, 'date' => "2025-#{format('%02d', 1 + (i % 12))}-0#{1 + (i % 8)}") }
+    assert_equal 0, signal(analyze(reviews: reviews), 'burst')['points']
+  end
+
+  def test_undated_reviews_do_not_count_toward_the_sample
+    reviews = (1..20).map { |i| review(i, 'date' => nil) }
+    assert_nil signal(analyze(reviews: reviews), 'burst')['points']
+  end
+
+  def test_malformed_dates_are_ignored_not_fatal
+    reviews = (1..20).map { |i| review(i, 'date' => 'last Tuesday') }
+    assert_nil signal(analyze(reviews: reviews), 'burst')['points']
+  end
+end
+
+class ReviewsDuplicateSignalTest < Minitest::Test
+  TEMPLATE = 'These earbuds sound amazing and the battery life is excellent overall.'.freeze
+
+  def test_distinct_bodies_score_zero
+    s = signal(analyze(reviews: sample(8)), 'duplicates')
+    assert_equal 0, s['points']
+    assert_includes s['detail'], 'no near-duplicate phrasing'
+  end
+
+  def test_templated_bodies_score_full
+    s = signal(analyze(reviews: sample(8, 'body' => TEMPLATE)), 'duplicates')
+    assert_equal 15, s['points']
+    assert_includes s['detail'], 'overlapping wording'
+  end
+
+  def test_short_bodies_are_not_comparable
+    s = signal(analyze(reviews: sample(8, 'body' => 'Good.')), 'duplicates')
+    assert_nil s['points']
+    assert_includes s['detail'], 'substantial text'
+  end
+
+  def test_partial_duplication_scores_partially
+    reviews = sample(8).each_with_index.map { |r, i| i < 2 ? r.merge('body' => TEMPLATE) : r }
+    points = signal(analyze(reviews: reviews), 'duplicates')['points']
+    assert_operator points, :>, 0
+    assert_operator points, :<, 15
+  end
+end
+
+class ReviewsIncentivizedSignalTest < Minitest::Test
+  DISCLOSURE = 'I received this product for free in exchange for my honest review of the spool.'.freeze
+
+  def test_clean_sample_scores_zero
+    assert_equal 0, signal(analyze(reviews: sample(10)), 'incentivized')['points']
+  end
+
+  def test_disclosures_score
+    reviews = sample(10).each_with_index.map { |r, i| i < 3 ? r.merge('body' => DISCLOSURE) : r }
+    s = signal(analyze(reviews: reviews), 'incentivized')
+    assert_equal 10, s['points']
+    assert_includes s['detail'], '3/10'
+  end
+
+  def test_vine_reviews_are_excluded_from_the_penalty
+    # Vine is Amazon's own disclosed programme; penalising it would flag honest
+    # listings for participating in something Amazon runs.
+    reviews = sample(10).map { |r| r.merge('body' => DISCLOSURE, 'vine' => true) }
+    assert_equal 0, signal(analyze(reviews: reviews), 'incentivized')['points']
+  end
+
+  def test_phrasing_variants
+    %w[
+      at\ a\ discounted\ price
+      in\ return\ for\ my\ honest\ opinion
+      got\ this\ item\ free\ of\ no\ cost
+    ].each do |phrase|
+      reviews = sample(10).map { |r| r.merge('body' => "Nice spool, #{phrase.tr('\\', ' ')}.") }
+      assert_operator signal(analyze(reviews: reviews), 'incentivized')['points'], :>, 0, phrase
+    end
+  end
+
+  def test_thin_sample_is_not_computable
+    assert_nil signal(analyze(reviews: sample(2)), 'incentivized')['points']
+  end
+end
+
+class ReviewsMismatchSignalTest < Minitest::Test
+  def test_occasional_echoes_of_the_title_keep_it_quiet
+    # The realistic false positive this guards against: most honest reviewers
+    # never repeat a keyword-stuffed title back, so only a *total* absence over
+    # a deep sample counts as evidence.
+    reviews = (1..30).map do |i|
+      body = i % 5 == 0 ? "The loppers held up through a full season #{tag(i)}." : "Held up nicely #{tag(i)}."
+      review(i, 'title' => "Fine #{tag(i)}", 'body' => body)
+    end
+    s = signal(analyze(reviews: reviews, title: 'Heavy Duty Garden Loppers Steel Blade'), 'mismatch')
+    assert_equal 0, s['points']
+    assert_includes s['detail'], 'mention something from the product title'
+  end
+
+  def test_total_mismatch_across_a_deep_sample_scores
+    reviews = (1..30).map { |i| review(i, 'title' => 'Nice', 'body' => "Lovely scented candle #{tag(i)}.") }
+    s = signal(analyze(reviews: reviews, title: 'Cordless Impact Driver Brushless Kit'), 'mismatch')
+    assert_equal 8, s['points']
+    assert_includes s['detail'], 'merged listing'
+  end
+
+  def test_shallow_sample_is_not_computable
+    s = signal(analyze(reviews: sample(12)), 'mismatch')
+    assert_nil s['points']
+    assert_includes s['detail'], '--pages 3'
+  end
+
+  def test_a_title_with_no_content_words_is_not_computable
+    assert_nil signal(analyze(reviews: sample(30), title: 'A B'), 'mismatch')['points']
+  end
+
+  def test_reviews_without_text_are_excluded_from_the_denominator
+    assert_nil signal(analyze(reviews: sample(30, 'body' => '', 'title' => '')), 'mismatch')['points']
+  end
+end
+
+class ReviewsRepeatReviewerSignalTest < Minitest::Test
+  def test_distinct_names_score_zero
+    s = signal(analyze(reviews: sample(10)), 'repeat_reviewers')
+    assert_equal 0, s['points']
+    assert_includes s['detail'], '10 distinct reviewer names'
+  end
+
+  def test_repeated_names_score
+    s = signal(analyze(reviews: sample(10, 'author' => 'Same Person')), 'repeat_reviewers')
+    assert_equal 5, s['points']
+    assert_includes s['detail'], 'more than once'
+  end
+
+  def test_names_are_matched_case_and_space_insensitively
+    reviews = sample(10).each_with_index.map { |r, i| r.merge('author' => i.even? ? ' Ann ' : 'ANN') }
+    assert_equal 5, signal(analyze(reviews: reviews), 'repeat_reviewers')['points']
+  end
+
+  def test_anonymous_reviews_are_not_computable
+    assert_nil signal(analyze(reviews: sample(10, 'author' => nil)), 'repeat_reviewers')['points']
+    assert_nil signal(analyze(reviews: sample(10, 'author' => '  ')), 'repeat_reviewers')['points']
+  end
+end
+
+class ReviewsScoringTest < Minitest::Test
+  def test_a_clean_listing_scores_low
+    result = analyze(reviews: sample(10), 'histogram' => { '5' => 58, '4' => 19, '3' => 9, '2' => 5, '1' => 9 })
+    assert_equal 0, result['score']
+    assert_equal 'low', result['level']
+  end
+
+  def test_a_farmed_listing_scores_high
+    reviews = (1..20).map do |i|
+      review(i, 'verified' => false, 'author' => 'Bot', 'date' => '2026-03-02',
+                'body' => 'These earbuds sound amazing and the battery life is excellent overall.')
+    end
+    result = analyze(reviews: reviews, 'histogram' => { '5' => 96, '4' => 2, '3' => 0, '2' => 0, '1' => 2 })
+    assert_equal 'high', result['level']
+    assert_operator result['score'], :>, 75
+  end
+
+  def test_uncomputable_signals_leave_the_denominator_rather_than_scoring_zero
+    # Two reviews can't support any per-review check. If those checks counted as
+    # passes, a listing nobody can assess would look spotless — the single most
+    # dangerous way for this to be wrong.
+    result = analyze(reviews: sample(2), 'histogram' => { '5' => 96, '4' => 2, '3' => 0, '2' => 0, '1' => 2 })
+    assert_equal 100, result['score']
+    assert_equal 'high', result['level']
+    assert_equal 'low', result['confidence']
+  end
+
+  def test_no_computable_signals_at_all_yields_no_score
+    result = analyze(reviews: [])
+    assert_nil result['score']
+    assert_equal 'unknown', result['level']
+    assert_equal 'none', result['confidence']
+  end
+
+  def test_level_bands
+    assert_equal 'low', Amazon::Reviews.level_for(19)
+    assert_equal 'some', Amazon::Reviews.level_for(20)
+    assert_equal 'elevated', Amazon::Reviews.level_for(40)
+    assert_equal 'high', Amazon::Reviews.level_for(65)
+    assert_equal 'unknown', Amazon::Reviews.level_for(nil)
+  end
+
+  def test_confidence_rises_with_sample_depth
+    deep = (1..45).map { |i| review(i, 'date' => "2025-#{format('%02d', 1 + (i % 12))}-0#{1 + (i % 8)}") }
+    result = analyze(reviews: deep, 'histogram' => { '5' => 58, '4' => 19, '3' => 9, '2' => 5, '1' => 9 })
+    assert_equal 'high', result['confidence']
+
+    mid = (1..20).map { |i| review(i, 'date' => "2025-#{format('%02d', 1 + (i % 12))}-0#{1 + (i % 8)}") }
+    assert_equal 'medium', analyze(reviews: mid,
+                                   'histogram' => { '5' => 58, '4' => 19, '3' => 9, '2' => 5, '1' => 9 })['confidence']
+  end
+
+  def test_handles_a_nil_payload
+    result = Amazon::Reviews.analyze(nil)
+    assert_equal 0, result['sample_size']
+    assert_nil result['score']
+  end
+
+  def test_reports_sample_composition
+    reviews = sample(10).each_with_index.map { |r, i| r.merge('verified' => i < 7, 'vine' => i == 9) }
+    result = analyze(reviews: reviews)
+    assert_equal 70, result['verified_pct']
+    assert_equal 1, result['vine_count']
+    assert_equal 10, result['sample_size']
+  end
+end
+
+class ReviewsAdjustedRatingTest < Minitest::Test
+  def test_averages_only_trustworthy_reviews
+    reviews = [
+      review(1, 'rating' => 5.0),
+      review(2, 'rating' => 5.0),
+      review(3, 'rating' => 2.0),
+      review(4, 'rating' => 5.0, 'verified' => false),
+      review(5, 'rating' => 5.0, 'vine' => true),
+      review(6, 'rating' => 5.0, 'body' => 'Received this product for free in exchange for my honest review.')
+    ]
+    assert_equal 4.0, analyze(reviews: reviews)['adjusted_rating']
+  end
+
+  def test_too_few_trustworthy_reviews_yields_nothing
+    reviews = [review(1), review(2, 'verified' => false), review(3, 'verified' => false)]
+    assert_nil analyze(reviews: reviews)['adjusted_rating']
+  end
+
+  def test_unrated_reviews_are_skipped
+    reviews = (1..5).map { |i| review(i, 'rating' => nil) }
+    assert_nil analyze(reviews: reviews)['adjusted_rating']
+  end
+end
+
+class ReviewsThemesTest < Minitest::Test
+  def test_extracts_repeated_complaints_from_critical_reviews
+    reviews = (1..4).map do |i|
+      review(i, 'rating' => 2.0, 'title' => 'Bad',
+                'body' => 'The battery life is terrible and it stopped working after two weeks.')
+    end
+    phrases = analyze(reviews: reviews)['themes'].map { |t| t['phrase'] }
+    assert_includes phrases, 'battery life'
+    assert_includes phrases, 'stopped working'
+  end
+
+  def test_five_star_reviews_are_not_mined_for_complaints
+    assert_empty analyze(reviews: sample(10, 'rating' => 5.0))['themes']
+  end
+
+  def test_bigrams_never_span_a_clause_or_the_title_boundary
+    # "Great product" + "Stopped working" must not become "great stopped".
+    reviews = (1..4).map do |i|
+      review(i, 'rating' => 1.0, 'title' => 'Great product',
+                'body' => 'Stopped working. Battery life is poor, packaging arrived crushed.')
+    end
+    phrases = analyze(reviews: reviews)['themes'].map { |t| t['phrase'] }
+    refute_includes phrases, 'great stopped'
+    refute_includes phrases, 'poor packaging'
+    assert_includes phrases, 'stopped working'
+  end
+
+  def test_stopwords_do_not_join_their_neighbours
+    reviews = (1..4).map { |i| review(i, 'rating' => 1.0, 'body' => 'The screen is cracked.') }
+    phrases = analyze(reviews: reviews)['themes'].map { |t| t['phrase'] }
+    refute_includes phrases, 'screen cracked'
+    assert_includes phrases, 'screen'
+  end
+
+  def test_unique_wording_yields_no_themes
+    reviews = (1..4).map do |i|
+      review(i, 'rating' => 1.0, 'title' => tag(i), 'body' => "#{tag(i)} #{tag(i + 100)} #{tag(i + 200)}.")
+    end
+    assert_empty analyze(reviews: reviews)['themes']
+  end
+
+  def test_falls_back_to_unigrams_when_no_bigram_repeats
+    reviews = (1..4).map do |i|
+      review(i, 'rating' => 1.0, 'title' => tag(i), 'body' => "Leaking. #{tag(i)} #{tag(i + 100)}.")
+    end
+    phrases = analyze(reviews: reviews)['themes'].map { |t| t['phrase'] }
+    assert_includes phrases, 'leaking'
+  end
+
+  def test_too_few_critical_reviews_to_generalise
+    assert_empty analyze(reviews: [review(1, 'rating' => 1.0), review(2, 'rating' => 1.0)])['themes']
+  end
+end
+
+# --- Review formatting -------------------------------------------------
+
+class ReviewsFormatterTest < Minitest::Test
+  def fmt(**kw) = Amazon::Formatter.new(color: false, **kw)
+
+  def data(**over)
+    {
+      'asin' => 'B0747R1M51', 'url' => 'https://www.amazon.com/dp/B0747R1M51',
+      'title' => 'PLA Filament Spool', 'rating' => 4.8, 'reviews' => 2400,
+      'histogram' => { '5' => 94, '4' => 3, '3' => 1, '2' => 0, '1' => 2 },
+      'reviews_sample' => FakeWorker::REVIEW_SAMPLE.map(&:dup)
+    }.merge(over)
+  end
+
+  def render(payload = data, **kw)
+    analysis = Amazon::Reviews.analyze(payload)
+    out, = capture_io_streams { fmt(**kw.slice(:json)).reviews(payload, analysis, **kw.except(:json)) }
+    out
+  end
+
+  def test_renders_the_whole_report
+    out = render
+    assert_includes out, 'PLA Filament Spool'
+    assert_includes out, '4.8★'
+    assert_includes out, '2,400 ratings'
+    assert_includes out, 'Rating distribution'
+    assert_includes out, '5★'
+    assert_includes out, '94%'
+    assert_includes out, 'Authenticity'
+    assert_includes out, 'Verified:'
+    assert_includes out, 'Vine:'
+    assert_includes out, 'What critical reviews mention'
+    assert_includes out, 'not a verdict'
+  end
+
+  def test_adjusted_rating_is_labelled_as_sample_only
+    payload = data('reviews_sample' => (1..6).map { |i| review(i, 'rating' => 4.0) })
+    out = render(payload)
+    assert_includes out, 'Adjusted:  4.0★'
+    assert_includes out, 'this sample only'
+  end
+
+  def test_omits_sections_it_has_no_data_for
+    out = render(data('rating' => nil, 'reviews' => nil, 'histogram' => {}, 'reviews_sample' => []))
+    assert_includes out, '(no rating)'
+    # The histogram *section* is gone; the histogram *check* still reports why
+    # it couldn't run, which is the point of listing uncomputable signals.
+    refute_includes out, 'Rating distribution:  '
+    assert_includes out, "?  Rating distribution: Amazon didn't render"
+    refute_includes out, 'What critical reviews mention'
+    refute_includes out, 'Adjusted:'
+    refute_includes out, 'Vine:'
+  end
+
+  def test_nil_payload_and_json
+    out, = capture_io_streams { fmt.reviews(nil, {}) }
+    assert_includes out, '(not found)'
+
+    out = render(data, json: true)
+    parsed = JSON.parse(out)
+    assert_equal 'B0747R1M51', parsed['asin']
+    assert_equal 5, parsed['analysis']['sample_size']
+  end
+
+  def test_scored_signals_are_itemised_with_their_weight
+    payload = data('reviews_sample' => (1..10).map { |i| review(i, 'verified' => false) })
+    out = render(payload)
+    assert_includes out, 'Verified purchases: 10/10 sampled reviews are unverified'
+    assert_includes out, '[+20/20]'
+  end
+
+  def test_unrunnable_checks_are_shown_rather_than_silently_passing
+    out = render
+    assert_includes out, '?  Review timing:'
+    assert_includes out, '--pages 3'
+  end
+
+  def test_every_risk_band_renders
+    %w[low some elevated high].each do |level|
+      analysis = { 'score' => 10, 'level' => level, 'confidence' => 'medium', 'signals' => [],
+                   'sample_size' => 5, 'themes' => [] }
+      out, = capture_io_streams { fmt.reviews(data, analysis) }
+      assert_includes out, level == 'low' ? 'low risk' : "#{level} risk"
+    end
+  end
+
+  def test_unscorable_analysis_says_so_instead_of_showing_zero
+    analysis = { 'score' => nil, 'level' => 'unknown', 'confidence' => 'none', 'signals' => [],
+                 'sample_size' => 0, 'themes' => [] }
+    out, = capture_io_streams { fmt.reviews(data, analysis) }
+    assert_includes out, 'not enough data to assess'
+    refute_includes out, '0/100'
+  end
+
+  def test_verbatim_prints_review_text_and_badges
+    out = render(data, verbatim: true)
+    assert_includes out, 'Reviews (5 of 5)'
+    assert_includes out, 'Prints beautifully'
+    assert_includes out, 'verified'
+    assert_includes out, 'vine'
+    assert_includes out, '4 helpful'
+  end
+
+  def test_verbatim_respects_a_limit
+    out = render(data, verbatim: true, limit: 2)
+    assert_includes out, 'Reviews (2 of 5)'
+    refute_includes out, 'Jammed'
+  end
+
+  def test_verbatim_tolerates_missing_review_fields
+    bare = [{ 'id' => 'R1', 'title' => 'Terse', 'verified' => false, 'vine' => false }]
+    out = render(data('reviews_sample' => bare), verbatim: true)
+    assert_includes out, '?★'
+    assert_includes out, 'Terse'
+  end
+
+  def test_verbatim_with_no_reviews_prints_no_section
+    out = render(data('reviews_sample' => []), verbatim: true)
+    refute_includes out, 'Reviews ('
+  end
+
+  def test_long_review_bodies_wrap
+    long = [review(1, 'body' => (%w[alpha bravo charlie delta echo] * 30).join(' '))]
+    out = render(data('reviews_sample' => long), verbatim: true)
+    body_lines = out.lines.select { |l| l.include?('alpha') }
+    assert_operator body_lines.size, :>, 1
+    assert(body_lines.all? { |l| l.chomp.length <= 200 })
+  end
+
+  def test_summary_block_is_condensed
+    payload = data('reviews_sample' => (1..10).map { |i| review(i, 'verified' => false) })
+    analysis = Amazon::Reviews.analyze(payload)
+    out, = capture_io_streams { fmt.reviews_summary(analysis) }
+    assert_includes out, 'Reviews:'
+    assert_includes out, 'unverified'
+    refute_includes out, 'Rating distribution'
+  end
+
+  def test_summary_reports_when_nothing_could_be_assessed
+    out, = capture_io_streams { fmt.reviews_summary(Amazon::Reviews.analyze({})) }
+    assert_includes out, 'not enough data to assess'
+  end
+
+  def test_summary_lists_complaint_themes
+    critical = (1..4).map do |i|
+      review(i, 'rating' => 1.0, 'title' => "Bad #{tag(i)}",
+                'body' => 'The filament jammed constantly and the spool warped badly.')
+    end
+    analysis = Amazon::Reviews.analyze(data('reviews_sample' => critical))
+    out, = capture_io_streams { fmt.reviews_summary(analysis) }
+    assert_includes out, 'complaints:'
+  end
+
+  def test_summary_prints_nothing_in_json_mode
+    out, = capture_io_streams { fmt(json: true).reviews_summary(Amazon::Reviews.analyze(data)) }
+    assert_empty out
+  end
+
+  def test_color_marks_pass_and_fail_signals
+    payload = data('reviews_sample' => (1..10).map { |i| review(i, 'verified' => false) })
+    analysis = Amazon::Reviews.analyze(payload)
+    out, = capture_io_streams { Amazon::Formatter.new(color: true).reviews(payload, analysis) }
+    assert_includes out, "\e[31m"
+    assert_includes out, "\e[32m"
+  end
+end
+
+# --- reviews command ---------------------------------------------------
+
+class ReviewsCommandTest < Minitest::Test
+  def setup
+    write_config!
+    seed_order!(SAMPLE_ORDER.dup)
+  end
+
+  def run_cli(*args, worker: FakeWorker.new)
+    with_worker(->(*) { worker }) { capture_io_streams { Amazon::CLI.run(args) } }
+  end
+
+  def test_default_report
+    out, = run_cli('reviews', 'B0747R1M51', '--fresh')
+    assert_includes out, 'Rating distribution'
+    assert_includes out, 'Authenticity'
+    refute_includes out, 'Prints beautifully'
+  end
+
+  def test_verbatim_prints_review_bodies
+    out, = run_cli('reviews', 'B0747R1M51', '--verbatim', '--fresh')
+    assert_includes out, 'Prints beautifully'
+  end
+
+  def test_critical_narrows_output_but_not_the_analysis
+    out, = run_cli('reviews', 'B0747R1M51', '--critical', '--fresh')
+    assert_includes out, 'Jammed'
+    refute_includes out, 'Prints beautifully'
+    # Scoring still ran on all five, not the three that got printed.
+    assert_includes out, '5-review sample'
+  end
+
+  def test_limit_caps_verbatim_output
+    out, = run_cli('reviews', 'B0747R1M51', '--verbatim', '--limit', '1', '--fresh')
+    assert_includes out, 'Reviews (1 of 5)'
+  end
+
+  def test_pages_and_sort_reach_the_worker
+    worker = FakeWorker.new
+    run_cli('reviews', 'B0747R1M51', '--pages', '2', '--sort', 'recent', '--fresh', worker: worker)
+    assert_equal({ pages: 2, sort: 'recent' }, worker.last_review_args)
+  end
+
+  def test_json_carries_the_analysis
+    out, = run_cli('--json', 'reviews', 'B0747R1M51', '--fresh')
+    parsed = JSON.parse(out)
+    assert_equal 5, parsed['analysis']['sample_size']
+    assert parsed['analysis']['signals'].any?
+  end
+
+  def test_requires_a_target
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[reviews]) }
+    assert_includes err, 'ASIN or product URL is required'
+  end
+
+  def test_help
+    out, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[reviews --help]) }
+    assert_includes out, 'Usage: amazon reviews'
+    assert_includes out, 'not a verdict'
+  end
+
+  def test_rejects_a_page_count_that_would_hammer_amazon
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[reviews B1 --pages 99]) }
+    assert_includes err, 'between 0 and 10'
+
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[reviews B1 --pages -1]) }
+    assert_includes err, 'between 0 and 10'
+  end
+
+  def test_rejects_bad_flag_values
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[reviews B1 --pages lots]) }
+    assert_includes err, 'needs a number'
+
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[reviews B1 --sort cheapest]) }
+    assert_includes err, 'helpful, recent'
+
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[reviews B1 --nope]) }
+    assert_includes err, 'unknown option'
+  end
+
+  def test_exits_1_when_the_worker_returns_nothing
+    nil_worker = Class.new { def item(_asin, **) = nil }.new
+    _, err = run_cli('reviews', 'B1', '--fresh', worker: nil_worker)
+    assert_includes err, 'no product data'
+  end
+
+  def test_exit_status_is_1_when_nothing_came_back
+    nil_worker = Class.new { def item(_asin, **) = nil }.new
+    with_worker(->(*) { nil_worker }) do
+      capture_io_streams { assert_equal 1, Amazon::CLI.run(%w[reviews B1 --fresh]) }
+    end
+  end
+
+  def test_results_are_cached_between_runs
+    calls = 0
+    counting = Class.new do
+      define_method(:item) { |_asin, **kw| calls += 1; FakeWorker.new.item('B1', **kw) }
+    end.new
+    run_cli('reviews', 'B0CACHED', '--fresh', worker: counting)
+    run_cli('reviews', 'B0CACHED', worker: counting)
+    assert_equal 1, calls
+  end
+end
+
+class ItemWithReviewsTest < Minitest::Test
+  def setup
+    write_config!
+    seed_order!(SAMPLE_ORDER.dup)
+  end
+
+  def test_appends_a_review_summary
+    out, = with_worker(->(*) { FakeWorker.new }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[item B0747R1M51 --reviews --fresh]) }
+    end
+    assert_includes out, 'PLA Filament'
+    assert_includes out, 'Price:'
+    assert_includes out, 'Reviews:'
+  end
+
+  def test_plain_item_lookup_is_unaffected
+    out, = with_worker(->(*) { FakeWorker.new }) do
+      capture_io_streams { Amazon::CLI.run(%w[item B0747R1M51 --fresh]) }
+    end
+    refute_includes out, 'Reviews:'
+    refute_includes out, 'Authenticity'
+  end
+
+  def test_review_lookups_do_not_share_a_cache_entry_with_plain_ones
+    # Serving a --reviews request from a plain entry would silently drop the
+    # sample and report "not enough data" on a product that has plenty.
+    worker = FakeWorker.new
+    with_worker(->(*) { worker }) do
+      capture_io_streams { Amazon::CLI.run(%w[item B0SPLIT --fresh]) }
+      out, = capture_io_streams { Amazon::CLI.run(%w[item B0SPLIT --reviews]) }
+      assert_includes out, 'Reviews:'
+    end
+  end
+
+  def test_json_output_includes_the_analysis
+    out, = with_worker(->(*) { FakeWorker.new }) do
+      capture_io_streams { Amazon::CLI.run(%w[--json item B0747R1M51 --reviews --fresh]) }
+    end
+    assert JSON.parse(out)['analysis']['signals'].any?
+  end
+
+  def test_help_mentions_the_flag
+    out, = capture_io_streams { Amazon::CLI.run(%w[item --help]) }
+    assert_includes out, '--reviews'
+    assert_includes out, 'amazon reviews'
+  end
+
+  def test_top_level_help_lists_the_command
+    out, = capture_io_streams { Amazon::CLI.run(%w[help]) }
+    assert_includes out, 'reviews'
   end
 end

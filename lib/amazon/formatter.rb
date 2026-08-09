@@ -104,6 +104,51 @@ module Amazon
       end
     end
 
+    # Full `amazon reviews` view: histogram, trust signals, complaint themes,
+    # and — with verbatim: true — the review text itself.
+    def reviews(data, analysis, verbatim: false, limit: nil)
+      return puts(JSON.pretty_generate(data.merge("analysis" => analysis))) if @json
+      return puts("(not found)") unless data
+
+      puts bold(data["title"].to_s)
+      puts dim("#{data["asin"]}  ·  #{data["url"]}")
+      puts
+
+      rating = data["rating"]
+      count = data["reviews"]
+      header = rating ? "#{rating}★" : "(no rating)"
+      header += dim("  #{comma(count)} ratings") if count
+      puts "  Overall:   #{bold(header)}"
+      if (adjusted = analysis["adjusted_rating"])
+        puts "  Adjusted:  #{bold("#{adjusted}★")}#{dim("  verified, uncompensated reviews in this sample only")}"
+      end
+      if (verified = analysis["verified_pct"])
+        puts "  Verified:  #{verified}% of #{analysis["sample_size"]} sampled"
+      end
+      puts "  Vine:      #{analysis["vine_count"]} review(s) from Amazon's Vine programme" if analysis["vine_count"].to_i.positive?
+
+      histogram(data["histogram"])
+      trust(analysis)
+      complaint_themes(analysis["themes"])
+      verbatim_reviews(data["reviews_sample"] || [], limit) if verbatim
+    end
+
+    # Condensed block appended under `amazon item --reviews`.
+    def reviews_summary(analysis)
+      return if @json
+
+      puts
+      score = analysis["score"]
+      return puts(dim("  Reviews:   not enough data to assess")) unless score
+
+      puts "  Reviews:   #{level_phrase(analysis)}"
+      top = analysis["signals"].select { |s| s["points"].to_i.positive? }
+                               .max_by(2) { |s| s["points"] }
+      top.each { |s| puts dim("             · #{s["detail"]}") }
+      themes = analysis["themes"].first(3).map { |t| t["phrase"] }
+      puts dim("             complaints: #{themes.join(", ")}") if themes.any?
+    end
+
     def live_search(results, query)
       return puts(JSON.pretty_generate(results)) if @json
       return puts("(no live results for #{query.inspect})") if results.empty?
@@ -144,6 +189,96 @@ module Amazon
     end
 
     private
+
+    HIST_WIDTH = 24
+
+    def histogram(hist)
+      return if hist.nil? || hist.empty?
+
+      puts
+      puts bold("Rating distribution")
+      5.downto(1) do |star|
+        pct = hist[star.to_s].to_i
+        bar = "█" * ((pct / 100.0) * HIST_WIDTH).round
+        puts "  #{star}★ #{bar.ljust(HIST_WIDTH)} #{pct.to_s.rjust(3)}%"
+      end
+    end
+
+    # The score is deliberately never printed alone — every point it carries is
+    # itemised underneath, including the checks that could not be run.
+    def trust(analysis)
+      puts
+      puts bold("Authenticity")
+      puts "  #{level_phrase(analysis)}"
+
+      analysis["signals"].each do |s|
+        if s["points"].nil?
+          puts dim("    ?  #{s["label"]}: #{s["detail"]}")
+        else
+          mark = s["points"].positive? ? red("!") : green("✓")
+          weight = s["points"].positive? ? dim(" [+#{s["points"]}/#{s["max"]}]") : ""
+          puts "    #{mark}  #{s["label"]}: #{s["detail"]}#{weight}"
+        end
+      end
+      puts dim("    Heuristics on a #{analysis["sample_size"]}-review sample, not a verdict. " \
+               "Use --pages 3 for a deeper sample.")
+    end
+
+    def level_phrase(analysis)
+      score = analysis["score"]
+      return dim("not enough data to assess") unless score
+
+      label = case analysis["level"]
+              when "low"      then green("low risk")
+              when "some"     then "some risk"
+              when "elevated" then red("elevated risk")
+              else red("high risk")
+              end
+      "#{label} #{dim("(#{score}/100, #{analysis["confidence"]} confidence)")}"
+    end
+
+    def complaint_themes(themes)
+      return if themes.nil? || themes.empty?
+
+      puts
+      puts bold("What critical reviews mention")
+      themes.each { |t| puts "  · #{t["phrase"]} #{dim("(#{t["count"]}x)")}" }
+    end
+
+    def verbatim_reviews(reviews, limit)
+      shown = limit ? reviews.first(limit) : reviews
+      return if shown.empty?
+
+      puts
+      puts bold("Reviews (#{shown.size} of #{reviews.size})")
+      shown.each do |r|
+        badges = []
+        badges << "verified" if r["verified"]
+        badges << "vine" if r["vine"]
+        stars = r["rating"] ? "#{r["rating"]}★" : "?★"
+        puts
+        puts "  #{bold(stars)}  #{r["title"]}"
+        meta = [r["date"], r["author"], *badges].compact.reject(&:empty?)
+        meta << "#{r["helpful_votes"]} helpful" if r["helpful_votes"]
+        puts dim("      #{meta.join(" · ")}")
+        wrap(r["body"], term_width - 8).each { |line| puts "      #{line}" }
+      end
+    end
+
+    def wrap(text, width)
+      words = text.to_s.split
+      return [] if words.empty?
+
+      words.each_with_object([+""]) do |word, lines|
+        if lines.last.empty?
+          lines.last << word
+        elsif lines.last.length + word.length + 1 <= width
+          lines.last << " " << word
+        else
+          lines << +word
+        end
+      end
+    end
 
     # Prefer the parsed ISO date (stable, sortable) and fall back to whatever
     # blurb Amazon rendered.

@@ -15,7 +15,13 @@ Protocol (NDJSON over stdout):
 
 Stdin (one-shot request):
     {"action":"item","asin":"B0747R1M51"}
+    {"action":"item","asin":"B0747R1M51","reviews":true,"review_pages":2}
     {"action":"search","query":"pla filament","limit":10}
+
+Reviews ride along on the `item` action rather than getting their own: the
+product page already carries the rating histogram and the top ~8 reviews, so
+folding them in costs no extra page load. `review_pages` > 0 additionally walks
+/product-reviews/ for depth.
 """
 
 from __future__ import annotations
@@ -64,6 +70,34 @@ MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1
 )}
 
+MONTH_ALT = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
+# "Reviewed in the United States on July 26, 2025"
+REVIEW_DATE_RE = re.compile(
+    rf"(?P<month>{MONTH_ALT})[a-z]*\s+(?P<day>\d{{1,2}}),?\s+(?P<year>\d{{4}})", re.IGNORECASE
+)
+# Non-US locales invert it: "Reviewed in Canada on 26 July 2025".
+REVIEW_DATE_INTL_RE = re.compile(
+    rf"(?P<day>\d{{1,2}})\s+(?P<month>{MONTH_ALT})[a-z]*\s+(?P<year>\d{{4}})", re.IGNORECASE
+)
+# "Reviewed in the United States on ..." -> "the United States"
+REVIEW_COUNTRY_RE = re.compile(r"reviewed in\s+(.+?)\s+on\b", re.IGNORECASE)
+
+# "12 people found this helpful" / "One person found this helpful"
+HELPFUL_RE = re.compile(r"([\d,]*\d)\s+(?:person|people)\s+found", re.IGNORECASE)
+HELPFUL_ONE_RE = re.compile(r"\bone person found\b", re.IGNORECASE)
+
+# The histogram renders as either an aria-label ("5 stars represent 71% of
+# rating") or a bare row ("5 star  71%"), depending on which layout Amazon
+# serves. Both shapes reduce to the same (stars, percent) pair.
+HISTOGRAM_RE = re.compile(r"(?P<stars>[1-5])\s*stars?\b.*?(?P<pct>\d{1,3})\s*%", re.IGNORECASE | re.DOTALL)
+HISTOGRAM_PCT_FIRST_RE = re.compile(r"(?P<pct>\d{1,3})\s*%.*?(?P<stars>[1-5])\s*stars?\b", re.IGNORECASE | re.DOTALL)
+
+# The review-title hook's text often leads with the star rating on its own line
+# ("5.0 out of 5 stars\nWorks great"). That prefix is the rating, not the title.
+STAR_PREFIX_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s+out of\s+\d+(?:\.\d+)?\s+stars\s*", re.IGNORECASE)
+
+SORT_KEYS = {"helpful": "helpful", "recent": "recent"}
+
 
 def extract_asin(raw: str) -> str | None:
     """Accept a bare ASIN, a /dp/ URL, or a /gp/product/ URL.
@@ -108,7 +142,209 @@ def parse_delivery_date(raw: str | None, today: date | None = None) -> str | Non
         return None
 
 
-def scrape_item(page: Any, asin: str) -> dict[str, Any]:
+def parse_review_date(raw: str | None) -> str | None:
+    """"Reviewed in the United States on July 26, 2025" -> "2025-07-26".
+
+    Unlike delivery blurbs, review datelines carry a real year, so nothing has
+    to be inferred. Both the US ("July 26, 2025") and international
+    ("26 July 2025") orderings appear, and a day-first string must not be read
+    as month-first.
+    """
+    if not raw:
+        return None
+    m = REVIEW_DATE_RE.search(raw) or REVIEW_DATE_INTL_RE.search(raw)
+    if not m:
+        return None
+    try:
+        return date(
+            int(m.group("year")), MONTHS[m.group("month")[:3].lower()], int(m.group("day"))
+        ).isoformat()
+    except ValueError:
+        return None
+
+
+def parse_review_country(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    m = REVIEW_COUNTRY_RE.search(raw)
+    if not m:
+        return None
+    country = re.sub(r"^the\s+", "", m.group(1).strip(), flags=re.IGNORECASE)
+    return country or None
+
+
+def parse_helpful_votes(raw: str | None) -> int | None:
+    """Vote count from the helpfulness line. None means "no votes shown"."""
+    if not raw:
+        return None
+    m = HELPFUL_RE.search(raw)
+    if m:
+        return int(m.group(1).replace(",", ""))
+    return 1 if HELPFUL_ONE_RE.search(raw) else None
+
+
+def strip_star_prefix(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    cleaned = STAR_PREFIX_RE.sub("", raw).strip()
+    return cleaned or None
+
+
+def parse_histogram_label(raw: str | None) -> tuple[int, int] | None:
+    """"5 stars represent 71% of rating" -> (5, 71). None when unparseable."""
+    if not raw:
+        return None
+    m = HISTOGRAM_RE.search(raw) or HISTOGRAM_PCT_FIRST_RE.search(raw)
+    if not m:
+        return None
+    pct = int(m.group("pct"))
+    # A percentage over 100 means the two numbers were matched out of a string
+    # that isn't a histogram row at all.
+    return (int(m.group("stars")), pct) if pct <= 100 else None
+
+
+def reviews_url(asin: str, page_number: int = 1, sort: str = "helpful") -> str:
+    return (
+        f"https://www.amazon.com/product-reviews/{asin}"
+        f"?pageNumber={page_number}&sortBy={SORT_KEYS.get(sort, 'helpful')}"
+        "&reviewerType=all_reviews"
+    )
+
+
+def scrape_histogram(page: Any) -> dict[str, int]:
+    """Star -> percent of all ratings, e.g. {"5": 71, "4": 12, ...}.
+
+    Percentages are what Amazon publishes; absolute per-star counts are not on
+    the page. Returns {} when the table can't be found, which callers must treat
+    as "unknown" rather than "no ratings".
+    """
+    out: dict[str, int] = {}
+    for selector in (
+        "#histogramTable a[aria-label]",
+        "#cm_cr_dp_d_rating_histogram a[aria-label]",
+        "[data-hook=cr-histogram-row] a[aria-label]",
+    ):
+        try:
+            rows = page.locator(selector)
+            for i in range(rows.count()):
+                parsed = parse_histogram_label(rows.nth(i).get_attribute("aria-label"))
+                if parsed:
+                    out.setdefault(str(parsed[0]), parsed[1])
+        except Exception:  # noqa: BLE001
+            continue
+        if out:
+            return out
+
+    # Fallback: no aria-labels, so read the rendered row text ("5 star  71%").
+    try:
+        rows = page.locator("#histogramTable .a-histogram-row, .a-histogram-row")
+        for i in range(rows.count()):
+            parsed = parse_histogram_label(" ".join(rows.nth(i).inner_text().split()))
+            if parsed:
+                out.setdefault(str(parsed[0]), parsed[1])
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def scrape_review_cards(scope: Any) -> list[dict[str, Any]]:
+    """Every [data-hook=review] card under `scope`, in page order."""
+    out: list[dict[str, Any]] = []
+    try:
+        cards = scope.locator("[data-hook=review], [data-hook=cmps-review]")
+        total = cards.count()
+    except Exception:  # noqa: BLE001
+        return out
+
+    for i in range(total):
+        card = cards.nth(i)
+        try:
+            dateline = text(card, "[data-hook=review-date]")
+            body = text(card, "[data-hook=review-body]", ".review-text-content")
+            # The Vine badge marks a review Amazon itself incentivized with a
+            # free product. That is disclosed and legitimate, so it is reported
+            # separately rather than folded into the paid-review signals.
+            vine = _has(card, "[data-hook=review-vine-badge]", ".vine-review-badge")
+            record = {
+                    "id": _review_id(card),
+                    "title": strip_star_prefix(
+                        text(card, "[data-hook=review-title] span:last-child", "[data-hook=review-title]")
+                    ),
+                    "rating": _first_float(
+                        text(card, "[data-hook=review-star-rating]", "[data-hook=cmps-review-star-rating]", ".a-icon-alt")
+                    ),
+                    "date": parse_review_date(dateline),
+                    "country": parse_review_country(dateline),
+                    "verified": _has(card, "[data-hook=avp-badge]"),
+                    "vine": vine,
+                    "author": text(card, ".a-profile-name"),
+                    "variant": text(card, "[data-hook=format-strip]"),
+                    "helpful_votes": parse_helpful_votes(text(card, "[data-hook=helpful-vote-statement]")),
+                    "body": body,
+            }
+            # `text()` reports a detached or unrecognized card as all-None
+            # rather than raising, so an empty record is indistinguishable from
+            # a real review with nothing filled in. Dropping it matters: the
+            # scoring downstream would otherwise count the phantom as an
+            # unverified review and inflate the manipulation score.
+            if not any((record["title"], record["body"], record["rating"], record["date"])):
+                continue
+            out.append(record)
+        except Exception:  # noqa: BLE001
+            # One malformed card must not cost us the rest of the page.
+            continue
+    return out
+
+
+def scrape_reviews(page: Any, asin: str, pages: int = 0, sort: str = "helpful") -> list[dict[str, Any]]:
+    """Reviews already on the loaded product page, plus `pages` more from
+    /product-reviews/.
+
+    Assumes `page` is sitting on the product page. Deduplicates by review id
+    because the product page's top reviews reappear on the full listing.
+    """
+    collected = scrape_review_cards(page)
+    seen = {r["id"] for r in collected if r["id"]}
+
+    for n in range(1, max(pages, 0) + 1):
+        page.goto(reviews_url(asin, n, sort), wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(1200)
+        guard(page)
+        batch = [r for r in scrape_review_cards(page) if not r["id"] or r["id"] not in seen]
+        if not batch:
+            # Amazon caps review pagination and serves the last page repeatedly
+            # past the end; stopping here avoids burning loads on duplicates.
+            emit("log", level="info", msg=f"no new reviews on page {n} — stopping")
+            break
+        seen.update(r["id"] for r in batch if r["id"])
+        collected.extend(batch)
+        emit("log", level="info", msg=f"review page {n}: +{len(batch)} ({len(collected)} total)")
+
+    return collected
+
+
+def _review_id(card: Any) -> str | None:
+    try:
+        raw = card.get_attribute("id") or ""
+    except Exception:  # noqa: BLE001
+        return None
+    # On the product page the container id is prefixed ("customer_review-R1A2B3").
+    return raw.split("-")[-1] if raw else None
+
+
+def _has(scope: Any, *selectors: str) -> bool:
+    for sel in selectors:
+        try:
+            if scope.locator(sel).count() > 0:
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def scrape_item(
+    page: Any, asin: str, reviews: bool = False, review_pages: int = 0, sort: str = "helpful"
+) -> dict[str, Any]:
     page.goto(f"https://www.amazon.com/dp/{asin}", wait_until="domcontentloaded", timeout=45000)
     page.wait_for_timeout(1500)
     guard(page)
@@ -167,6 +403,17 @@ def scrape_item(page: Any, asin: str) -> dict[str, Any]:
         "_fetched_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     _warn_selector_rot(data)
+
+    if reviews:
+        # Must come last: walking to /product-reviews/ navigates away from the
+        # product page, so every field above has to be read off it first.
+        # Not "reviews" — that key is already the sitewide rating *count* that
+        # `item` and `search` render.
+        data["histogram"] = scrape_histogram(page)
+        data["reviews_sample"] = scrape_reviews(page, asin, pages=review_pages, sort=sort)
+        if not data["reviews_sample"]:
+            emit("log", level="warn", msg=f"no reviews found for {asin}")
+
     return data
 
 
@@ -301,8 +548,19 @@ def main() -> int:
                     if not asin:
                         emit("error", msg=f"could not parse an ASIN from {req.get('asin')!r}")
                         return 2
+                    want_reviews = bool(req.get("reviews"))
+                    review_pages = int(req.get("review_pages") or 0)
                     emit("log", level="info", msg=f"fetching {asin}")
-                    emit("item", data=scrape_item(page, asin))
+                    emit(
+                        "item",
+                        data=scrape_item(
+                            page,
+                            asin,
+                            reviews=want_reviews,
+                            review_pages=review_pages,
+                            sort=str(req.get("sort") or "helpful"),
+                        ),
+                    )
                     emit("done", count=1)
 
                 elif action == "search":

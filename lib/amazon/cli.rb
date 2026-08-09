@@ -27,6 +27,7 @@ module Amazon
       # `amazon search` would resolve to the legacy redirect instead.
       when "search" then Commands::Search.new(global).run(argv)
       when "item"   then Commands::Item.new(global).run(argv)
+      when "reviews" then Commands::Reviews.new(global).run(argv)
       when "order"  then Commands::OrderNamespace.new(global).run(argv)
       when "config" then Commands::Config.new(global).run(argv)
       when "buy"    then Commands::Buy.new(global).run(argv)
@@ -72,6 +73,7 @@ module Amazon
         Live (queries Amazon now):
           search   Search Amazon listings; flags items you've bought before
           item     Show live price, stock, and delivery date for an ASIN/URL
+          reviews  Rating breakdown, complaint themes, and fake-review signals
 
         Your orders (local archive):
           order sync     Pull orders from Amazon into the local store

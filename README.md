@@ -39,6 +39,43 @@ You've bought this 1x
   2023-12-10     $17.99  (-$5.00)  111-5881012-0199422
 ```
 
+Reviews get read *as evidence*, not as a star average:
+
+```
+$ amazon reviews B0DEMO1234
+65W USB-C GaN Fast Charger, 3-Port Compact Wall Adapter
+B0DEMO1234  ·  https://www.amazon.com/dp/B0DEMO1234
+
+  Overall:   4.5★  1,842 ratings
+  Adjusted:  2.25★  verified, uncompensated reviews in this sample only
+  Verified:  50% of 10 sampled
+  Vine:      1 review(s) from Amazon's Vine programme
+
+Rating distribution
+  5★ ████████████████████      82%
+  4★ █                          6%
+  3★                            2%
+  2★                            2%
+  1★ ██                         8%
+
+Authenticity
+  high risk (76/100, low confidence)
+    !  Rating distribution: 82% five-star and only 10% two-to-four-star; organic ratings keep a fatter middle [+11/20]
+    !  Verified purchases: 5/10 sampled reviews are unverified (5 of them 4★ or better) [+20/20]
+    ?  Review timing: needs 15+ dated reviews (have 10) — re-run with --pages 3
+    !  Distinct wording: 2/6 reviews share heavily overlapping wording with another [+12/15]
+    !  Undisclosed compensation: 2/10 reviews mention a free or discounted unit outside the Vine programme [+7/10]
+    ?  Reviews match the product: needs a descriptive title and 25+ reviews with text (have 10) — re-run with --pages 3
+    !  Distinct reviewers: 1 reviewer name(s) appear more than once [+3/5]
+    Heuristics on a 10-review sample, not a verdict. Use --pages 3 for a deeper sample.
+
+What critical reviews mention
+  · stopped charging (3x)
+  · port stopped (2x)
+  · three weeks (2x)
+  · hot (2x)
+```
+
 ```
 $ amazon order list --year 2025 --limit 3
 date        order_id             total    status
@@ -55,6 +92,13 @@ date        order_id             total    status
 - **Live product lookup** — `amazon item` and `amazon search` hit Amazon
   now, returning current price, stock, seller, rating, and a delivery-by
   date personalized to your default address.
+- **Review research** — `amazon reviews` pulls the sample Amazon renders on
+  the product page (`--pages N` walks deeper), summarizes what critical
+  reviewers actually complain about, and screens the sample for
+  manipulation: histogram shape, unverified share, date bursts, duplicated
+  phrasing, incentivized language, review hijacking, repeat reviewers. Every
+  signal is itemized with its weight, and checks that couldn't run say so
+  instead of quietly passing.
 - **Price memory** — live results are cross-referenced against your order
   archive, so anything you've bought before shows the date and price you
   paid, plus the delta.
@@ -77,6 +121,7 @@ lib/amazon/
   cli.rb                arg parsing, dispatch
   commands/
     item.rb             live product detail
+    reviews.rb          review report + authenticity screen
     search.rb           live product search
     order.rb            `amazon order …` dispatcher
     order/              sync, list, show, search over the local archive
@@ -84,6 +129,7 @@ lib/amazon/
   config.rb             XDG paths, config load
   store.rb              JSON read/write, index, ASIN purchase history
   cache.rb              short-TTL disk cache for live lookups
+  reviews.rb            review-manipulation heuristics (pure, no I/O)
   worker.rb             spawns Python workers, parses NDJSON over stdout
   formatter.rb          tables, live output, --json, color
 pyworker/
@@ -95,7 +141,7 @@ pyworker/
   pyproject.toml        deps: amazon-orders, playwright
 web.rb                  single-file Sinatra browser
 test/web_test.rb        Minitest, 95% line + branch coverage gate
-test/cli_test.rb        Minitest, 98% line / 95% branch coverage gate
+test/cli_test.rb        Minitest, 99% line / 95% branch coverage gate
 ```
 
 Two-process design: Ruby owns the CLI/UX/storage; Python owns the scraping.
@@ -115,7 +161,8 @@ reuse the session that `amazon login` persisted.
 ~/.local/share/amazon/orders/<year>/<id>.json   # one file per order
 ~/.local/share/amazon/cache/cookies.json        # session reuse (mode 600)
 ~/.local/share/amazon/cache/storage_state.json  # full Playwright state
-~/.local/share/amazon/cache/live/{item,search}/ # 15-min live-lookup cache
+~/.local/share/amazon/cache/live/{item,item-reviews,search,reviews}/
+                                                # 15-min live-lookup cache
 ~/.local/state/amazon/sync.log                  # sync history
 ```
 
@@ -173,6 +220,7 @@ amazon item B0747R1M51                    # live price / stock / delivery
 amazon item https://www.amazon.com/dp/B0747R1M51   # URLs work too
 amazon item B0747R1M51 --fresh            # bypass the 15-minute cache
 amazon item B0747R1M51 --json | jq .delivery_date
+amazon item B0747R1M51 --reviews          # detail plus a one-block review verdict
 ```
 
 Live results are cached on disk for 15 minutes under
@@ -189,6 +237,50 @@ stderr — dropping unknowns would silently hide organic results.
 Delivery dates come from your signed-in session and reflect your default
 shipping address. If Amazon serves a captcha instead of the page, the CLI
 says so — re-run `amazon login` to refresh the session.
+
+### Reviews (research + fake-review screening)
+
+```bash
+amazon reviews B0747R1M51                 # the ~8 reviews on the product page
+amazon reviews B0747R1M51 --pages 3       # walk /product-reviews/ for a deeper sample
+amazon reviews B0747R1M51 --sort recent   # default is "helpful"
+amazon reviews B0747R1M51 --verbatim      # print the review text, not just the summary
+amazon reviews B0747R1M51 --critical      # only the 1-3★ reviews (implies --verbatim)
+amazon reviews B0747R1M51 --limit 5       # cap how many verbatim reviews print
+amazon reviews B0747R1M51 --json | jq .analysis.signals
+amazon item B0747R1M51 --reviews          # condensed: product detail + verdict
+```
+
+The default costs no extra page load — the sample rides along on the same
+product page `amazon item` already fetches. `--pages N` (0–10) is what
+actually walks `/product-reviews/`, one request per page.
+
+**What the score means.** Seven deterministic checks run over the sample:
+
+| Check | Weight | Fires on |
+|---|---|---|
+| Rating distribution | 20 | a five-star wall with no organic middle |
+| Verified purchases | 20 | a high unverified share, worse if those are the positive ones |
+| Review timing | 20 | bursts of reviews inside a 7-day window |
+| Distinct wording | 15 | near-duplicate phrasing across reviews (Jaccard on content words) |
+| Undisclosed compensation | 10 | free/discounted-unit language outside Vine |
+| Reviews match the product | 8 | reviews describing a different item than the title (review hijacking) |
+| Distinct reviewers | 5 | the same reviewer name appearing repeatedly |
+
+A check that can't run on the sample you fetched leaves the **denominator**
+rather than scoring zero — so a thin sample reports "low confidence" and
+lists what it couldn't test, instead of reading as a clean bill of health.
+Vine reviews are tracked separately from undisclosed compensation: Vine is
+disclosed and legitimate, it just isn't a purchase.
+
+`Adjusted` re-averages only the verified, non-Vine, uncompensated reviews
+*in the sample* — it is not a corrected sitewide rating, and it's omitted
+when fewer than three reviews qualify.
+
+This is a screen, not a verdict. It reports evidence and its own limits;
+deciding what to do with a 60/100 is yours. (The tools that used to do this
+as a service are gone — Mozilla shut Fakespot down in July 2025, ReviewMeta
+followed — and the replacements have no public API, hence local heuristics.)
 
 ### Your orders (local archive)
 
@@ -238,7 +330,7 @@ Bump `workers` up cautiously — Amazon starts handing back HTTP 503s above
 
 ```bash
 ruby test/web_test.rb                              # 95% line + branch gate
-ruby test/cli_test.rb                              # 98% line / 95% branch gate
+ruby test/cli_test.rb                              # 99% line / 95% branch gate
 python -m unittest discover -s pyworker -v         # parsing helpers
 ```
 
@@ -249,8 +341,16 @@ real Chrome window and shell out to `op` — are filtered out of the coverage
 gate and verified by running them for real.
 
 `pyworker/test_live.py` covers the fiddly pure functions — ASIN extraction
-from URL shapes, money parsing, and the delivery-date parser (Amazon omits
-the year, so December→January has to roll forward). It needs no browser.
+from URL shapes, money parsing, the delivery-date parser (Amazon omits the
+year, so December→January has to roll forward), and the review-card parsers
+(day-first international dates, "One person found this helpful", histogram
+labels in either percent-first order).
+
+`lib/amazon/reviews.rb` is pure and does no I/O, so it's tested directly
+against synthetic listings — a farmed one it should flag and a genuine one
+it must not. False positives there would discredit every other signal, so
+the mismatch and burst checks are deliberately conservative and abstain on
+small samples rather than guess.
 
 What isn't unit-tested is selector drift: Amazon A/B tests product-page
 markup constantly. Every field is looked up through a list of fallback
