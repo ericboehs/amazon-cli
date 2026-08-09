@@ -1331,6 +1331,93 @@ class WorkerProtocolTest < Minitest::Test
   end
 end
 
+# The worker's stderr is where a Python traceback lands, and a traceback is the
+# only thing that says *where* a crash happened. Gating it behind -v meant the
+# person diagnosing a failure was the one person guaranteed not to see it: the
+# run they need it for is the run that already happened.
+class WorkerStderrTest < Minitest::Test
+  def worker(**kw) = Amazon::Worker.new(**kw)
+
+  def test_a_bare_non_zero_exit_reports_what_the_worker_said_on_stderr
+    body = <<~SCRIPT
+      STDIN.gets
+      warn 'Traceback (most recent call last):'
+      warn '  File "live.py", line 512, in scrape_item'
+      warn "AttributeError: 'NoneType' object has no attribute 'count'"
+      exit 1
+    SCRIPT
+    with_python_cmd(body) do
+      err = assert_raises(Amazon::Worker::Error) { worker.item('B1') }
+      assert_includes err.message, 'exited 1'
+      assert_includes err.message, 'line 512, in scrape_item'
+      assert_includes err.message, 'AttributeError'
+    end
+  end
+
+  def test_an_error_event_keeps_the_traceback_that_explains_it
+    # `emit("error", msg=f"{type(e).__name__}: {e}")` names the exception and
+    # nothing else; live.py prints the traceback to stderr on the very next
+    # line. Reporting one without the other is how "AttributeError: 'NoneType'
+    # object has no attribute 'count'" became the whole bug report.
+    body = <<~SCRIPT
+      STDIN.gets
+      warn '  File "live.py", line 512, in scrape_item'
+      puts({event: 'error', msg: "AttributeError: 'NoneType' object has no attribute 'count'"}.to_json)
+      STDOUT.flush
+      exit 1
+    SCRIPT
+    with_python_cmd(body) do
+      err = assert_raises(Amazon::Worker::Error) { worker.item('B1') }
+      assert_includes err.message, 'AttributeError'
+      assert_includes err.message, 'line 512, in scrape_item'
+    end
+  end
+
+  # The counterpart: an expired session is not a crash, and a message telling
+  # someone to run `amazon login` must not arrive wrapped in worker chatter.
+  def test_a_clean_error_message_is_not_padded_with_an_empty_stderr
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: 'no saved session — run: amazon login', kind: 'not_logged_in'}.to_json)
+      STDOUT.flush
+      exit 1
+    SCRIPT
+    with_python_cmd(body) do
+      err = assert_raises(Amazon::Worker::Error) { worker.item('B1') }
+      assert_equal 'no saved session — run: amazon login', err.message
+    end
+  end
+
+  # Playwright can write megabytes before it falls over. Reporting a crash must
+  # not itself become the failure.
+  def test_only_the_tail_of_a_torrential_stderr_is_kept
+    body = <<~SCRIPT
+      STDIN.gets
+      3_000.times { |i| warn "chatter \#{i}" }
+      warn 'the actual traceback'
+      exit 1
+    SCRIPT
+    with_python_cmd(body) do
+      err = assert_raises(Amazon::Worker::Error) { worker.item('B1') }
+      assert_includes err.message, 'the actual traceback'
+      refute_includes err.message, 'chatter 0'
+      assert_operator err.message.lines.size, :<=, Amazon::Worker::STDERR_TAIL_LINES + 3
+    end
+  end
+
+  def test_verbose_mode_still_streams_stderr_as_it_arrives
+    body = <<~SCRIPT
+      STDIN.gets
+      warn 'browser launched'
+      puts({event: 'done', count: 0}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      _, err = capture_io_streams { worker(verbose: true).search('q') }
+      assert_includes err, 'browser launched'
+    end
+  end
+end
+
 class WorkerHelpersTest < Minitest::Test
   def test_python_cmd_prefers_the_uv_venv_when_present
     w = Amazon::Worker.new

@@ -8,6 +8,13 @@ module Amazon
 
     PYWORKER = File.expand_path("../../pyworker", __dir__)
 
+    # How much of the worker's stderr to keep for a failure report. A Python
+    # traceback is a couple of dozen lines and the interesting end is the last
+    # one, while Playwright can write megabytes before it falls over — so this
+    # keeps the tail rather than the head, and keeps it bounded so that
+    # reporting a crash never becomes the failure itself.
+    STDERR_TAIL_LINES = 40
+
     def initialize(verbose: false, quiet: false)
       @verbose = verbose
       @quiet = quiet
@@ -187,59 +194,94 @@ module Amazon
 
     def run(request, script: "fetch.py")
       cmd = python_cmd(script)
+      tail = []
       Open3.popen3(*cmd, chdir: PYWORKER) do |stdin, stdout, stderr, wait|
         stdin.write(JSON.generate(request) + "\n")
         # Keep stdin open — worker may need to write OTP/prompt responses.
 
         err_thread = Thread.new do
-          stderr.each_line { |l| warn(l.chomp) if @verbose }
+          stderr.each_line do |l|
+            line = l.chomp
+            warn(line) if @verbose
+            tail << line
+            tail.shift while tail.size > STDERR_TAIL_LINES
+          end
         rescue IOError
           # stderr was closed during shutdown; that's fine.
         end
 
-        saw_error = false
-        stdout.each_line do |line|
-          line = line.strip
-          next if line.empty?
-          event = parse_event(line)
-          next unless event
+        begin
+          saw_error = false
+          stdout.each_line do |line|
+            line = line.strip
+            next if line.empty?
+            event = parse_event(line)
+            next unless event
 
-          case event["event"]
-          when "otp_required"
-            answer = prompt_secret(event["prompt"] || "OTP")
-            stdin.write(answer + "\n")
-          when "prompt"
-            answer = prompt_text(event)
-            stdin.write(answer + "\n")
-          else
-            yield event
-            saw_error = true if event["event"] == "error"
-            # `break`, not `return`: returning from here exits the popen3 block
-            # and skips the exit-status check below, so a worker that emitted
-            # `done` and then died during teardown looked like a clean success.
-            break if event["event"] == "done" || event["event"] == "error"
+            case event["event"]
+            when "otp_required"
+              answer = prompt_secret(event["prompt"] || "OTP")
+              stdin.write(answer + "\n")
+            when "prompt"
+              answer = prompt_text(event)
+              stdin.write(answer + "\n")
+            else
+              yield event
+              saw_error = true if event["event"] == "error"
+              # `break`, not `return`: returning from here exits the popen3 block
+              # and skips the exit-status check below, so a worker that emitted
+              # `done` and then died during teardown looked like a clean success.
+              break if event["event"] == "done" || event["event"] == "error"
+            end
           end
-        end
 
-        begin
-          stdin.close
-        rescue IOError, Errno::EPIPE
-          # already closed
-        end
-        # Drain whatever the worker wrote after `done` so it can't block on a
-        # full pipe while we wait for it to exit.
-        begin
-          stdout.read
-        rescue IOError
-          # already closed
-        end
-        err_thread.join
-        status = wait.value
-        # An `error` event already carries a better message than the exit code.
-        if !status.success? && !saw_error
-          raise Error, "python worker exited #{status.exitstatus}"
+          begin
+            stdin.close
+          rescue IOError, Errno::EPIPE
+            # already closed
+          end
+          # Drain whatever the worker wrote after `done` so it can't block on a
+          # full pipe while we wait for it to exit.
+          begin
+            stdout.read
+          rescue IOError
+            # already closed
+          end
+          err_thread.join
+          status = wait.value
+          # An `error` event already carries a better message than the exit code.
+          if !status.success? && !saw_error
+            raise Error, "python worker exited #{status.exitstatus}"
+          end
+        ensure
+          # The callers raise from inside the yielded block, which unwinds
+          # straight past the join above — abandoning the reader thread along
+          # with the buffered stderr that explains what went wrong. Bounded on
+          # purpose: a worker still writing must not hold the CLI open, and
+          # popen3's own teardown closes the pipes and frees the reader.
+          err_thread.join(2)
         end
       end
+    rescue Error => e
+      # Every failure out of `run` gets the worker's own last words attached
+      # here rather than at each raise site, because the ones raised from inside
+      # the yielded block never reach a raise site we control.
+      #
+      # live.py prints the traceback to stderr and then emits an `error` event
+      # naming only the exception class — "AttributeError: 'NoneType' object has
+      # no attribute 'count'" with no hint which selector rotted. The two halves
+      # are only useful together, and gating stderr behind -v guaranteed that
+      # the person diagnosing a crash never saw it: the run they need it for is
+      # the run that already happened. An expired session writes nothing to
+      # stderr, so its `run: amazon login` message stays exactly as composed.
+      report = stderr_report(tail)
+      raise if report.empty?
+      raise Error, "#{e.message}#{report}"
+    end
+
+    def stderr_report(tail)
+      return "" if tail.empty? || @verbose
+      "\nworker stderr (last #{tail.size} line#{"s" unless tail.size == 1}):\n#{tail.join("\n")}"
     end
 
     def parse_event(line)
