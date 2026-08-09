@@ -480,23 +480,81 @@ def _emit_progress(year: int, i: int, n: int, order: Any) -> None:
     )
 
 
-def _fetch_with_retry(api: Any, order: Any, backoff: list[float], emit_fn: Any) -> Any:
-    """Fetch full order details with retry-on-503. Returns the populated order, or None to skip."""
+# Why an order was lost, which is the whole difference between a run worth
+# failing and one worth a warning.
+TRANSIENT = "transient"
+PERMANENT = "permanent"
+
+# Exceptions amazon-orders raises when the page itself can't be turned into an
+# order: a required field its selectors can't find, or an order that isn't
+# there. Retrying is pointless, and so is failing the run — the next sync hits
+# the identical failure, so a non-zero exit here is one the tool can never get
+# out of on its own. amazon-orders' own default (`warn_on_missing_required_field`)
+# concedes this class is routine on pre-2018 orders.
+#
+# Matched by exact type name, not `isinstance`: `AmazonOrdersAuthError`
+# subclasses `AmazonOrdersError`, and an expired session is the one loss with
+# an obvious fix. Name matching also means a rename in a future amazon-orders
+# silently stops matching, so `PackageAssumptionsTest` checks these names
+# against the installed package.
+UNFETCHABLE_ERRORS = (
+    "AmazonOrdersError",
+    "AmazonOrdersEntityError",
+    "AmazonOrdersNotFoundError",
+)
+
+
+def _throttled(msg: str) -> bool:
+    """True when Amazon is objecting to the pace rather than to the order."""
+    lowered = msg.lower()
+    return "503" in msg or "throttle" in lowered or "rate" in lowered
+
+
+def classify_failure(e: BaseException) -> str:
+    """Whether a failed detail fetch is worth another attempt, ever.
+
+    The throttle check goes first so this and the retry decision below cannot
+    disagree about the same exception. Everything unrecognized is `TRANSIENT`:
+    the list above is an allowlist because the two mistakes don't cost the
+    same — calling an outage permanent turns a real failure into a warning
+    nobody reads, while calling a parse error transient costs three retries and
+    an exit code that is at worst too honest.
+    """
+    if _throttled(str(e)):
+        return TRANSIENT
+    return PERMANENT if type(e).__name__ in UNFETCHABLE_ERRORS else TRANSIENT
+
+
+def _fetch_with_retry(api: Any, order: Any, backoff: list[float],
+                      emit_fn: Any) -> tuple[Any, str | None]:
+    """Fetch full order details with retry-on-503.
+
+    Returns `(order, None)`, or `(None, reason)` — the reason being what the
+    caller needs to tell "Amazon started bouncing us at order 150" apart from
+    "this 2016 order has never been parseable."
+    """
     for attempt, wait in enumerate([0.0, *backoff]):
         if wait > 0:
             emit_fn("log", level="warn",
                     msg=f"retrying {order.order_number} after {wait:.0f}s (attempt {attempt})")
             time.sleep(wait)
         try:
-            return api.get_order(order.order_number, clone=order)
+            fetched = api.get_order(order.order_number, clone=order)
         except Exception as e:  # noqa: BLE001
-            msg = str(e)
-            transient = "503" in msg or "throttle" in msg.lower() or "rate" in msg.lower()
-            if attempt >= len(backoff) or not transient:
-                emit_fn("log", level="warn",
-                        msg=f"detail fetch skipped for {order.order_number}: {e}")
-                return None
-    return None
+            if attempt < len(backoff) and _throttled(str(e)):
+                continue
+            emit_fn("log", level="warn",
+                    msg=f"detail fetch skipped for {order.order_number}: {e}")
+            return None, classify_failure(e)
+        # A library that returns nothing without raising has said nothing about
+        # why, and unexplained is loud.
+        return (fetched, None) if fetched else (None, TRANSIENT)
+    return None, TRANSIENT
+
+
+def _name_some(numbers: list[str], limit: int = 5) -> str:
+    shown = ", ".join(numbers[:limit])
+    return shown + (f" (and {len(numbers) - limit} more)" if len(numbers) > limit else "")
 
 
 def main() -> int:
@@ -597,7 +655,7 @@ def main() -> int:
 
         total = 0
         skipped = 0
-        lost: list[str] = []
+        lost: dict[str, str] = {}
         for year in years:
             emit("log", level="info", msg=f"fetching year {year} (history page)")
             try:
@@ -661,10 +719,13 @@ def main() -> int:
                 for fut in as_completed(futures):
                     completed += 1
                     original = futures[fut]
-                    fetched = None
+                    fetched, why = None, TRANSIENT
                     try:
-                        fetched = fut.result()
+                        fetched, why = fut.result()
                     except Exception as e:  # noqa: BLE001
+                        # Nothing should escape `_fetch_with_retry`, so this is
+                        # our bug rather than Amazon's — which is exactly the
+                        # kind of loss that has to stay loud.
                         emit("log", level="warn",
                              msg=f"detail fetch raised for {original.order_number}: {e}")
                     _emit_progress(year, completed, new_n, fetched or original)
@@ -677,21 +738,35 @@ def main() -> int:
                         # again. Being forgiving here is what makes the loss
                         # unrecoverable. Leaving it out costs one order this
                         # run and gets it in full on the next.
-                        lost.append(original.order_number)
+                        lost[original.order_number] = why or TRANSIENT
                         continue
                     emit("order", data=order_to_dict(fetched, _ao_mod.__version__))
                     total += 1
 
-        if lost:
+        unfetchable = [n for n, why in lost.items() if why == PERMANENT]
+        bounced = [n for n, why in lost.items() if why != PERMANENT]
+
+        if unfetchable:
+            # Loud, but not fatal. These fail the same way every run, so an exit
+            # code would be an alarm that can never be cleared. They stay out of
+            # the store, so whenever Amazon's HTML changes back a later sync
+            # picks them up with no intervention.
+            emit("log", level="warn", msg=(
+                f"{len(unfetchable)} order(s) could not be parsed from Amazon's page and "
+                f"were left unstored: {_name_some(unfetchable)}. This is usually an older "
+                "order missing a field the parser requires; later syncs will keep trying."))
+
+        if bounced:
             # An `error` rather than a `done`: the parent stops at whichever
             # arrives first, keeps the orders it already received, and exits
             # non-zero. Silently exiting 0 is what makes a sync that gave up on
             # orders indistinguishable from a complete one to cron and `&&`.
-            shown = ", ".join(lost[:5])
-            more = f" (and {len(lost) - 5} more)" if len(lost) > 5 else ""
-            emit("error", msg=(
-                f"could not fetch full details for {len(lost)} order(s): {shown}{more}. "
-                "They were left unstored so the next sync retries them."))
+            # The counts ride along because this is the run where the shape of
+            # what was kept matters most, and it was the one run not printing it.
+            emit("error", count=total, skipped=skipped, msg=(
+                f"could not fetch full details for {len(bounced)} order(s): "
+                f"{_name_some(bounced)}. Kept {total} order(s) ({skipped} already stored); "
+                "the rest were left unstored so the next sync retries them."))
             return 1
 
         emit("done", count=total, skipped=skipped)

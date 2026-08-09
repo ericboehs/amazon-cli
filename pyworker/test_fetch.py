@@ -26,7 +26,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fetch  # noqa: E402
 from fetch import (  # noqa: E402
     AUTH_COOKIE_NAMES,
+    PERMANENT,
+    TRANSIENT,
+    UNFETCHABLE_ERRORS,
     JarGuard,
+    classify_failure,
     clear_dead_session,
     jar_cookie_names,
     jar_regressed,
@@ -517,6 +521,39 @@ class BareInterpreterImportTest(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), ",".join(sorted(AUTH_COOKIE_NAMES)))
 
 
+class ClassifyFailureTest(unittest.TestCase):
+    """Which losses are worth failing the run over.
+
+    Both answers used to be the same `None` one line above the call site that
+    had to tell them apart.
+    """
+
+    def test_a_page_that_will_never_parse_is_permanent(self):
+        self.assertEqual(
+            classify_failure(AmazonOrdersEntityError("field for selector `#x` was None")),
+            PERMANENT,
+        )
+
+    def test_an_unrecognized_failure_is_loud(self):
+        # The permanent list is an allowlist because the two mistakes don't cost
+        # the same: calling an outage permanent turns a real failure into a
+        # warning nobody reads, while calling a parse error transient costs
+        # three retries and an exit code that is at worst too honest.
+        self.assertEqual(classify_failure(RuntimeError("connection reset by peer")), TRANSIENT)
+
+    def test_a_dead_session_is_not_a_permanent_loss(self):
+        # `AmazonOrdersAuthError` subclasses `AmazonOrdersError`, so an
+        # `isinstance` check over the hierarchy would file every expired session
+        # under "nothing to be done" — the one failure with an obvious fix.
+        self.assertEqual(classify_failure(AmazonOrdersAuthError("reauthenticate")), TRANSIENT)
+
+    def test_a_throttle_wearing_a_library_error_is_still_transient(self):
+        # Type name loses to the message here on purpose: the retry decision
+        # reads the message, and the two must not be able to disagree about
+        # what they are looking at.
+        self.assertEqual(classify_failure(AmazonOrdersError("503 Service Unavailable")), TRANSIENT)
+
+
 class PackageAssumptionsTest(unittest.TestCase):
     """The fixtures at the top of this file are a claim about amazon-orders.
 
@@ -577,6 +614,41 @@ class PackageAssumptionsTest(unittest.TestCase):
         self.assertEqual(jar_cookie_names(json.dumps(dict_from_cookiejar(session.cookies))),
                          set())
 
+    def test_the_unfetchable_errors_are_classes_amazon_orders_still_raises(self):
+        # `classify_failure` matches on type name, which is the only way to say
+        # "this exact class, not its subclasses" — and the only way to get it
+        # silently wrong, since a renamed class stops matching without any
+        # import error to notice. An upgrade that renames one fails here.
+        import amazonorders.exception as exc
+
+        for name in UNFETCHABLE_ERRORS:
+            self.assertTrue(issubclass(getattr(exc, name), Exception), name)
+        # The trap the name check exists for: this one is a subclass of a
+        # permanent error and must never be treated as one.
+        self.assertTrue(issubclass(exc.AmazonOrdersAuthError, exc.AmazonOrdersError))
+        self.assertNotIn("AmazonOrdersAuthError", UNFETCHABLE_ERRORS)
+
+
+class AmazonOrdersError(Exception):
+    """Stand-ins for `amazonorders.exception`, checked against the real module.
+
+    `classify_failure` dispatches on the exception's type *name*, so a test can
+    raise a class defined here and get the same answer the real one would.
+    `PackageAssumptionsTest` is what keeps that "same" honest.
+    """
+
+
+class AmazonOrdersEntityError(AmazonOrdersError):
+    pass
+
+
+class AmazonOrdersNotFoundError(AmazonOrdersError):
+    pass
+
+
+class AmazonOrdersAuthError(AmazonOrdersError):
+    pass
+
 
 class FakeOrder:
     """The attributes `order_to_dict` and `_emit_progress` actually read."""
@@ -632,6 +704,13 @@ def fake_amazonorders(login, history, get_order):
         "amazonorders.orders": _module("amazonorders.orders", AmazonOrders=AmazonOrders),
         "amazonorders.session": _module(
             "amazonorders.session", IODefault=IODefault, AmazonSession=AmazonSession
+        ),
+        "amazonorders.exception": _module(
+            "amazonorders.exception",
+            AmazonOrdersError=AmazonOrdersError,
+            AmazonOrdersEntityError=AmazonOrdersEntityError,
+            AmazonOrdersNotFoundError=AmazonOrdersNotFoundError,
+            AmazonOrdersAuthError=AmazonOrdersAuthError,
         ),
     }
     with mock.patch.dict(sys.modules, mods):
@@ -758,6 +837,60 @@ class WorkerRunTest(unittest.TestCase):
         # It got as far as refusing and no further: no fetch, no write.
         self.assertEqual(self.kinds(events, "order"), [])
         self.assertEqual(cookies.read_text(), GOOD)
+
+    def test_an_order_amazon_will_never_parse_does_not_fail_the_run(self):
+        # The loop this closes: the order stays unstored, so it is `new` every
+        # run; it fails identically every run; the run exits non-zero every run.
+        # Cron alerts forever and `&&` chains never fire, with nothing the user
+        # can do about it — amazon-orders' own config calls a missing required
+        # field "common on pre-2018 orders". The order still doesn't reach the
+        # store, so an Amazon-side fix is picked up whenever it lands.
+        def get_order(number, clone):
+            if number == "222":
+                raise AmazonOrdersEntityError(
+                    "When building Order, field for selector `#grand-total` was None, "
+                    "but this is not allowed."
+                )
+            return FakeOrder(number, detailed=True)
+
+        code, events, _ = self.run_worker(
+            orders=[FakeOrder("111"), FakeOrder("222"), FakeOrder("333")],
+            get_order=get_order,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.order_ids(events), ["111", "333"])
+        self.assertEqual(self.kinds(events, "done")[0]["count"], 2)
+        warnings = [e["msg"] for e in self.kinds(events, "log") if e.get("level") == "warn"]
+        self.assertTrue(any("222" in m for m in warnings), warnings)
+
+    def test_a_run_amazon_throttled_out_of_an_order_still_fails(self):
+        # The other half: same `None` at the same call site, but this one is
+        # Amazon bouncing us and it is exactly what exit 1 exists for. The zero
+        # backoff keeps the retries — which have to happen — instant.
+        def get_order(number, clone):
+            if number == "222":
+                raise RuntimeError("503 Service Unavailable")
+            return FakeOrder(number, detailed=True)
+
+        code, events, _ = self.run_worker(
+            orders=[FakeOrder("111"), FakeOrder("222")],
+            get_order=get_order,
+            retry_backoff=[0],
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("222", self.kinds(events, "error")[0]["msg"])
+
+    def test_a_partial_run_reports_what_it_did_keep(self):
+        # `skipped` was made real so the user could see the shape of a partial
+        # run; the run where that matters most was the one that never printed it.
+        code, events, _ = self.run_worker(
+            orders=[FakeOrder("111"), FakeOrder("222")],
+            known_order_ids=["111"],
+            get_order=lambda number, clone: None,
+        )
+        self.assertEqual(code, 1)
+        error = self.kinds(events, "error")[0]
+        self.assertEqual((error["count"], error["skipped"]), (0, 1))
 
     def test_a_session_earned_this_run_survives_a_later_failure(self):
         # Finding 7 end to end: the run starts with a stale jar, signs in for
