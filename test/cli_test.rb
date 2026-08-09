@@ -1209,6 +1209,25 @@ class WorkerProtocolTest < Minitest::Test
     end
   end
 
+  # The invariant, which reads as obviously true and wasn't: nothing more
+  # severe than a warn can be quieter than a warn. `level == "warn"` is an
+  # equality test wearing a threshold's clothes, so `error` printed only under
+  # -v — and a typo'd `warning` vanished entirely. Both fail in the direction
+  # of losing the more important message.
+  def test_nothing_is_quieter_than_a_warn
+    %w[warn error critical fatal warning].each do |level|
+      body = <<~SCRIPT
+        STDIN.gets
+        puts({event: 'log', level: '#{level}', msg: 'the parser is gone'}.to_json)
+        puts({event: 'done', count: 0}.to_json)
+      SCRIPT
+      with_python_cmd(body) do
+        _, err = capture_io_streams { worker.search('q') }
+        assert_includes err, "[worker:#{level}] the parser is gone"
+      end
+    end
+  end
+
   def test_item_reads_the_item_event
     body = <<~SCRIPT
       STDIN.gets
