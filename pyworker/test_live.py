@@ -879,3 +879,79 @@ class ScrapeReviewsDepthTest(unittest.TestCase):
         # `--pages 0` got exactly the depth it requested; nothing was refused.
         _, walk = scrape_reviews(self.Page(pages_available=0), "B0TEST00001", pages=0)
         self.assertEqual(walk, "complete")
+
+
+class ScrapeReviewsIdlessDedupeTest(unittest.TestCase):
+    """Cards without a container id must still deduplicate.
+
+    Dedup keyed on the id alone, and a card with no id was kept unconditionally.
+    Amazon serves the same page over again past the end of the listing, so the
+    same review came back once per requested page: the sample inflated, the
+    "no new reviews" end-of-walk signal never fired, and the duplicate-wording
+    check — which scores reviews that share phrasing as bought — was handed a
+    listing's own reviews repeated verbatim. Selector drift on one attribute
+    would have manufactured a maximum-confidence accusation.
+    """
+
+    class Page:
+        """Every card is id-less; the same page is served every time."""
+
+        def locator(self, sel):
+            if sel == "[data-hook=review], [data-hook=cmps-review]":
+                return FakeCardList([
+                    FakeScope({
+                        "[data-hook=reviewTitle]": FakeTextLocator(text="Works great"),
+                        "[data-hook=review-date]": FakeTextLocator(
+                            text="Reviewed in the United States on March 2, 2024"
+                        ),
+                        "[data-hook=reviewRichContentContainer]": FakeTextLocator(
+                            text="Held up to a full season of use with no complaints."
+                        ),
+                        ".a-profile-name": FakeTextLocator(text="Dana"),
+                    })
+                ])
+            return FakeTextLocator(count=0)
+
+        def goto(self, *_a, **_kw):
+            pass
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    def test_the_same_id_less_review_is_not_collected_once_per_page(self):
+        got, walk = scrape_reviews(self.Page(), "B0TEST00001", pages=3)
+        self.assertEqual(len(got), 1)
+        self.assertIsNone(got[0]["id"])
+        # And with nothing new on page 1, the walk knows it has run dry rather
+        # than marching through all three pages re-reading the same review.
+        self.assertEqual(walk, "exhausted")
+
+    def test_distinct_id_less_reviews_are_all_kept(self):
+        # The fallback keys on content, so it must not collapse two people who
+        # happened to be handed the same product.
+        class Page(self.Page):
+            def __init__(self):
+                self._n = 0
+
+            def locator(self, sel):
+                if sel != "[data-hook=review], [data-hook=cmps-review]":
+                    return FakeTextLocator(count=0)
+                return FakeCardList([
+                    FakeScope({
+                        "[data-hook=reviewTitle]": FakeTextLocator(text="Works great"),
+                        "[data-hook=review-date]": FakeTextLocator(
+                            text="Reviewed in the United States on March 2, 2024"
+                        ),
+                        "[data-hook=reviewRichContentContainer]": FakeTextLocator(
+                            text=f"Reviewer number {self._n} had a fine time with it."
+                        ),
+                        ".a-profile-name": FakeTextLocator(text=f"Dana {self._n}"),
+                    })
+                ])
+
+            def goto(self, *_a, **_kw):
+                self._n += 1
+
+        got, walk = scrape_reviews(Page(), "B0TEST00001", pages=3)
+        self.assertEqual(len(got), 4)
+        self.assertEqual(walk, "complete")
