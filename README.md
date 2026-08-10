@@ -372,6 +372,62 @@ three or more of the six expected fields come back empty, the worker emits
 a `warn` log saying the markup may have changed — but a single blanked
 field can still slip through, and only a real run will show it.
 
+### Guards that can't fail
+
+Delete the fix, run the suite, watch the named test fail. Then put the fix
+back and commit. A test written for a specific hazard is worth exactly the
+failure it can produce, and four in this repo produced none:
+
+- **A test that mirrored the code instead of calling it.** The cookie-jar
+  restore assertions ran against a hand-copied duplicate of the closure in
+  `main()`, so the real one could change underneath them and they'd stay
+  green. Fixed by extracting `restore_jar` and calling it.
+- **A test that skipped in the one place it was for.** `PackageAssumptionsTest`
+  checks our fixtures against the installed amazon-orders — and CI runs a bare
+  interpreter with no install step, so it skipped there every time. Fixed by
+  adding a second CI job that installs the deps (`python-deps-test`).
+- **A test whose hazard the fake couldn't express.** `test_the_style_leak_still_reproduces`
+  asserted that CSS gets stripped from scraped text, but bs4 sorts `<style>`
+  contents into a `NavigableString` subclass that `get_text()` skips — so there
+  was never any CSS to strip. Deleting `without_style_nodes` outright left the
+  entire suite green.
+- **The same trap, one branch over.** After that was fixed in the fake's
+  rendered branch, its unrendered branch still used `get_text()` — and the
+  unrendered branch is the one the real leak travelled through, since
+  `#availability_feature_div` had no layout box on the live page. Found by
+  simulating a reviewer's concern rather than arguing about it: modelling the
+  accordion collapse pessimistically moved exactly one assertion, and it moved
+  because the fake was wrong.
+
+A guard can also fail to fail because it never ran. The uv project is
+`pyworker/`, not the repo root, so `uv run` from the root builds an empty
+environment — 27 tests skip and the run still reports `OK`, which looks
+identical to a pass. Two commands are honest about which suite you got:
+
+```sh
+pyworker/.venv/bin/python -m unittest discover -s pyworker -p 'test_*.py'  # 0 skips
+/usr/bin/python3           -m unittest discover -s pyworker -p 'test_*.py'  # 27 skips
+```
+
+The first is what `python-deps-test` runs; the second stands in for
+`python-test`. A skip count from anywhere else is not evidence about either.
+
+The last two bullets share a cause worth stating on its own: a fake that
+stands in for a browser is itself untested code, and it will agree with
+whatever you believed when you wrote it. `DomFakeFidelityTest` exists to hold it against measurements
+taken from real Chrome rather than from the spec — `innerText` has three
+branches that a reasonable reading gets wrong, and each has a test naming the
+measured behaviour:
+
+| markup | layout box | `innerText` |
+|---|---|---|
+| `display: none` | no | full descendant text — the `textContent` fallback |
+| rendered, with a `display: none` child | yes | own text; the child contributes nothing |
+| `visibility: hidden` | yes | `""` — and a `visibility: visible` child still comes through |
+
+The list is expected to grow. Add to it when you find the next one; the entry
+that helps is the one that says what the guard *looked* like it covered.
+
 ## License
 
 MIT. See [LICENSE](./LICENSE).

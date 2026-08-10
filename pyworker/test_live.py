@@ -1347,6 +1347,18 @@ except ImportError:  # pragma: no cover - exercised by the bare-interpreter CI j
 # adding it here would return "" for every price in the fixture suite, and it
 # would present as the price selectors having rotted rather than as the fake
 # having changed.
+# A skip reason a human reads only when confused about why a test did not
+# run, so it says how to make it run rather than asserting where it is.
+# "this is CI" was wrong the moment someone ran `uv run` from the repo
+# root: there is no pyproject.toml there, so uv builds an empty
+# environment and every one of these skips while the run reports OK.
+NO_DEPS = (
+    "{pkg} is not installed. The bare-interpreter CI job skips these by design; "
+    "to run them use pyworker/.venv/bin/python, or `uv run` from pyworker/ — "
+    "not from the repo root, which builds an empty env and skips silently."
+)
+
+
 HIDING_CLASSES = ("aok-hidden", "a-hidden")
 
 
@@ -1545,7 +1557,7 @@ class RealMarkupSellerTest(unittest.TestCase):
 
     def setUp(self):
         if not HAVE_BS4:
-            self.skipTest("beautifulsoup4 is not installed (this is the bare-interpreter CI job)")
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
 
     def test_an_amazon_sold_listing_reports_amazon(self):
         page = DomPage.from_fixture("buybox_amazon_sold.html")
@@ -1658,7 +1670,7 @@ class DomFakeFidelityTest(unittest.TestCase):
 
     def setUp(self):
         if not HAVE_BS4:
-            self.skipTest("beautifulsoup4 is not installed (this is the bare-interpreter CI job)")
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
         self.page = DomPage(self.HTML)
 
     def test_a_hidden_node_still_yields_its_own_text(self):
@@ -1745,7 +1757,7 @@ class RealMarkupHiddenTwinTest(unittest.TestCase):
 
     def setUp(self):
         if not HAVE_BS4:
-            self.skipTest("beautifulsoup4 is not installed (this is the bare-interpreter CI job)")
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
 
     def test_the_second_merchant_match_is_a_hidden_popover_twin(self):
         # The multi-match the old fake could not express. Both matches carry
@@ -1766,7 +1778,7 @@ class RealMarkupCleanTextTest(unittest.TestCase):
 
     def setUp(self):
         if not HAVE_BS4:
-            self.skipTest("beautifulsoup4 is not installed (this is the bare-interpreter CI job)")
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
 
     def test_the_availability_container_carries_a_style_block(self):
         # If this fails the fixture has been re-captured from a page that no
@@ -1794,7 +1806,7 @@ class RealMarkupPriceTest(unittest.TestCase):
 
     def setUp(self):
         if not HAVE_BS4:
-            self.skipTest("beautifulsoup4 is not installed (this is the bare-interpreter CI job)")
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
 
     # (fixture, featured price, used-offer price)
     PAGES = (
