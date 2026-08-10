@@ -20,8 +20,9 @@ Stdin (one-shot request):
 
 Reviews ride along on the `item` action rather than getting their own: the
 product page already carries the rating histogram and the top ~8 reviews, so
-folding them in costs no extra page load. `review_pages` > 0 additionally walks
-/product-reviews/ for depth.
+folding them in costs no extra page load. `review_pages` > 0 additionally opens
+/product-reviews/ and clicks "Show 10 more reviews" for each batch past the
+first, which is the only pagination that listing has.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from urllib.parse import quote_plus
 
 from browser import (
     Blocked,
+    NoProduct,
     NotLoggedIn,
     attr,
     emit,
@@ -306,12 +308,40 @@ def parse_histogram_label(raw: str | None) -> tuple[int, int] | None:
     return (int(m.group("stars")), pct) if pct <= 100 else None
 
 
-def reviews_url(asin: str, page_number: int = 1, sort: str = "helpful") -> str:
+def reviews_url(asin: str, sort: str = "helpful") -> str:
+    """The full review listing, first batch.
+
+    Deliberately carries no `pageNumber`. It used to, and Amazon ignores it:
+    measured against B09BJMY8HL, `pageNumber=1` through `4` each served the
+    identical ten reviews. Every page past the first was therefore a page load
+    that returned nothing new, the dedupe caught it, and the walk reported
+    "Amazon served no new reviews past page 1" — a claim about the listing
+    manufactured entirely out of a query parameter that stopped working. Depth
+    now comes from `expand_reviews`, which is how the page itself paginates.
+    """
     return (
         f"https://www.amazon.com/product-reviews/{asin}"
-        f"?pageNumber={page_number}&sortBy={SORT_KEYS.get(sort, 'helpful')}"
+        f"?sortBy={SORT_KEYS.get(sort, 'helpful')}"
         "&reviewerType=all_reviews"
     )
+
+
+# Every review card, on the product page and on the full listing. `cmps-review`
+# is the cross-marketplace card Amazon mixes in.
+REVIEW_CARDS = "[data-hook=review], [data-hook=cmps-review]"
+# "Show 10 more reviews". The listing appends the next batch into the same DOM
+# over XHR rather than serving it at a URL, so this button is the whole of
+# pagination — there is no numbered pager on the page at all.
+SHOW_MORE_BUTTON = "[data-hook=show-more-button]"
+# How long to give that XHR before calling the batch dead.
+EXPAND_TIMEOUT_MS = 15000
+# The JS behind the wait. Expressed against the DOM rather than by polling
+# `count()` from here because the appended cards land in one paint, and a
+# locator poll would either sample between the two or need a sleep long enough
+# to make ten batches noticeably slow.
+CARDS_GREW_JS = (
+    "n => document.querySelectorAll('[data-hook=review], [data-hook=cmps-review]').length > n"
+)
 
 
 STAR_ROWS = 5
@@ -370,20 +400,24 @@ def scrape_histogram(page: Any) -> dict[str, int]:
     return out
 
 
-def scrape_review_cards(scope: Any) -> list[dict[str, Any]]:
-    """Every review card under `scope`, in page order.
+def scrape_review_cards(scope: Any, start: int = 0) -> list[dict[str, Any]]:
+    """Every review card under `scope` from `start` onwards, in page order.
 
-    Both hooks: `review` on the product page and the full listing,
-    `cmps-review` on the cross-marketplace cards Amazon mixes in.
+    `start` exists because the listing appends rather than replaces: after the
+    fourth "show more" the DOM holds all fifty cards, and re-reading the
+    forty already in hand costs a dozen locator round-trips apiece. Skipping
+    them is an optimization only — `fresh()` upstream still dedupes, so an
+    offset that lands short re-reads a few cards rather than duplicating them.
     """
     out: list[dict[str, Any]] = []
     try:
-        cards = scope.locator("[data-hook=review], [data-hook=cmps-review]")
+        cards = scope.locator(REVIEW_CARDS)
         total = cards.count()
     except Exception:  # noqa: BLE001
         return out
+    start = max(start, 0)
 
-    for i in range(total):
+    for i in range(start, total):
         card = cards.nth(i)
         try:
             dateline = text(card, "[data-hook=review-date]")
@@ -404,11 +438,23 @@ def scrape_review_cards(scope: Any) -> list[dict[str, Any]]:
             vine = _has(card, "[data-hook=review-vine-badge]", ".vine-review-badge")
             record = {
                     "id": _review_id(card),
+                    # `> span`, not a descendant span. The star rating lives
+                    # *inside* the title anchor as
+                    # `<i data-hook=review-star-rating><span class=a-icon-alt>
+                    # 5.0 out of 5 stars</span></i>`, and that span is the last
+                    # child of its own parent, so the descendant form matched it
+                    # first — `text()` takes `.first` in document order, and the
+                    # icon precedes the title. Every title on the listing came
+                    # back "5.0 out of 5 stars", which `strip_star_prefix` then
+                    # reduced to nothing: the field read as absent rather than
+                    # wrong, so nothing downstream had anything to complain
+                    # about. The bare-hook fallback below survives it either
+                    # way, which is why this went unnoticed.
                     "title": strip_star_prefix(
                         text(
                             card,
                             "[data-hook=reviewTitle]",
-                            "[data-hook=review-title] span:last-child",
+                            "[data-hook=review-title] > span:last-child",
                             "[data-hook=review-title]",
                         )
                     ),
@@ -438,20 +484,62 @@ def scrape_review_cards(scope: Any) -> list[dict[str, Any]]:
     return out
 
 
+def count_review_cards(page: Any) -> int:
+    try:
+        return page.locator(REVIEW_CARDS).count()
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def expand_reviews(page: Any) -> str:
+    """Click "Show N more reviews" and wait for the batch to land.
+
+    Assumes `page` is sitting on the full listing. Returns:
+
+      "grew"    — the button was there and new cards arrived
+      "end"     — no button, so the listing is showing everything it has
+      "stalled" — the button was there and nothing came
+
+    The last two are what the caller has to keep apart. A missing button is
+    Amazon saying there is no more, and is worth nothing louder than a note. A
+    button that promised ten more and delivered none means the reviews exist
+    and we didn't get them, which is a failure to retry, not a fact about the
+    listing.
+    """
+    try:
+        button = page.locator(SHOW_MORE_BUTTON)
+        if button.count() == 0:
+            return "end"
+        before = count_review_cards(page)
+        button.first.scroll_into_view_if_needed(timeout=5000)
+        button.first.click(timeout=EXPAND_TIMEOUT_MS)
+        page.wait_for_function(CARDS_GREW_JS, arg=before, timeout=EXPAND_TIMEOUT_MS)
+    except Exception as exc:  # noqa: BLE001
+        emit("log", level="info", msg=f"the show-more button did not deliver ({exc})")
+        return "stalled"
+    return "grew"
+
+
 def scrape_reviews(
     page: Any, asin: str, pages: int = 0, sort: str = "helpful"
 ) -> tuple[list[dict[str, Any]], str]:
-    """Reviews already on the loaded product page, plus `pages` more from
-    /product-reviews/.
+    """Reviews already on the loaded product page, plus `pages` batches of ten
+    from the full listing.
 
     Assumes `page` is sitting on the product page. Deduplicates by review id
     because the product page's top reviews reappear on the full listing.
 
+    The first batch is the listing's own page load; every batch after it is a
+    click on "Show 10 more reviews". That is not an implementation detail we
+    chose — the listing has no numbered pager and ignores `pageNumber`, so
+    walking URLs re-read batch one `pages` times and stopped, reporting fifteen
+    reviews for a listing with six thousand ratings.
+
     Returns the reviews and how the walk ended, one of:
 
-      "complete"  — every page asked for was read
-      "exhausted" — Amazon stopped serving new reviews before that
-      "failed"    — a page load fell over, so depth is unknown
+      "complete"  — every batch asked for was read
+      "exhausted" — the listing ran out of reviews before that
+      "failed"    — a load or a batch fell over, so depth is unknown
 
     Three states, not the boolean this used to be. "Didn't finish" was doing
     double duty for "there is no more" and "we couldn't get at it", and the
@@ -466,7 +554,7 @@ def scrape_reviews(
         """Cards not already collected, `seen` updated as it goes.
 
         Running rather than a set comprehension so that one page rendering the
-        same review twice is caught the same way a repeated page is.
+        same review twice is caught the same way a repeated batch is.
         """
         out = []
         for r in cards:
@@ -477,50 +565,76 @@ def scrape_reviews(
         return out
 
     collected = fresh(scrape_review_cards(page))
-    walk = "complete"
+    if pages < 1:
+        return collected, "complete"
 
-    for n in range(1, max(pages, 0) + 1):
-        try:
-            page.goto(reviews_url(asin, n, sort), wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(1200)
-            guard(page)
-        except (Blocked, NotLoggedIn):
-            # Not a depth problem — the session itself is gone, or Amazon is
-            # serving a robot check. Both subclass RuntimeError, so the handler
-            # below used to swallow them and hand back a complete-looking fraud
-            # report built on the ~8 product-page reviews, exit 0, with the one
-            # actionable message ("Run: amazon login") never reaching the user.
-            # guard() fails closed on purpose; catching it here undid that.
-            raise
-        except Exception as exc:  # noqa: BLE001
-            # /product-reviews/ demands a signed-in session even when /dp/ will
-            # still render for a stale one, so this leg fails on its own. The
-            # sample from the product page is already in hand and is exactly
-            # what `--pages 0` would have returned — reporting on it beats
-            # discarding a good partial answer over the depth we couldn't get.
-            emit("log", level="warn", msg=f"could not load review page {n} ({exc}) — reporting on {len(collected)} from the product page")
-            walk = "failed"
-            break
-        batch = fresh(scrape_review_cards(page))
-        if not batch:
-            # Amazon serves the same page over again rather than 404ing past the
-            # end, so duplicates are the only "no more" signal there is. It does
-            # the same thing when it simply won't paginate for this session, and
-            # the two are indistinguishable from here — which is why stopping on
-            # page 1 of a product with thousands of ratings is worth saying out
-            # loud rather than logging as routine.
-            walk = "exhausted"
-            if n < pages:
+    try:
+        page.goto(reviews_url(asin, sort), wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(1200)
+        guard(page)
+    except (Blocked, NotLoggedIn):
+        # Not a depth problem — the session itself is gone, or Amazon is
+        # serving a robot check. Both subclass RuntimeError, so the handler
+        # below used to swallow them and hand back a complete-looking fraud
+        # report built on the ~8 product-page reviews, exit 0, with the one
+        # actionable message ("Run: amazon login") never reaching the user.
+        # guard() fails closed on purpose; catching it here undid that.
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # /product-reviews/ demands a signed-in session even when /dp/ will
+        # still render for a stale one, so this leg fails on its own. The
+        # sample from the product page is already in hand and is exactly what
+        # `--pages 0` would have returned — reporting on it beats discarding a
+        # good partial answer over the depth we couldn't get.
+        emit("log", level="warn", msg=(
+            f"could not load the review listing ({exc}) — "
+            f"reporting on {len(collected)} from the product page"
+        ))
+        return collected, "failed"
+
+    walk = "complete"
+    read = 0  # cards already taken out of the listing's DOM
+
+    for n in range(1, pages + 1):
+        if n > 1:
+            outcome = expand_reviews(page)
+            if outcome == "stalled":
+                # Before blaming the network, let guard() look: the batch
+                # arrives by XHR into the page we are already on, so a robot
+                # check served in place never navigates, and this is the only
+                # point where it would surface. It raises if that is what
+                # happened, which is the outcome that has an answer.
+                guard(page)
                 emit("log", level="warn", msg=(
-                    f"Amazon served no new reviews past page {n} of the {pages} requested — "
-                    f"analyzing the {len(collected)} it did give up. Either it caps this "
-                    "listing, or it won't paginate reviews for this session."
+                    f"the 'show more reviews' button stopped delivering after batch {n - 1} "
+                    f"of the {pages} requested — analyzing the {len(collected)} in hand. "
+                    "The reviews are there; retry to sample further."
                 ))
-            else:
-                emit("log", level="info", msg=f"no new reviews on page {n} — stopping")
+                walk = "failed"
+                break
+            if outcome == "end":
+                emit("log", level="info", msg=(
+                    f"the listing has no more reviews to show — stopping at {len(collected)} "
+                    f"after batch {n - 1} of the {pages} requested"
+                ))
+                walk = "exhausted"
+                break
+
+        total = count_review_cards(page)
+        batch = fresh(scrape_review_cards(page, start=read))
+        read = max(read, total)
+        if not batch:
+            # The DOM grew and every card in it was one we already had. Not a
+            # shape Amazon has been seen to serve, which is exactly why it is
+            # reported rather than passed off as the end of the listing.
+            emit("log", level="warn", msg=(
+                f"batch {n} of the {pages} requested was all reviews already collected — "
+                f"analyzing the {len(collected)} in hand"
+            ))
+            walk = "exhausted"
             break
         collected.extend(batch)
-        emit("log", level="info", msg=f"review page {n}: +{len(batch)} ({len(collected)} total)")
+        emit("log", level="info", msg=f"review batch {n}: +{len(batch)} ({len(collected)} total)")
 
     return collected, walk
 
@@ -592,7 +706,10 @@ def scrape_item(
 
     title = text(page, "#productTitle", "#title", "h1#title span")
     if not title:
-        raise RuntimeError(f"no product found for {asin} (page may be a 404 or a redirect)")
+        raise NoProduct(
+            f"no product page for {asin} — Amazon returned a 404 or redirected elsewhere. "
+            "Check the ASIN."
+        )
 
     # The featured offer's row comes first, for the same reason the seller does.
     # On an accordion listing `#corePrice_feature_div` exists once per row, so
@@ -952,6 +1069,12 @@ def main() -> int:
         return 1
     except Blocked as e:
         emit("error", msg=str(e), kind="blocked")
+        return 1
+    except NoProduct as e:
+        # No traceback and no "live lookup failed" prefix: the stack would name
+        # scrape_item, which is not where the problem is. A mistyped ASIN is a
+        # user error whose whole diagnosis fits in the sentence itself.
+        emit("error", msg=str(e), kind="no_product")
         return 1
     except Exception as e:  # noqa: BLE001
         print(traceback.format_exc(), file=sys.stderr)

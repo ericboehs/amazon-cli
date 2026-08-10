@@ -14,6 +14,7 @@ from pathlib import Path
 import browser
 from browser import (
     Blocked,
+    NoProduct,
     NotLoggedIn,
     clean_text,
     guard,
@@ -23,7 +24,10 @@ from browser import (
     text,
 )
 from live import (
+    REVIEW_CARDS,
     SELLER_SELECTORS,
+    SHOW_MORE_BUTTON,
+    expand_reviews,
     extract_asin,
     normalize_seller,
     parse_delivery_date,
@@ -33,6 +37,7 @@ from live import (
     parse_review_date,
     reviews_url,
     scrape_histogram,
+    scrape_item,
     scrape_review_cards,
     scrape_reviews,
     strip_star_prefix,
@@ -719,19 +724,23 @@ class ParseHistogramLabelTest(unittest.TestCase):
 
 
 class ReviewsUrlTest(unittest.TestCase):
-    def test_defaults_to_helpful_page_one(self):
+    def test_defaults_to_helpful(self):
         url = reviews_url("B0747R1M51")
         self.assertIn("/product-reviews/B0747R1M51", url)
-        self.assertIn("pageNumber=1", url)
         self.assertIn("sortBy=helpful", url)
 
-    def test_recent_sort_and_page(self):
-        url = reviews_url("B0747R1M51", 3, "recent")
-        self.assertIn("pageNumber=3", url)
-        self.assertIn("sortBy=recent", url)
+    def test_recent_sort(self):
+        self.assertIn("sortBy=recent", reviews_url("B0747R1M51", "recent"))
 
     def test_unknown_sort_falls_back_rather_than_injecting_it(self):
-        self.assertIn("sortBy=helpful", reviews_url("B1", 1, "bogus"))
+        self.assertIn("sortBy=helpful", reviews_url("B1", "bogus"))
+
+    def test_no_page_number_is_asked_for(self):
+        # Amazon ignores it — measured against B09BJMY8HL, pageNumber=1..4 each
+        # served the same ten reviews. Sending it anyway produced a walk that
+        # re-read batch one N times and then announced the listing had no more,
+        # which is a claim about Amazon assembled out of our own dead parameter.
+        self.assertNotIn("pageNumber", reviews_url("B0747R1M51", "recent"))
 
 
 def aria_rows(*pairs):
@@ -839,7 +848,7 @@ class HasTest(unittest.TestCase):
 class ScrapeReviewCardsTest(unittest.TestCase):
     def card(self, **overrides):
         mapping = {
-            "[data-hook=review-title] span:last-child": FakeTextLocator(text="Works great"),
+            "[data-hook=review-title] > span:last-child": FakeTextLocator(text="Works great"),
             "[data-hook=review-star-rating]": FakeTextLocator(text="5.0 out of 5 stars"),
             "[data-hook=review-date]": FakeTextLocator(
                 text="Reviewed in the United States on July 26, 2025"
@@ -960,7 +969,7 @@ class LiveMarkup2026Test(unittest.TestCase):
     def test_older_hooks_still_win_when_the_new_ones_are_absent(self):
         r = self.scrape_card(
             {
-                "[data-hook=review-title] span:last-child": FakeTextLocator(text="Old layout"),
+                "[data-hook=review-title] > span:last-child": FakeTextLocator(text="Old layout"),
                 "[data-hook=review-body]": FakeTextLocator(text="Old body"),
             }
         )
@@ -1052,128 +1061,287 @@ class ScrapeReviewsSessionFailureTest(unittest.TestCase):
         self.assertEqual(walk, "failed")
 
 
-class ScrapeReviewsDepthTest(unittest.TestCase):
-    """Whether the walk got everything it asked Amazon for."""
+def review_card(ident=None, title="Works great", body=None, author=None, date=None):
+    """One review card's worth of selector -> text, as `scrape_review_cards` reads it."""
+    mapping = {"[data-hook=reviewTitle]": FakeTextLocator(text=title)}
+    if body:
+        mapping["[data-hook=reviewRichContentContainer]"] = FakeTextLocator(text=body)
+    if author:
+        mapping[".a-profile-name"] = FakeTextLocator(text=author)
+    if date:
+        mapping["[data-hook=review-date]"] = FakeTextLocator(text=date)
+    return FakeScope(mapping, attrs={"id": f"customer_review-{ident}"} if ident else {})
+
+
+class FakeListingPage:
+    """A product page whose review listing appends ten more per click.
+
+    Models the mechanism Amazon actually ships: loading /product-reviews/
+    yields `batch` cards, and each "Show 10 more reviews" click appends another
+    `batch` into the same DOM until `available` is exhausted, at which point the
+    button is gone. There is no numbered pager and no second URL to load, which
+    is why `gotos` is counted — a walk that navigates per page is re-reading
+    batch one, and that is the bug this models.
+
+    The product page's own reviews are a prefix of the listing's, as they are
+    on a helpful-sorted listing, so the dedupe is exercised on every run.
+    """
+
+    def __init__(self, available=30, batch=10, on_product_page=2, click="grow", ids=True):
+        self._available = available
+        self._batch = batch
+        self._on_product_page = on_product_page
+        self._click = click
+        self._ids = ids
+        self._shown = 0
+        self._listing = False
+        self.gotos = 0
+
+    def _card(self, i):
+        return review_card(
+            ident=f"R{i}" if self._ids else None,
+            title=f"review {i}",
+            body=f"Reviewer number {i} had a fine time with it.",
+            author=f"Dana {i}",
+        )
+
+    # -- the page API scrape_reviews uses -------------------------------
+
+    def goto(self, *_a, **_kw):
+        self.gotos += 1
+        self._listing = True
+        self._shown = min(self._batch, self._available)
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+    def wait_for_function(self, _expr, arg=None, timeout=None):
+        # The real call waits on the card count rising past `arg`. Asserting
+        # that here rather than on a flag keeps the fake honest about what a
+        # stalled click looks like: the button is clicked, nothing lands.
+        if self._shown <= (arg or 0):
+            raise RuntimeError("Timeout 15000ms exceeded")
+
+    def locator(self, sel):
+        if sel == REVIEW_CARDS:
+            visible = self._shown if self._listing else self._on_product_page
+            return FakeCardList([self._card(i) for i in range(visible)])
+        if sel == SHOW_MORE_BUTTON:
+            return FakeShowMore(self, self._listing and self._shown < self._available)
+        return FakeTextLocator(count=0)
+
+    def click_show_more(self):
+        if self._click == "grow":
+            self._shown = min(self._shown + self._batch, self._available)
+
+
+class FakeShowMore:
+    """The "Show 10 more reviews" button, or the absence of one."""
+
+    def __init__(self, page, present):
+        self._page = page
+        self._present = present
+
+    def count(self):
+        return 1 if self._present else 0
+
+    @property
+    def first(self):
+        return self
+
+    def scroll_into_view_if_needed(self, timeout=None):
+        pass
+
+    def click(self, timeout=None):
+        self._page.click_show_more()
+
+
+class ScrapeItemMissingProductTest(unittest.TestCase):
+    """An ASIN that resolves to nothing is a user error, not a crash.
+
+    It raised a bare RuntimeError, and `main`'s catch-all treats every
+    RuntimeError as a bug in us: traceback to stderr, `kind` left unset, and
+    the CLI then prefixed the message with "live lookup failed" and stapled the
+    last seven stderr lines underneath. Five lines of Python internals whose
+    top frame is our own `raise`, shown to someone who mistyped an ASIN.
+    """
 
     class Page:
-        """Serves `pages_available` distinct review pages, then repeats.
+        """A page that loads and passes guard(), but carries no product."""
 
-        Amazon returns the same page over again past the end rather than
-        404ing, which is the behaviour being modelled here.
-        """
-
-        def __init__(self, pages_available):
-            self._pages_available = pages_available
-            self._n = 0
-
-        def locator(self, sel):
-            if sel == "[data-hook=review], [data-hook=cmps-review]":
-                idx = min(self._n, self._pages_available)
-                return FakeCardList([
-                    FakeScope(
-                        {"[data-hook=reviewTitle]": FakeTextLocator(text=f"review {idx}")},
-                        attrs={"id": f"customer_review-R{idx}"},
-                    )
-                ])
-            return FakeTextLocator(count=0)
+        url = "https://www.amazon.com/dp/B0DEMO1234"
 
         def goto(self, *_a, **_kw):
-            self._n += 1
+            pass
 
         def wait_for_timeout(self, _ms):
             pass
 
+        def locator(self, _sel):
+            return FakeTextLocator(count=0)
+
+    def test_a_page_with_no_title_raises_no_product(self):
+        with self.assertRaises(NoProduct) as caught:
+            scrape_item(self.Page(), "B0DEMO1234")
+        self.assertIn("B0DEMO1234", str(caught.exception))
+
+    def test_it_is_not_the_generic_runtime_error_the_catch_all_handles(self):
+        # The distinction is the whole fix: `main` can only route this away
+        # from the traceback path if it is its own class. Subclassing
+        # RuntimeError keeps every existing caller working, so the type check
+        # rather than the inheritance is what the routing turns on.
+        self.assertTrue(issubclass(NoProduct, RuntimeError))
+        self.assertNotIn(type(NoProduct("x")), (RuntimeError, Blocked, NotLoggedIn))
+
+
+class ExpandReviewsTest(unittest.TestCase):
+    """The three outcomes of one "show more" click, which the caller acts on
+    differently: only "stalled" means the reviews exist and we failed to get
+    them."""
+
+    def test_a_click_that_appends_a_batch_grew(self):
+        page = FakeListingPage(available=30)
+        page.goto()
+        self.assertEqual(expand_reviews(page), "grew")
+        self.assertEqual(len(scrape_review_cards(page)), 20)
+
+    def test_no_button_is_the_end_of_the_listing(self):
+        page = FakeListingPage(available=10)
+        page.goto()
+        self.assertEqual(expand_reviews(page), "end")
+
+    def test_a_button_that_delivers_nothing_is_stalled_not_the_end(self):
+        page = FakeListingPage(available=30, click="stall")
+        page.goto()
+        self.assertEqual(expand_reviews(page), "stalled")
+
+
+class ScrapeReviewsDepthTest(unittest.TestCase):
+    """Whether the walk got everything it asked Amazon for."""
+
+    def test_the_listing_is_loaded_once_however_many_pages_are_asked_for(self):
+        # The defect this replaced: `--pages 10` navigated ten times to
+        # `?pageNumber=1..10`, Amazon ignored the parameter and served the same
+        # ten reviews each time, the dedupe correctly found nothing new on the
+        # second — and the walk announced that Amazon had no more to give for a
+        # listing with 6,258 ratings. Ten page loads to report fifteen reviews.
+        page = FakeListingPage(available=100)
+        got, walk = scrape_reviews(page, "B0TEST00001", pages=5)
+        self.assertEqual(page.gotos, 1)
+        self.assertEqual(len(got), 50)
+        self.assertEqual(walk, "complete")
+
     def test_a_walk_that_runs_out_early_is_reported_as_incomplete(self):
-        # The real case: a 3,706-rating listing that stopped yielding new
-        # reviews after page 1 of the 3 requested.
-        _, walk = scrape_reviews(self.Page(pages_available=1), "B0TEST00001", pages=3)
+        # 15 reviews on the listing, 3 batches asked for: the second click has
+        # no button to press, and that is the listing's answer, not a failure.
+        got, walk = scrape_reviews(FakeListingPage(available=15), "B0TEST00001", pages=3)
+        self.assertEqual(len(got), 15)
         self.assertEqual(walk, "exhausted")
 
     def test_a_full_walk_is_reported_as_complete(self):
-        got, walk = scrape_reviews(self.Page(pages_available=5), "B0TEST00001", pages=3)
+        got, walk = scrape_reviews(FakeListingPage(available=50), "B0TEST00001", pages=3)
         self.assertEqual(walk, "complete")
-        self.assertEqual(len(got), 4)  # product page + 3 walked pages
+        self.assertEqual(len(got), 30)
 
-    def test_asking_for_no_pages_is_a_complete_walk(self):
-        # `--pages 0` got exactly the depth it requested; nothing was refused.
-        _, walk = scrape_reviews(self.Page(pages_available=0), "B0TEST00001", pages=0)
+    def test_the_product_pages_own_reviews_are_not_counted_twice(self):
+        # They reappear at the top of the listing. Counting 10 for a listing
+        # that served 10 is the whole assertion.
+        got, _ = scrape_reviews(
+            FakeListingPage(available=10, on_product_page=3), "B0TEST00001", pages=1
+        )
+        self.assertEqual(len(got), 10)
+
+    def test_asking_for_no_pages_never_leaves_the_product_page(self):
+        # `--pages 0` got exactly the depth it requested; nothing was refused,
+        # and nothing was loaded to find that out.
+        page = FakeListingPage(available=50, on_product_page=8)
+        got, walk = scrape_reviews(page, "B0TEST00001", pages=0)
         self.assertEqual(walk, "complete")
+        self.assertEqual(len(got), 8)
+        self.assertEqual(page.gotos, 0)
+
+    def test_a_button_that_stops_delivering_is_a_failure_not_the_end(self):
+        # The distinction the report turns into advice. The button is still on
+        # the page, so the reviews are there — calling that "exhausted" would
+        # print "that is everything Amazon would serve for this listing" and
+        # talk the user out of the retry that works.
+        got, walk = scrape_reviews(
+            FakeListingPage(available=100, click="stall"), "B0TEST00001", pages=4
+        )
+        self.assertEqual(walk, "failed")
+        self.assertEqual(len(got), 10)
 
 
 class ScrapeReviewsIdlessDedupeTest(unittest.TestCase):
     """Cards without a container id must still deduplicate.
 
     Dedup keyed on the id alone, and a card with no id was kept unconditionally.
-    Amazon serves the same page over again past the end of the listing, so the
-    same review came back once per requested page: the sample inflated, the
-    "no new reviews" end-of-walk signal never fired, and the duplicate-wording
+    The listing appends rather than replaces, so every batch re-reads the cards
+    already on the page: the sample inflated by a full batch per click, the
+    "nothing new" end-of-walk signal never fired, and the duplicate-wording
     check — which scores reviews that share phrasing as bought — was handed a
     listing's own reviews repeated verbatim. Selector drift on one attribute
     would have manufactured a maximum-confidence accusation.
+
+    The `read` offset in `scrape_reviews` skips most of that re-reading now, but
+    it is an optimization and must not be what makes the count right: these
+    cards are id-less, so if the content fallback stopped working the offset
+    alone would still let the product page's copies through.
     """
 
     class Page:
-        """Every card is id-less; the same page is served every time."""
+        """Every card is id-less, and the listing serves the same one review."""
+
+        def __init__(self):
+            self._listing = False
 
         def locator(self, sel):
-            if sel == "[data-hook=review], [data-hook=cmps-review]":
+            if sel == REVIEW_CARDS:
                 return FakeCardList([
-                    FakeScope({
-                        "[data-hook=reviewTitle]": FakeTextLocator(text="Works great"),
-                        "[data-hook=review-date]": FakeTextLocator(
-                            text="Reviewed in the United States on March 2, 2024"
-                        ),
-                        "[data-hook=reviewRichContentContainer]": FakeTextLocator(
-                            text="Held up to a full season of use with no complaints."
-                        ),
-                        ".a-profile-name": FakeTextLocator(text="Dana"),
-                    })
+                    review_card(
+                        title="Works great",
+                        date="Reviewed in the United States on March 2, 2024",
+                        body="Held up to a full season of use with no complaints.",
+                        author="Dana",
+                    )
                 ])
+            if sel == SHOW_MORE_BUTTON:
+                return FakeShowMore(self, self._listing)
             return FakeTextLocator(count=0)
 
         def goto(self, *_a, **_kw):
-            pass
+            self._listing = True
 
         def wait_for_timeout(self, _ms):
             pass
 
-    def test_the_same_id_less_review_is_not_collected_once_per_page(self):
+        def wait_for_function(self, _expr, arg=None, timeout=None):
+            pass
+
+        def click_show_more(self):
+            pass
+
+    def test_the_same_id_less_review_is_not_collected_once_per_batch(self):
         got, walk = scrape_reviews(self.Page(), "B0TEST00001", pages=3)
         self.assertEqual(len(got), 1)
         self.assertIsNone(got[0]["id"])
-        # And with nothing new on page 1, the walk knows it has run dry rather
-        # than marching through all three pages re-reading the same review.
+        # The listing handed back only what the product page already had, which
+        # is the "all reviews already collected" branch — the walk stops rather
+        # than clicking twice more for the same card.
         self.assertEqual(walk, "exhausted")
 
     def test_distinct_id_less_reviews_are_all_kept(self):
         # The fallback keys on content, so it must not collapse two people who
         # happened to be handed the same product.
-        class Page(self.Page):
-            def __init__(self):
-                self._n = 0
-
-            def locator(self, sel):
-                if sel != "[data-hook=review], [data-hook=cmps-review]":
-                    return FakeTextLocator(count=0)
-                return FakeCardList([
-                    FakeScope({
-                        "[data-hook=reviewTitle]": FakeTextLocator(text="Works great"),
-                        "[data-hook=review-date]": FakeTextLocator(
-                            text="Reviewed in the United States on March 2, 2024"
-                        ),
-                        "[data-hook=reviewRichContentContainer]": FakeTextLocator(
-                            text=f"Reviewer number {self._n} had a fine time with it."
-                        ),
-                        ".a-profile-name": FakeTextLocator(text=f"Dana {self._n}"),
-                    })
-                ])
-
-            def goto(self, *_a, **_kw):
-                self._n += 1
-
-        got, walk = scrape_reviews(Page(), "B0TEST00001", pages=3)
-        self.assertEqual(len(got), 4)
+        got, walk = scrape_reviews(
+            FakeListingPage(available=40, batch=10, on_product_page=2, ids=False),
+            "B0TEST00001",
+            pages=3,
+        )
+        self.assertEqual(len(got), 30)
         self.assertEqual(walk, "complete")
+
+
 class FakeTextPage:
     """Selector -> raw inner_text, for exercising `text()`'s fallback chain.
 
@@ -1648,6 +1816,66 @@ class RealMarkupSellerTest(unittest.TestCase):
         page = DomPage.from_fixture("buybox_third_party.html")
         got = text(page, "#merchant-info", "#tabular-buybox")
         self.assertIn("Amazon Resale", got or "")
+
+
+class RealMarkupReviewListingTest(unittest.TestCase):
+    """The review card chain and the pagination control, against markup
+    captured from /product-reviews/B09BJMY8HL.
+
+    Two cards and the pagination bar, pruned and scrubbed of account ids; the
+    nesting is exactly as Amazon served it. That nesting is the whole claim
+    here — both defects this fixture pins are defects of structure, and the
+    hand-written fakes match selector strings rather than resolve them, so
+    neither could have caught either one.
+    """
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        self.page = DomPage.from_fixture("review_listing.html")
+
+    def test_titles_come_back_as_titles_and_not_as_star_ratings(self):
+        cards = scrape_review_cards(self.page)
+        self.assertEqual(len(cards), 2)
+        self.assertEqual(
+            cards[0]["title"], "Great machine, strong airflow, good looking, has digital monitor"
+        )
+        for c in cards:
+            self.assertNotIn("out of 5 stars", c["title"] or "")
+
+    def test_the_pre_fix_selector_reads_the_hidden_star_span_instead(self):
+        # The regression from the other side. `.a-icon-alt` is the last child of
+        # the `<i>` that opens the title anchor, so the descendant form matches
+        # it and `text()` takes the first match in document order. Every title
+        # became "5.0 out of 5 stars", which `strip_star_prefix` then emptied —
+        # the field read as absent, so nothing downstream complained.
+        card = self.page.locator(REVIEW_CARDS).first
+        self.assertEqual(
+            text(card, "[data-hook=review-title] span:last-child"), "5.0 out of 5 stars"
+        )
+        self.assertIsNone(
+            strip_star_prefix(text(card, "[data-hook=review-title] span:last-child"))
+        )
+
+    def test_the_rest_of_the_card_reads_off_the_real_markup(self):
+        first = scrape_review_cards(self.page)[0]
+        self.assertEqual(first["id"], "R345KXW6QR4S6U")
+        self.assertEqual(first["rating"], 5.0)
+        self.assertEqual(first["date"], "2026-07-18")
+        self.assertEqual(first["author"], "Mike M")
+        self.assertTrue(first["verified"])
+        self.assertIn("right out of the box", first["body"] or "")
+
+    def test_the_offset_skips_the_cards_already_read(self):
+        self.assertEqual(len(scrape_review_cards(self.page, start=1)), 1)
+        self.assertEqual(len(scrape_review_cards(self.page, start=99)), 0)
+
+    def test_the_show_more_button_is_the_only_pagination_the_page_offers(self):
+        # The fact the URL walk was built on the absence of: this listing ships
+        # no numbered pager at all, so there was never a page 2 link to follow.
+        self.assertEqual(self.page.locator(SHOW_MORE_BUTTON).count(), 1)
+        self.assertEqual(self.page.locator(".a-pagination").count(), 0)
+        self.assertEqual(self.page.locator("li.a-last a").count(), 0)
 
 
 class DomFakeFidelityTest(unittest.TestCase):

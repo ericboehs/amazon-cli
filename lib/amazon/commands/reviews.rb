@@ -113,8 +113,9 @@ module Amazon
           product-match check (needs 25 with text). Use --pages for those.
 
           Options:
-            --pages N    Also walk N pages of the full review listing (~10 each,
-                         max #{MAX_PAGES}). One extra page load each; default 0
+            --pages N    Also read N batches of the full review listing (~10
+                         reviews each, max #{MAX_PAGES}). One page load plus one
+                         "show more" click per batch after it; default 0
             --sort S     helpful (default) or recent — applies to --pages.
                          recent orders the sample by date, so the timing check
                          cannot be run on it

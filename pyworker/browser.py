@@ -46,6 +46,17 @@ class Blocked(RuntimeError):
     """Raised when Amazon serves a captcha / robot check instead of the page."""
 
 
+class NoProduct(RuntimeError):
+    """Raised when an ASIN resolves to no product page — a 404 or a redirect.
+
+    Its own class, not a bare RuntimeError, because a mistyped ASIN is a user
+    error with a one-line answer, and the generic handler treats every
+    RuntimeError as a crash: it prints the traceback to stderr, and the CLI
+    then prefixes the message with "live lookup failed" and staples the last
+    seven stderr lines underneath. All of that is diagnostics for a bug in us,
+    shown to someone whose only problem is a typo."""
+
+
 def emit(event: str, **fields: Any) -> None:
     sys.stdout.write(json.dumps({"event": event, **fields}) + "\n")
     sys.stdout.flush()

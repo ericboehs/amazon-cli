@@ -80,8 +80,8 @@ module Amazon
     # the saved session is missing, has expired, or Amazon serves a captcha.
     #
     # `reviews:` folds the rating histogram and the product page's own review
-    # block into the same page load. `review_pages:` walks /product-reviews/ for
-    # more, at one page load each.
+    # block into the same page load. `review_pages:` opens /product-reviews/ and
+    # expands it, one "show 10 more reviews" click per page past the first.
     def item(asin, reviews: false, review_pages: 0, sort: "helpful")
       data = nil
       request = { action: "item", asin: asin }
@@ -261,10 +261,17 @@ module Amazon
       warn(trace.lines.map { |l| "[worker:trace] #{l.chomp}" }.join("\n"))
     end
 
+    # Kinds the worker names on purpose. Their messages are written for the
+    # person reading them and already say what to do, so they pass through
+    # whole; anything else is an exception class we didn't anticipate, and the
+    # prefix is there to say so.
+    NAMED_LIVE_FAILURES = %w[not_logged_in blocked no_product].freeze
+
     def live_error(event)
-      case event["kind"]
-      when "not_logged_in", "blocked" then event["msg"]
-      else "live lookup failed: #{event["msg"]}"
+      if NAMED_LIVE_FAILURES.include?(event["kind"])
+        event["msg"]
+      else
+        "live lookup failed: #{event["msg"]}"
       end
     end
 
