@@ -497,6 +497,16 @@ class GuardTest(unittest.TestCase):
         with self.assertRaises(NotLoggedIn):
             guard(FakePage(url="https://www.amazon.com/ap/signin?openid.return_to=x"))
 
+    def test_a_verify_its_you_challenge_is_a_dead_session_not_a_product(self):
+        # Spelled out as a literal rather than looped over SIGNIN_URLS, because
+        # this path was added to that tuple for `login.py`'s benefit and it
+        # changes what `sync` does too: without it, `guard()` waves the challenge
+        # page through and the extractors scrape it, so an expired session
+        # surfaces as a product with every field empty instead of "run: amazon
+        # login". A loop over the constant would assert nothing about that.
+        with self.assertRaises(NotLoggedIn):
+            guard(FakePage(url="https://www.amazon.com/ap/challenge?arb=1"))
+
 
 class SigninPageTest(unittest.TestCase):
     def test_product_page_is_not_signin(self):

@@ -90,7 +90,12 @@ CAPTCHA_MARKERS = (
 # Amazon redirects here when the saved cookies have expired. The storage-state
 # file still exists on disk, so its presence alone proves nothing — without this
 # check an expired session surfaces as "no product found for <ASIN>".
-SIGNIN_URLS = ("/ap/signin", "/ap/cvf", "/ap/mfa")
+# `/ap/challenge` is the "verify it's you" step. It belongs here for the same
+# reason the others do, and `login.py` imports this tuple rather than keeping a
+# second list: when login's idea of a sign-in page and `guard()`'s disagree,
+# login saves cookies that sync then rejects — the exact failure both are
+# written to prevent.
+SIGNIN_URLS = ("/ap/signin", "/ap/cvf", "/ap/mfa", "/ap/challenge")
 SIGNIN_MARKERS = ("#ap_email", "#ap_password", "form[name='signIn']")
 
 
