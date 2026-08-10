@@ -11,9 +11,26 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
+
+# Amazon inlines <style> blocks inside content containers — #availability_feature_div
+# ships one — and Playwright's inner_text hands back their source as text.
+#
+# Both anchors here exist to stop a rule reaching backwards into the copy above
+# it. "Ships from Amazon.com" contains `.com`, which is indistinguishable from a
+# class selector, so requiring only "selector token ... braced body" let a match
+# start at `.com` and run forward to the next real rule, deleting every word in
+# between: the seller line came back as "Ships from Amazon". Hence `^[ \t]*` —
+# a rule begins its own line — and `[^{}\n]*`, which keeps the selector on the
+# same line as its opening brace.
+#
+# The cost is a selector list split across lines (`.a,\n.b { }`) leaves `.a,`
+# behind. That is the right way to be wrong: the residue is visibly junk, while
+# the alternative silently eats real text.
+CSS_RULE_RE = re.compile(r"(?m)^[ \t]*[.#][\w-]+[^{}\n]*\{[^{}]*\}")
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -148,12 +165,46 @@ def text(scope: Any, *selectors: str) -> str | None:
             loc = scope.locator(sel).first
             if loc.count() == 0:
                 continue
-            val = " ".join(loc.inner_text().split())
+            val = clean_text(without_style_nodes(loc, loc.inner_text()))
             if val:
                 return val
         except Exception:  # noqa: BLE001
             continue
     return None
+
+
+def without_style_nodes(loc: Any, raw: str) -> str:
+    """Remove the text of any <style>/<script> the container carried.
+
+    `innerText` normally excludes both — the UA stylesheet gives them
+    `display: none` — but only for an element that is *being rendered*. Amazon's
+    `#availability_feature_div` has no layout box (verified against a live page:
+    `getClientRects().length === 0` while its own `<style>` children compute to
+    `display: none`), and for an unrendered element `innerText` is specified to
+    fall back to `textContent`, which carries the stylesheet source through
+    verbatim. That, not any exotic markup, is where the CSS in the output came
+    from.
+
+    Subtracting the style nodes' own `textContent` removes exactly what leaked
+    and nothing else, which is why this is preferred over pattern-matching the
+    result: a regex has to guess what CSS looks like, and every shape it guesses
+    wrong is either product copy deleted or a rule printed to the user.
+    """
+    for css in loc.locator("style, script").all_text_contents():
+        if css:
+            raw = raw.replace(css, " ")
+    return raw
+
+
+def clean_text(raw: str | None) -> str:
+    """Collapse whitespace and drop any inlined CSS the container carried.
+
+    Without this, "Only 4 left in stock - order soon." comes back with a style
+    rule stapled to it, and it reads as scraper output nobody checked.
+    """
+    if not raw:
+        return ""
+    return " ".join(CSS_RULE_RE.sub(" ", raw).split())
 
 
 def attr(scope: Any, selector: str, name: str) -> str | None:

@@ -101,6 +101,80 @@ STAR_PREFIX_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s+out of\s+\d+(?:\.\d+)?\s+stars
 SORT_KEYS = {"helpful": "helpful", "recent": "recent"}
 
 
+# Who is actually selling the thing in the buybox.
+#
+# The bug this replaces: a new $599 item sold by Amazon.com was reported as
+# "Sold by Amazon Resale", pairing the new offer's price with the used offer's
+# seller, with nothing in the output hinting the two came from different offers.
+#
+# `#merchant-info` is not on this list, and scoping it to #buybox would not have
+# helped. Captured markup from two live listings (B0GJ5S4V78, B0DT8PV51T) shows
+# the element nested #buybox > #buyBoxAccordion > #usedAccordionRow >
+# #shipsFromSoldBy_feature_div > #merchant-info — it is *inside* the buybox and
+# it belongs to the used offer, on both. On a third listing (B08626WF87) it does
+# not exist at all. So on the evidence available it is never the featured
+# offer's seller, and `test_no_selector_in_the_chain_matches_the_used_offer_block`
+# holds the line.
+#
+# `#sellerProfileTriggerId` is gone for a different reason: it is the "Learn more
+# about the seller" link, and its text is that boilerplate, not a seller name.
+# It is present and reads exactly that on B0DT8PV51T.
+#
+# What is left is two selectors sharing one ancestor, which is thin cover if
+# Amazon renames #buybox. That is deliberate — a fallback that confidently
+# returns the wrong seller is worse than no fallback — and it is why
+# `_missing_seller_warning` exists to say so out loud instead.
+#
+# Known gap: the tabular selector matched nothing on all three listings checked,
+# so it is carried on the strength of the layout existing, not on evidence that
+# this selector finds it. Reversing the order of these two is invisible to the
+# test suite for the same reason. If a tabular page turns up, capture it as a
+# third fixture; until then the first selector is doing all the work.
+SELLER_SELECTORS = (
+    "#buybox [offer-display-feature-name=desktop-merchant-info] .offer-display-feature-text-message",
+    "#buybox .tabular-buybox-text[tabular-attribute-name='Sold by']",
+)
+
+# Amazon's layouts disagree about whether the seller cell holds a name or a
+# sentence: the accordion rows above yield "Amazon.com", while the classic
+# `#merchant-info` block reads "Sold by Amazon Resale and Fulfilled by Amazon."
+# Two callers already assume a name — `formatter.rb` prints it after "Seller:",
+# and `web.rb`'s search does `i['seller'].to_s.downcase.include?(q)`, so a
+# search for "amazon" hits the sentence form and a search for "resale" hits
+# only the sentence form. Same seller, different answer, decided by which A/B
+# layout Amazon served that minute.
+#
+# Neither surviving selector produces the sentence shape on either captured
+# fixture — RealMarkupSellerTest pins both to bare names — so this is a guard
+# on a path nothing takes today. It is here because the shape is not something
+# a selector promises: `#merchant-info` was in this chain one commit ago, and
+# the tabular selector's shape has never been observed at all.
+SELLER_PREFIX_RE = re.compile(r"^(?:ships? from and sold by|sold by)\s+", re.I)
+SELLER_SUFFIX_RE = re.compile(r"\s+and (?:fulfill?ed|shipped) by\b.*$", re.I)
+
+# What a seller name should never still contain once those are stripped:
+# Amazon's own fulfilment wording, so a sentence we *didn't* recognize is
+# reported rather than stored as a name...
+SELLER_PROSE_RE = re.compile(r"\b(?:sold by|ships? from|fulfill?ed by|dispatched from)\b", re.I)
+# ...and CSS punctuation. `CSS_RULE_RE` deliberately leaves a visible selector
+# fragment behind rather than risk eating prose (see browser.py); this is what
+# turns that honest residue into something that actually gets reported.
+SELLER_JUNK_RE = re.compile(r"[{}]|^[.#][\w-]")
+
+
+def normalize_seller(raw: str | None) -> str | None:
+    """Reduce whatever the seller cell held to a bare merchant name.
+
+    Returns None, not "", for nothing at all: `text()` returns None for a chain
+    that matched nothing and `_missing_seller_warning` keys off exactly that.
+    """
+    if not raw:
+        return None
+    val = SELLER_SUFFIX_RE.sub("", SELLER_PREFIX_RE.sub("", raw.strip())).strip()
+    # The trailing period belongs to the sentence, not to the name.
+    return val.rstrip(".").strip() or None
+
+
 def extract_asin(raw: str) -> str | None:
     """Accept a bare ASIN, a /dp/ URL, or a /gp/product/ URL.
 
@@ -493,12 +567,26 @@ def scrape_item(
     if not title:
         raise RuntimeError(f"no product found for {asin} (page may be a 404 or a redirect)")
 
+    # The featured offer's row comes first, for the same reason the seller does.
+    # On an accordion listing `#corePrice_feature_div` exists once per row, so
+    # the unscoped selector below matches the used offer's price too — measured
+    # on both fixtures: 2 matches, the second being $563.36 against a $599.00
+    # buybox. Today `.first` returns the right one only because the new row
+    # precedes the used row in the document, and which row Amazon features is
+    # not ours to assume. Getting this wrong prints the used offer's price in
+    # bold beside the new offer's seller, which is the defect this PR is named
+    # for with the two halves swapped.
     price_raw = text(
         page,
+        "[id^=newAccordionRow] .a-price .a-offscreen",
         "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
         "#corePrice_feature_div .a-price .a-offscreen",
         "#priceblock_ourprice",
         "#priceblock_dealprice",
+        # Last resort, and page-wide: it will match a "Buy it with" bundle or an
+        # accessory carousel on a listing whose buybox has no price at all.
+        # Kept because a listing with no buybox still has a price worth showing,
+        # and narrowed to the buybox first by everything above it.
         ".a-price .a-offscreen",
     )
     list_raw = text(
@@ -535,7 +623,7 @@ def scrape_item(
         "delivery_raw": delivery_raw,
         "delivery_date": parse_delivery_date(delivery_raw or fastest_raw),
         "fastest_raw": fastest_raw,
-        "seller": text(page, "#sellerProfileTriggerId", "#merchant-info", "#tabular-buybox"),
+        "seller": normalize_seller(text(page, *SELLER_SELECTORS)),
         "rating": _first_float(rating_raw),
         "reviews": _review_count(reviews_raw),
         "coupon": text(page, "#promoPriceBlockMessage_feature_div", "#couponFeature"),
@@ -679,9 +767,67 @@ def _selector_rot_warning(data: dict[str, Any]) -> str | None:
     )
 
 
+def _missing_seller_warning(data: dict[str, Any]) -> str | None:
+    """Say so when the seller chain came back empty off a page that has a buybox.
+
+    `_selector_rot_warning` cannot cover this one. It needs three of six fields
+    to fail before it speaks, and every selector in `SELLER_SELECTORS` is rooted
+    at `#buybox` while the other five chains are not — so a rename of that one
+    container empties exactly one field, scores 1/6, and passes in silence. The
+    user then gets a card with price, stock, delivery, rating and image all
+    filled in and simply no Seller line, which is indistinguishable from a
+    listing that legitimately has no seller to show.
+
+    A buybox price is the evidence that rules that out: something is being
+    offered, so somebody is offering it. Deliberately not folded into the
+    threshold — a correlated chain needs its own check, not a larger bucket.
+    """
+    if data.get("seller") or not data.get("price"):
+        return None
+    return (
+        "read a price from the buybox but no seller — the #buybox seller selectors "
+        "may have changed; treat the seller as unknown rather than as absent"
+    )
+
+
+def _seller_shape_warning(data: dict[str, Any]) -> str | None:
+    """Say so when the seller came back as something other than a name.
+
+    The other half of `_missing_seller_warning`: that one covers a chain that
+    matched nothing, this one covers a chain that matched the wrong thing. A
+    non-empty field passes every check we have — the rot threshold counts it as
+    present — so a selector that starts returning its container instead of its
+    cell says nothing at all, and the user reads the result as an answer. This
+    repo has already shipped a seller field that was confidently wrong once.
+    """
+    seller = data.get("seller")
+    if not seller:
+        return None
+    if not SELLER_PROSE_RE.search(seller) and not SELLER_JUNK_RE.search(seller):
+        return None
+    return (
+        f"the seller field does not look like a seller name ({seller!r}) — a "
+        "#buybox selector may now be matching a container rather than the "
+        "merchant cell; treat it as unverified"
+    )
+
+
+# Order is the order they're reported in, live and from cache alike.
+_WARNING_CHECKS = (_selector_rot_warning, _missing_seller_warning, _seller_shape_warning)
+
+
+def _warnings(data: dict[str, Any]) -> list[str]:
+    """Every rot signal the finished payload carries.
+
+    One list read by both the live emitter and `degradations`, so the warning
+    printed while the scrape runs and the one replayed out of the cache cannot
+    drift apart — before this they were two hand-maintained tuples.
+    """
+    return [msg for check in _WARNING_CHECKS if (msg := check(data))]
+
+
 def _warn_selector_rot(data: dict[str, Any]) -> None:
-    msg = _selector_rot_warning(data)
-    if msg:
+    for msg in _warnings(data):
         emit("log", level="warn", msg=msg)
 
 
@@ -699,10 +845,7 @@ def degradations(data: dict[str, Any]) -> list[str]:
     the same string that was emitted, from the same function, so the live
     warning and the replayed one can't drift apart.
     """
-    out = []
-    rot = _selector_rot_warning(data)
-    if rot:
-        out.append(rot)
+    out = _warnings(data)
     # A table we only half-read, which is not the same as a listing with no
     # ratings — plenty of those exist, and calling them degraded cries wolf.
     histogram = data.get("histogram")
