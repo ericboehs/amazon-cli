@@ -49,6 +49,18 @@ BOUNCED = json.dumps({"session-id": "v", "session-id-time": "v"})
 FRESH = json.dumps({"x-main": "earned", "at-main": "earned", "session-id": "v"})
 
 
+
+# A skip reason a human reads only when confused about why a test did not
+# run, so it says how to make it run rather than asserting where it is.
+# "this is CI" was wrong the moment someone ran `uv run` from the repo
+# root: there is no pyproject.toml there, so uv builds an empty
+# environment and every one of these skips while the run reports OK.
+NO_DEPS = (
+    "{pkg} is not installed. The bare-interpreter CI job skips these by design; "
+    "to run them use pyworker/.venv/bin/python, or `uv run` from pyworker/ — "
+    "not from the repo root, which builds an empty env and skips silently."
+)
+
 def emitted(fn):
     """Run fn, returning the NDJSON events it wrote to stdout."""
     buf = io.StringIO()
@@ -574,7 +586,7 @@ class PackageAssumptionsTest(unittest.TestCase):
         try:
             import amazonorders  # noqa: F401
         except ImportError:
-            self.skipTest("amazon-orders is not installed (this is CI)")
+            self.skipTest(NO_DEPS.format(pkg="amazon-orders"))
 
     def test_the_cookie_we_key_on_is_the_one_amazon_orders_keys_on(self):
         # `auth_cookies_stored()` walks this list; whatever is in it is what
