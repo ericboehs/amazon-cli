@@ -44,6 +44,7 @@ from live import (
     _review_count,
     _review_id,
     _warn_selector_rot,
+    _warn_tabular_seller,
     degradations,
 )
 
@@ -323,6 +324,29 @@ class MissingSellerWarningTest(unittest.TestCase):
             "no seller",
             " ".join(degradations(data)),
         )
+
+
+class TabularSellerWarningTest(unittest.TestCase):
+    """The known gap in SELLER_SELECTORS, made self-reporting.
+
+    The second selector has never matched anything on any listing checked, so
+    the comment recording that would stay true-or-not forever. This is the
+    observation that settles it, the first time a real page produces one.
+    """
+
+    def test_the_tabular_selector_answering_is_announced(self):
+        msgs = [e["msg"] for e in emitted(lambda: _warn_tabular_seller(SELLER_SELECTORS[1]))]
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("tabular buybox selector", msgs[0])
+        self.assertIn("capturing this listing as a fixture", msgs[0])
+
+    def test_the_verified_selector_answering_is_not_news(self):
+        self.assertEqual(emitted(lambda: _warn_tabular_seller(SELLER_SELECTORS[0])), [])
+
+    def test_no_seller_at_all_is_not_this_warnings_business(self):
+        # _missing_seller_warning covers that case; two warnings for one event
+        # would teach the user to skim past both.
+        self.assertEqual(emitted(lambda: _warn_tabular_seller(None)), [])
 
 
 class NormalizeSellerTest(unittest.TestCase):
@@ -1157,6 +1181,31 @@ class FakeTextPage:
         if found is None:
             return FakeTextLocator(count=0)
         return FakeTextLocator(count=1, text=found)
+
+
+class TextFromTest(unittest.TestCase):
+    """`text_from` has to name the selector that answered, not just the value."""
+
+    PAGE = FakeTextPage(
+        {
+            "#first": "",
+            "#second": "  Amazon.com  ",
+            "#third": "Never reached",
+        }
+    )
+
+    def test_it_reports_the_selector_that_produced_the_value(self):
+        val, sel = browser.text_from(self.PAGE, "#missing", "#first", "#second", "#third")
+        self.assertEqual(val, "Amazon.com")
+        self.assertEqual(sel, "#second")
+
+    def test_a_chain_that_matched_nothing_names_no_selector(self):
+        # Not ("", "") — a caller keying off the selector has to be able to tell
+        # "nothing matched" from "the first one did".
+        self.assertEqual(browser.text_from(self.PAGE, "#missing", "#first"), (None, None))
+
+    def test_text_still_returns_just_the_value(self):
+        self.assertEqual(text(self.PAGE, "#missing", "#second"), "Amazon.com")
 
 
 class CleanTextTest(unittest.TestCase):

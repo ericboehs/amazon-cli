@@ -44,6 +44,7 @@ from browser import (
     new_context,
     parse_money,
     text,
+    text_from,
 )
 
 # The URL path is authoritative. Matching a bare token anywhere in the input
@@ -130,6 +131,12 @@ SORT_KEYS = {"helpful": "helpful", "recent": "recent"}
 # this selector finds it. Reversing the order of these two is invisible to the
 # test suite for the same reason. If a tabular page turns up, capture it as a
 # third fixture; until then the first selector is doing all the work.
+#
+# Rather than leave that recorded only here — where it would stay unknown
+# forever, which is the sort of unverifiable claim this chain has already cost
+# us once — `_warn_tabular_seller` says so the first time it actually answers.
+# A user hitting a tabular page closes the gap with a real observation; never
+# hearing it is an answer too. Either beats three samples and a comment.
 SELLER_SELECTORS = (
     "#buybox [offer-display-feature-name=desktop-merchant-info] .offer-display-feature-text-message",
     "#buybox .tabular-buybox-text[tabular-attribute-name='Sold by']",
@@ -160,6 +167,26 @@ SELLER_PROSE_RE = re.compile(r"\b(?:sold by|ships? from|fulfill?ed by|dispatched
 # fragment behind rather than risk eating prose (see browser.py); this is what
 # turns that honest residue into something that actually gets reported.
 SELLER_JUNK_RE = re.compile(r"[{}]|^[.#][\w-]")
+
+
+def _warn_tabular_seller(selector: str | None) -> None:
+    """Report the one time the tabular selector earns its place in the chain.
+
+    Not a degradation — the scrape came back whole, and the value is as good as
+    any other. It goes out as a warn because it is the only evidence that will
+    ever settle whether that selector works, and a listing that produces it is
+    worth capturing as a third fixture.
+    """
+    if selector != SELLER_SELECTORS[1]:
+        return
+    emit(
+        "log",
+        level="warn",
+        msg=(
+            "seller resolved via the tabular buybox selector — an A/B layout "
+            "the fixtures don't cover. Worth capturing this listing as a fixture."
+        ),
+    )
 
 
 def normalize_seller(raw: str | None) -> str | None:
@@ -608,6 +635,8 @@ def scrape_item(
     )
     rating_raw = text(page, "#acrPopover", "[data-hook=rating-out-of-text]")
     reviews_raw = text(page, "#acrCustomerReviewText")
+    seller_raw, seller_selector = text_from(page, *SELLER_SELECTORS)
+    _warn_tabular_seller(seller_selector)
 
     price = parse_money(price_raw)
     list_price = parse_money(list_raw)
@@ -623,7 +652,7 @@ def scrape_item(
         "delivery_raw": delivery_raw,
         "delivery_date": parse_delivery_date(delivery_raw or fastest_raw),
         "fastest_raw": fastest_raw,
-        "seller": normalize_seller(text(page, *SELLER_SELECTORS)),
+        "seller": normalize_seller(seller_raw),
         "rating": _first_float(rating_raw),
         "reviews": _review_count(reviews_raw),
         "coupon": text(page, "#promoPriceBlockMessage_feature_div", "#couponFeature"),
