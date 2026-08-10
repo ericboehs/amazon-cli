@@ -160,6 +160,17 @@ def text(scope: Any, *selectors: str) -> str | None:
     Product-page markup is heavily A/B tested, so every field is looked up
     through several candidate selectors rather than one brittle path.
     """
+    return text_from(scope, *selectors)[0]
+
+
+def text_from(scope: Any, *selectors: str) -> tuple[str | None, str | None]:
+    """`text`, plus which selector produced the value.
+
+    Split out so a caller can tell a fallback firing from the first candidate
+    working. Several entries in these chains are carried on the strength of a
+    layout existing rather than on evidence that the selector finds it, and
+    which one answered is the only evidence that ever settles that.
+    """
     for sel in selectors:
         try:
             loc = scope.locator(sel).first
@@ -167,10 +178,10 @@ def text(scope: Any, *selectors: str) -> str | None:
                 continue
             val = clean_text(without_style_nodes(loc, loc.inner_text()))
             if val:
-                return val
+                return val, sel
         except Exception:  # noqa: BLE001
             continue
-    return None
+    return None, None
 
 
 def without_style_nodes(loc: Any, raw: str) -> str:
