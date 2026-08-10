@@ -4,11 +4,14 @@ Only the pure decision functions are covered — the browser flow around them
 needs a real Chrome window and a human, and is verified by running it.
 """
 
+import io
+import json
 import os
 import stat
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,7 +21,9 @@ from login import (  # noqa: E402
     ORDERS_URL,
     describe_state,
     is_signin_url,
+    marker_counts,
     order_access_ok,
+    report_markers,
     poll_state,
     resolve_cookies,
     should_prefill_email,
@@ -419,14 +424,93 @@ class WritePrivateTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
 
+def emitted(fn):
+    """Run `fn`, returning the JSON events it wrote to stdout."""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        fn()
+    return [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+
+
+class FakeMarkerPage:
+    """selector -> match count. Unlisted selectors match nothing."""
+
+    def __init__(self, counts):
+        self._counts = counts
+
+    def locator(self, sel):
+        return FakeMarkerLocator(self._counts.get(sel, 0))
+
+
+class FakeMarkerLocator:
+    def __init__(self, n):
+        self._n = n
+
+    def count(self):
+        return self._n
+
+
+class MarkerReportTest(unittest.TestCase):
+    """The gate has to say which marker carried it.
+
+    `amazon login` is the only probe in this repo that runs against a real
+    signed-in account every time, so it is the one place a selector list can be
+    measured instead of argued about. Measured on 2026-08-10, one of the four
+    markers matched and three returned zero — a list that reads as defense in
+    depth and is currently a single point of failure. The report is what stops
+    the next reading of that coming from a stale comment.
+    """
+
+    # The live measurement, verbatim.
+    LIVE = {
+        ".order-card, .js-order-card": 10,
+        "[data-component=orderCard]": 0,
+        "#ordersContainer": 0,
+        "#your-orders-content": 0,
+    }
+
+    def test_counts_are_reported_per_selector(self):
+        got = marker_counts(FakeMarkerPage(self.LIVE))
+        self.assertEqual(got, self.LIVE)
+        # Every marker gets a key, including the ones that matched nothing —
+        # a report that only listed hits could not distinguish "three are dead"
+        # from "three were never probed".
+        self.assertEqual(set(got), set(ORDER_MARKERS))
+
+    def test_the_report_names_the_markers_that_matched(self):
+        msgs = [e["msg"] for e in emitted(lambda: report_markers(self.LIVE))]
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("1 of 4 markers", msgs[0])
+        self.assertIn(".order-card, .js-order-card (10)", msgs[0])
+
+    def test_the_report_does_not_list_markers_that_matched_nothing(self):
+        # Naming them would read as though they contributed. The count in
+        # "1 of 4" is what says three did not.
+        msg = [e["msg"] for e in emitted(lambda: report_markers(self.LIVE))][0]
+        for dead in ("[data-component=orderCard]", "#ordersContainer", "#your-orders-content"):
+            self.assertNotIn(dead, msg)
+
+    def test_a_layout_where_more_markers_render_says_so(self):
+        # The point of reporting rather than asserting: another account, or
+        # Amazon next month, is allowed to disagree with the measurement above.
+        counts = dict(self.LIVE, **{"#ordersContainer": 1})
+        msg = [e["msg"] for e in emitted(lambda: report_markers(counts))][0]
+        self.assertIn("2 of 4 markers", msg)
+        self.assertIn("#ordersContainer (1)", msg)
+
+
 class OrderMarkersTest(unittest.TestCase):
-    def test_an_account_with_no_orders_can_still_be_verified(self):
-        # The contract `order_access_ok` documents and depends on. Every other
-        # marker is a card, so a brand-new account with an empty order list
-        # would count zero of them and time out at ten minutes having been
-        # signed in the whole time. `#your-orders-content` is the page
-        # container: it renders empty, which is what separates "your list is
-        # empty" from "you can't see your list".
+    def test_the_empty_account_container_is_still_in_the_list(self):
+        # This used to assert a working contract: `#your-orders-content` is the
+        # page container, so a brand-new account with no orders would match it
+        # and pass. Measured on a live orders page on 2026-08-10 it matched
+        # zero times, with ten orders on the page — so it is not rendering at
+        # all, and an empty account times out at ten minutes today.
+        #
+        # Kept in the list, and kept asserted, because removing it would delete
+        # the only record that the empty-account case is meant to be covered.
+        # Closing it needs the real container id off a live empty account;
+        # guessing one here is how the original claim got made.
         self.assertIn("#your-orders-content", ORDER_MARKERS)
 
     def test_the_card_selectors_are_not_the_container(self):

@@ -86,6 +86,27 @@ IDLE_PATHS = ("", "/", "/gp/css/homepage.html", "/gp/css/homepage")
 # Markers that the order list itself rendered. Several, because this layout is
 # A/B tested like the rest of the site and a single miss here costs the user ten
 # minutes of silence followed by a timeout.
+#
+# Measured against a live signed-in account on 2026-08-10, on /your-orders/orders
+# with ten orders present:
+#
+#     10   .order-card, .js-order-card
+#      0   [data-component=orderCard]
+#      0   #ordersContainer
+#      0   #your-orders-content
+#
+# So this reads as defense in depth and is currently one selector with three
+# zeros behind it. The three are kept — an A/B layout that renders none of them
+# today may be what some other account gets, and a marker that matches nothing
+# costs a `count()` call — but they are recorded as unverified rather than left
+# to look like cover. `report_markers` prints which ones actually carried each
+# real login, so the next reading of this list comes from a measurement instead
+# of from this comment.
+#
+# Note what the zeros cost, because it is not symmetric with the seller chain in
+# `live.py`: this gate is what stands between a working login and a refused one,
+# so if `.order-card` goes the way the other three went, *every* login fails and
+# the fallbacks contribute nothing to stopping it.
 ORDER_MARKERS = (
     ".order-card, .js-order-card",
     "[data-component=orderCard]",
@@ -120,6 +141,30 @@ def is_order_history_url(url: str | None) -> bool:
     return bool(url) and any(p in url for p in ORDER_HISTORY_PATHS)
 
 
+def marker_counts(page: Any) -> dict[str, int]:
+    """Per-selector counts, so the gate can say which marker carried it."""
+    return {sel: page.locator(sel).count() for sel in ORDER_MARKERS}
+
+
+def report_markers(counts: dict[str, int]) -> None:
+    """Say which markers rendered, once, on the login that passed.
+
+    `amazon login` is the only probe in this repo that runs against a real
+    signed-in account every time it runs, which makes it the one place a
+    selector list can be measured in production rather than argued about. The
+    comment on `ORDER_MARKERS` is a reading of one account on one day; this is
+    the reading from whoever ran it last.
+    """
+    live = [sel for sel, n in counts.items() if n]
+    emit(
+        "log",
+        msg=(
+            f"order list confirmed by {len(live)} of {len(ORDER_MARKERS)} markers: "
+            + ", ".join(f"{sel} ({counts[sel]})" for sel in live)
+        ),
+    )
+
+
 def order_access_ok(url: str | None, order_cards: int) -> bool:
     """True only when order history actually rendered for this session.
 
@@ -139,9 +184,19 @@ def order_access_ok(url: str | None, order_cards: int) -> bool:
     opposite conclusion. It used to be accepted here on its own, which meant a
     signed-in homepage counted as proof of order access.
 
-    An account with no orders still passes: `#your-orders-content` is the page
-    container and renders empty, so "your order list is empty" is distinguished
-    from "you cannot see your order list" by the same probe.
+    An account with no orders was supposed to still pass, on the grounds that
+    `#your-orders-content` is the page *container* and renders empty — so "your
+    order list is empty" would be distinguished from "you cannot see your order
+    list" by the same probe. That is now known to be wrong: measured on a live
+    orders page with ten orders on it, `#your-orders-content` matched zero
+    times, so it cannot be the container that carries an empty account either.
+    The card selector was the only marker that fired.
+
+    So on today's markup an account with no orders times out at ten minutes
+    having been signed in the whole time. Left as a known gap rather than
+    guessed at: closing it needs the real container id from a live empty
+    account, and inventing a selector here would restore exactly the false
+    assurance this docstring just lost.
     """
     if not url or is_signin_url(url) or not is_order_history_url(url):
         return False
@@ -518,6 +573,9 @@ def main() -> int:
         # Requiring two consecutive passing ticks costs two seconds and removes
         # the only way this check can fire on a shell.
         streak = 0
+        # The counts from the tick that proved it, so the report names what
+        # actually rendered rather than re-probing a page that has moved on.
+        matched: dict[str, int] = {}
         last_error: str | None = None
         probe_failures = 0
         while time.time() < deadline:
@@ -548,12 +606,13 @@ def main() -> int:
                 # session was authenticating in the tab beside it. Nothing has to
                 # change about saving: `context.cookies()` is context-wide and
                 # already sees it.
-                proved = any(
-                    order_access_ok(
-                        p.url, sum(p.locator(sel).count() for sel in ORDER_MARKERS)
-                    )
-                    for p in open_pages
-                )
+                proved = False
+                for p in open_pages:
+                    counts = marker_counts(p)
+                    if order_access_ok(p.url, sum(counts.values())):
+                        proved = True
+                        matched = counts
+                        break
                 # Give the tab a few seconds to settle before steering it, so a
                 # redirect in flight isn't mistaken for an idle page.
                 # `last_state` is `poll_state`'s pick, so a sign-in tab anywhere
@@ -586,6 +645,7 @@ def main() -> int:
             streak = streak + 1 if proved else 0
             if streak >= 2:
                 authenticated = True
+                report_markers(matched)
                 break
             time.sleep(2)
 
