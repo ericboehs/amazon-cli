@@ -36,6 +36,7 @@ from fetch import (  # noqa: E402
     jar_regressed,
     jar_without_auth,
     restore_jar,
+    split_known,
     write_jar,
 )
 
@@ -970,6 +971,48 @@ class WorkerRunTest(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(cookies.read_text())["x-main"], "earned")
+
+
+class SplitKnownTest(unittest.TestCase):
+    """The `total` event's numbers, and the names `worker.rb` reads them by.
+
+    The bug this comes from: a year where Amazon listed 206 orders and all 206
+    were already stored printed the same sentence as a year Amazon listed
+    nothing. The two cases are the first two tests here, and the third is the
+    one that matters — they must not produce equal payloads.
+    """
+
+    def test_a_fully_cached_year(self):
+        _, totals = split_known([FakeOrder("A"), FakeOrder("B")], {"A", "B"})
+        self.assertEqual(totals, {"listed": 2, "new": 0, "cached": 2})
+
+    def test_a_year_amazon_listed_nothing_for(self):
+        _, totals = split_known([], {"A", "B"})
+        self.assertEqual(totals, {"listed": 0, "new": 0, "cached": 0})
+
+    def test_the_two_zeros_are_distinguishable(self):
+        _, cached = split_known([FakeOrder("A"), FakeOrder("B")], {"A", "B"})
+        _, empty = split_known([], set())
+        self.assertEqual(cached["new"], empty["new"], "both are zero-new — that was the trap")
+        self.assertNotEqual(cached, empty)
+
+    def test_a_partly_new_year_splits_and_preserves_order(self):
+        new_orders, totals = split_known([FakeOrder("A"), FakeOrder("B"), FakeOrder("C")], {"B"})
+        self.assertEqual([o.order_number for o in new_orders], ["A", "C"])
+        self.assertEqual(totals, {"listed": 3, "new": 2, "cached": 1})
+
+    def test_known_ids_we_did_not_list_do_not_go_negative(self):
+        # `cached` is derived from what was listed, not from the size of the
+        # known set — the store holds every year, the listing is only one.
+        _, totals = split_known([FakeOrder("A")], {"A", "B", "C", "D"})
+        self.assertEqual(totals, {"listed": 1, "new": 0, "cached": 1})
+
+    def test_the_key_names_are_the_ones_ruby_reads(self):
+        # `Worker::Progress#start` reads these three by name and nothing in
+        # either suite crosses the process boundary, so a rename here would
+        # otherwise fail no test anywhere.
+        _, totals = split_known([FakeOrder("A")], set())
+        self.assertEqual(sorted(totals), ["cached", "listed", "new"])
 
 
 if __name__ == "__main__":

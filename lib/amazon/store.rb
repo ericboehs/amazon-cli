@@ -81,6 +81,25 @@ module Amazon
       JSON.parse(File.read(path))
     end
 
+    # What a query was drawn from, so an empty result can say which of the two
+    # empties it is. "(no orders)" from an unsynced archive and "(no orders)"
+    # from a 222-order archive holding none for the year asked about are the
+    # same four words, and only the first one is fixed by syncing.
+    #
+    # `searched` is the count *after* the year filter, because that is the
+    # number actually looked at; `stored` is the whole archive. They differ
+    # exactly when a filter is doing the excluding, which is the case the
+    # caller most needs to name.
+    def scope(year: nil)
+      metas = index["orders"].values
+      {
+        stored: metas.size,
+        searched: year ? metas.count { |m| m["year"] == year } : metas.size,
+        years: metas.filter_map { |m| m["year"] }.uniq.sort,
+        year: year
+      }
+    end
+
     def list(year: nil, limit: nil)
       rows = index["orders"].map { |id, meta| meta.merge("order_id" => id) }
       rows = rows.select { |r| r["year"] == year } if year
