@@ -252,8 +252,12 @@ amazon item B0747R1M51 --reviews          # condensed: product detail + verdict
 ```
 
 The default costs no extra page load — the sample rides along on the same
-product page `amazon item` already fetches. `--pages N` (0–10) is what
-actually walks `/product-reviews/`, one request per page.
+product page `amazon item` already fetches. `--pages N` (0–10) is what opens
+`/product-reviews/`, which serves ten reviews and paginates by appending ten
+more each time its "Show 10 more reviews" button is clicked. So `--pages 10`
+samples up to ~100 reviews, one page load and nine clicks. There is no numbered
+pager on that listing and `?pageNumber=` is ignored, so a URL walk re-reads the
+first ten however many times you ask for.
 
 **What the score means.** Seven deterministic checks run over the sample:
 

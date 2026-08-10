@@ -1646,6 +1646,46 @@ class WorkerProtocolTest < Minitest::Test
     end
   end
 
+  # An unknown ASIN used to come back as a bare RuntimeError, which meant the
+  # traceback went to stderr and the CLI stapled its last seven lines under a
+  # "live lookup failed" prefix. What the user typed was a bad ASIN; what they
+  # read was a Python stack ending in `raise RuntimeError` inside scrape_item.
+  def test_a_missing_product_reads_as_a_bad_asin_not_a_crash
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: 'no product page for B0DEMO1234 — check the ASIN', kind: 'no_product'}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      err = assert_raises(Amazon::Worker::Error) { worker.item('B0DEMO1234') }
+      assert_equal 'no product page for B0DEMO1234 — check the ASIN', err.message
+      refute_includes err.message, 'live lookup failed'
+      refute_includes err.message, 'worker stderr'
+    end
+  end
+
+  def test_a_missing_product_does_not_drag_the_stderr_tail_along
+    # The other half of the same complaint. The tail is diagnostics for a bug
+    # in us; here the worker's own message is the whole diagnosis, and the
+    # traceback that used to fill this space was noise around it.
+    body = <<~SCRIPT
+      STDIN.gets
+      warn 'Traceback (most recent call last):'
+      warn '  File "live.py", line 595, in scrape_item'
+      puts({event: 'error', msg: 'no product page for B0DEMO1234 — check the ASIN', kind: 'no_product'}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      err = nil
+      capture_io_streams { err = assert_raises(Amazon::Worker::Error) { worker.item('B0DEMO1234') } }
+      # The tail still attaches when the worker wrote one — that behaviour is
+      # unchanged and load-bearing for real crashes. What changed is upstream:
+      # live.py raises NoProduct, which `main` routes past the handler that
+      # prints the traceback, so on the real path there is no tail to attach.
+      # See ScrapeItemMissingProductTest in the Python suite.
+      assert_includes err.message, 'no product page for B0DEMO1234'
+      refute_includes err.message, 'live lookup failed'
+    end
+  end
+
   def test_non_json_lines_are_skipped_and_always_logged
     body = <<~SCRIPT
       STDIN.gets
@@ -1800,7 +1840,20 @@ class WorkerHelpersTest < Minitest::Test
     w = Amazon::Worker.new
     assert_equal 'x', w.send(:live_error, 'kind' => 'not_logged_in', 'msg' => 'x')
     assert_equal 'x', w.send(:live_error, 'kind' => 'blocked', 'msg' => 'x')
+    # A mistyped ASIN is a user error, not a crash in us. It used to arrive as a
+    # bare RuntimeError, so it got the "live lookup failed" prefix, a traceback
+    # on stderr, and the last seven stderr lines stapled underneath — five lines
+    # of Python internals for a typo whose answer is the sentence itself.
+    assert_equal 'x', w.send(:live_error, 'kind' => 'no_product', 'msg' => 'x')
     assert_equal 'live lookup failed: x', w.send(:live_error, 'msg' => 'x')
+  end
+
+  def test_an_unknown_kind_still_gets_the_prefix
+    # The prefix is the tell that we did not anticipate this failure. A new
+    # kind added on the Python side without a matching entry here must keep it
+    # rather than pass an unvetted message off as advice.
+    w = Amazon::Worker.new
+    assert_equal 'live lookup failed: x', w.send(:live_error, 'kind' => 'brand_new', 'msg' => 'x')
   end
 end
 
