@@ -14,9 +14,9 @@ module Amazon
       @color = color
     end
 
-    def list(rows)
+    def list(rows, scope:)
       return puts(JSON.pretty_generate(rows)) if @json
-      return puts("(no orders — run `amazon sync`)") if rows.empty?
+      return puts(empty_note("orders", scope)) if rows.empty?
 
       headers = %w[date order_id total status]
       data = rows.map do |r|
@@ -94,7 +94,15 @@ module Amazon
       puts "  Coupon:    #{data["coupon"]}" if data["coupon"]
 
       purchases = data["purchases"] || []
-      return if purchases.empty?
+      if purchases.empty?
+        # Printing nothing here is a claim: "you have never bought this." On an
+        # archive that was never synced it means "nothing was checked", which is
+        # the opposite claim wearing the same silence. `purchases_searched` is
+        # the denominator, so say it out loud.
+        searched = data["purchases_searched"]
+        puts dim("  History:   #{purchase_note(searched)}") unless searched.nil?
+        return
+      end
 
       puts
       puts bold("You've bought this #{purchases.size}x")
@@ -181,9 +189,9 @@ module Amazon
       end
     end
 
-    def search(orders, query)
+    def search(orders, query, scope:)
       return puts(JSON.pretty_generate(orders)) if @json
-      return puts("(no matches for #{query.inspect})") if orders.empty?
+      return puts(empty_note("matches for #{query.inspect}", scope)) if orders.empty?
 
       orders.each do |o|
         items = o["items"] || []
@@ -195,6 +203,52 @@ module Amazon
     end
 
     private
+
+    # Every empty result in this file goes through here, because a zero is not
+    # self-explanatory: it can mean nothing was stored to look at, or that
+    # plenty was and a filter excluded all of it. The two need opposite
+    # remedies — one syncs, the other picks a different year — so the line has
+    # to name which happened rather than leaving the reader to guess.
+    #
+    # `scope:` is a required keyword on both callers rather than a nilable one,
+    # so "we didn't know what was searched" isn't a state this can be in. A
+    # default would have been a fallback no user could reach, kept alive only
+    # by the tests proving it worked.
+    def empty_note(subject, scope)
+      stored = scope[:stored].to_i
+      return "(no #{subject} — nothing stored yet; run `amazon order sync`)" if stored.zero?
+
+      year = scope[:year]
+      searched = scope[:searched].to_i
+      if year && searched.zero?
+        have = year_ranges(scope[:years])
+        return "(no #{subject} — nothing from #{year} among your " \
+               "#{plural(stored, "stored order")}#{have.empty? ? "" : "; stored years: #{have}"})"
+      end
+      "(no #{subject} — searched #{plural(searched, "stored order")}#{year ? " from #{year}" : ""})"
+    end
+
+    def purchase_note(searched)
+      n = searched.to_i
+      return "no local orders to check — run `amazon order sync`" if n.zero?
+      "not in your #{plural(n, "stored order")}"
+    end
+
+    def plural(n, word) = "#{comma(n)} #{word}#{"s" unless n == 1}"
+
+    # A real archive spans two decades, and nineteen comma-separated years is a
+    # wall the reader skips — which puts us back where we started, with a line
+    # that technically said what it searched and practically didn't. Contiguous
+    # runs collapse; gaps survive, because a missing year is the one thing here
+    # worth noticing.
+    def year_ranges(years)
+      sorted = Array(years).map(&:to_i).uniq.sort
+      return "" if sorted.empty?
+
+      sorted.slice_when { |a, b| b != a + 1 }
+            .map { |run| run.first == run.last ? run.first.to_s : "#{run.first}–#{run.last}" }
+            .join(", ")
+    end
 
     HIST_WIDTH = 24
 

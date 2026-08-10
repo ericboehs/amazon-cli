@@ -31,7 +31,7 @@ module Amazon
           Amazon::Config.load
           store = Amazon::Store.new
           hits = store.search(query, year: year)
-          Amazon::Formatter.new(json: @global.json).search(hits, query)
+          Amazon::Formatter.new(json: @global.json).search(hits, query, scope: store.scope(year: year))
           0
         end
       end

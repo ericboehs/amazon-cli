@@ -55,7 +55,11 @@ module Amazon
         cache.replay_degradations(data)
 
         store = Amazon::Store.new
-        data = data.merge("purchases" => store.purchases_by_asin[data["asin"]] || [])
+        # The denominator travels with the numerator: an empty `purchases` list
+        # says nothing on its own, and the formatter can't tell "never bought"
+        # from "never synced" without knowing how many orders were checked.
+        data = data.merge("purchases" => store.purchases_by_asin[data["asin"]] || [],
+                          "purchases_searched" => store.scope[:stored])
         formatter = Amazon::Formatter.new(json: @global.json)
         if reviews
           analysis = Amazon::Reviews.analyze(data)

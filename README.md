@@ -428,6 +428,44 @@ measured behaviour:
 The list is expected to grow. Add to it when you find the next one; the entry
 that helps is the one that says what the guard *looked* like it covered.
 
+### Zeros that don't say what they looked at
+
+Selector rot is this repo's loudest failure, and its quietest one is the same
+bug seen from the other side: a healthy zero and a broken zero print the same
+characters. `amazon order sync` reported `year 2026: 0 orders` for an account
+holding 222 of them, because the `total` event sent one number where three
+were needed — Amazon listed nothing, and everything Amazon listed was already
+on disk, arrived as the same `0`.
+
+The rule the CLI now follows is that no empty result is printed alone; it is
+printed next to what was searched to produce it. `(no orders)` became
+`(no orders — nothing from 1995 among your 4,257 stored orders; stored years:
+2008–2026)`, and silence about purchase history became either `not in your
+4,257 stored orders` or `no local orders to check`. The old line had a second
+tell worth noting: it advised running `amazon sync`, which is not a subcommand.
+Advice printed on a path nobody exercises rots the same way a selector does.
+
+Tests for this shape assert the *distinction*, not the wording — two runs that
+used to produce byte-identical output are asserted to differ
+(`refute_equal unsynced, filtered`). A wording assertion passes as soon as the
+substring appears anywhere; only the inequality fails when the two cases
+collapse back together, which is the actual bug.
+
+The `--json` path needs the denominator more than the terminal does, not less:
+a human might smell something off about `"purchases": []`, and a script acting
+on it unattended won't. `Formatter#item` dumps `data` wholesale, so
+`purchases_searched` reached JSON as a side effect of a `merge` in `item.rb` —
+true, but true by accident. That's the inverse of a guard that can't fail:
+not an assertion incapable of failing, but a contract with no assertion at
+all, and it is just as quiet. Stripping the key left every human-facing test
+green. `test_the_json_payload_carries_the_denominator_too` is what a future
+refactor now has to argue with.
+
+Where the ambiguity can be removed instead of documented, remove it.
+`Formatter#list` and `#search` take `scope:` as a required keyword, not a
+nilable one — the fallback it would otherwise need was reachable only from the
+tests proving it worked.
+
 ## License
 
 MIT. See [LICENSE](./LICENSE).

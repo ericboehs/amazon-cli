@@ -27,7 +27,7 @@ module Amazon
           Amazon::Config.load # ensures dirs exist via load
           store = Amazon::Store.new
           rows = store.list(year: year, limit: limit)
-          Amazon::Formatter.new(json: @global.json).list(rows)
+          Amazon::Formatter.new(json: @global.json).list(rows, scope: store.scope(year: year))
           0
         end
 

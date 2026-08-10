@@ -125,6 +125,11 @@ def seed_order!(order)
   store
 end
 
+# For formatter tests exercising a path other than the empty result. `scope:`
+# is required on the real signature, so there is no "unknown denominator" to
+# fall back to and every caller states one.
+EMPTY_SCOPE = { stored: 0, searched: 0, years: [], year: nil }.freeze
+
 SAMPLE_ORDER = {
   'order_id' => '111-0000000-0000001',
   'order_placed' => '2023-12-10',
@@ -289,7 +294,7 @@ class FormatterTest < Minitest::Test
   end
 
   def test_money_passes_through_non_numeric_strings
-    out, = capture_io_streams { fmt.list([{ 'date' => 'd', 'order_id' => 'X', 'total' => 'Not Available' }]) }
+    out, = capture_io_streams { fmt.list([{ 'date' => 'd', 'order_id' => 'X', 'total' => 'Not Available' }], scope: EMPTY_SCOPE) }
     assert_includes out, 'Not Available'
   end
 
@@ -300,10 +305,12 @@ class FormatterTest < Minitest::Test
   end
 
   def test_existing_order_formatters_still_work
-    out, = capture_io_streams { fmt.list([{ 'date' => '2023-01-01', 'order_id' => 'X', 'total' => 5.0 }]) }
+    out, = capture_io_streams do
+      fmt.list([{ 'date' => '2023-01-01', 'order_id' => 'X', 'total' => 5.0 }], scope: EMPTY_SCOPE)
+    end
     assert_includes out, 'order_id'
 
-    out, = capture_io_streams { fmt.list([]) }
+    out, = capture_io_streams { fmt.list([], scope: EMPTY_SCOPE) }
     assert_includes out, 'no orders'
 
     out, = capture_io_streams { fmt.show(SAMPLE_ORDER.dup) }
@@ -312,10 +319,10 @@ class FormatterTest < Minitest::Test
     out, = capture_io_streams { fmt.show(nil) }
     assert_includes out, '(not found)'
 
-    out, = capture_io_streams { fmt.search([SAMPLE_ORDER.dup], 'filament') }
+    out, = capture_io_streams { fmt.search([SAMPLE_ORDER.dup], 'filament', scope: EMPTY_SCOPE) }
     assert_includes out, '3D Pen Filament'
 
-    out, = capture_io_streams { fmt.search([], 'zzz') }
+    out, = capture_io_streams { fmt.search([], 'zzz', scope: EMPTY_SCOPE) }
     assert_includes out, 'no matches'
   end
 end
@@ -338,10 +345,10 @@ class FormatterEdgeCaseTest < Minitest::Test
   end
 
   def test_order_search_json_and_order_without_matching_item
-    out, = capture_io_streams { fmt(json: true).search([SAMPLE_ORDER.dup], 'q') }
+    out, = capture_io_streams { fmt(json: true).search([SAMPLE_ORDER.dup], 'q', scope: EMPTY_SCOPE) }
     assert_equal '111-0000000-0000001', JSON.parse(out).first['order_id']
 
-    out, = capture_io_streams { fmt.search([{ 'order_id' => 'X', 'items' => [] }], 'q') }
+    out, = capture_io_streams { fmt.search([{ 'order_id' => 'X', 'items' => [] }], 'q', scope: EMPTY_SCOPE) }
     assert_includes out, '(no items)'
   end
 
@@ -2239,13 +2246,6 @@ class SessionCookieTest < Minitest::Test
     File.write(@dir.join('storage_state.json'), JSON.generate('cookies' => 'nope'))
     refute authenticated?
   end
-end
-
-# --- Review analysis ---------------------------------------------------
-
-# A unique all-alphabetic token per index. Digits can't be used: they break
-# clauses and fall out of the word scanner, so "body 7" and "body 8" would
-# reduce to the same content words and read as duplicates.
 
   # sync.rb is filtered out of the coverage gate, so nothing here is graded and
   # this line went years without a test. It is also the *persistent* record — a
@@ -2271,6 +2271,13 @@ end
     assert_includes line, 'count=3  listed=10  known=7'
     assert_includes line, 'status=partial  error=boom second line'
   end
+end
+
+# --- Review analysis ---------------------------------------------------
+
+# A unique all-alphabetic token per index. Digits can't be used: they break
+# clauses and fall out of the word scanner, so "body 7" and "body 8" would
+# reduce to the same content words and read as duplicates.
 def tag(i) = "zz#{i.to_s.tr('0123456789', 'abcdefghij')}"
 
 # Builds review samples for the heuristics. Defaults describe a plausibly
@@ -3309,5 +3316,143 @@ class ItemWithReviewsTest < Minitest::Test
   def test_top_level_help_lists_the_command
     out, = capture_io_streams { Amazon::CLI.run(%w[help]) }
     assert_includes out, 'reviews'
+  end
+end
+
+# The `total` event's collapsed count was one instance of a shape that repeats
+# across the CLI: a zero printed without saying whether anything was looked at.
+# Every test here asserts the *distinction* rather than the wording — two runs
+# that used to print byte-identical output now don't.
+class EmptyResultsSayWhatWasSearchedTest < Minitest::Test
+  def setup
+    write_config!
+  end
+
+  def fmt = Amazon::Formatter.new(color: false)
+
+  def test_an_unsynced_archive_does_not_read_like_a_year_with_no_orders
+    reset_store!
+    unsynced, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[order list]) }
+
+    seed_order!(SAMPLE_ORDER.dup)
+    filtered, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[order list --year 1999]) }
+
+    assert_includes unsynced, 'nothing stored yet'
+    assert_includes unsynced, 'amazon order sync'
+    assert_includes filtered, 'nothing from 1999'
+    assert_includes filtered, '1 stored order'
+    assert_includes filtered, 'stored years: 2023'
+    refute_equal unsynced, filtered
+  end
+
+  def test_a_search_that_found_nothing_says_how_much_it_read
+    reset_store!
+    unsynced, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[order search filament]) }
+
+    seed_order!(SAMPLE_ORDER.dup)
+    searched, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[order search zzz]) }
+    filtered, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[order search filament --year 1999]) }
+
+    assert_includes unsynced, 'nothing stored yet'
+    assert_includes searched, 'searched 1 stored order'
+    assert_includes filtered, 'nothing from 1999'
+    # All three are "no matches". Nothing else about them may coincide.
+    [unsynced, searched, filtered].combination(2) do |a, b|
+      refute_equal a, b
+    end
+  end
+
+  # The advice was for a command that does not exist — `amazon sync` is not a
+  # subcommand, so the one actionable thing the old line said was also wrong.
+  def test_the_sync_advice_names_a_real_command
+    reset_store!
+    out, = capture_io_streams { Amazon::CLI.run(%w[order list]) }
+    advice = out[/`([^`]+)`/, 1]
+    refute_nil advice, "empty listing should suggest a command"
+
+    argv = advice.split.drop(1) # drop the "amazon" program name
+    _, err = capture_io_streams { Amazon::CLI.run(argv + ['--help']) }
+    refute_includes err, 'unknown', "`#{advice}` is not a real subcommand"
+  end
+
+  def test_never_bought_does_not_read_like_never_synced
+    never, = capture_io_streams do
+      fmt.item('asin' => 'B1', 'title' => 'T', 'purchases' => [], 'purchases_searched' => 222)
+    end
+    unsynced, = capture_io_streams do
+      fmt.item('asin' => 'B1', 'title' => 'T', 'purchases' => [], 'purchases_searched' => 0)
+    end
+
+    assert_includes never, 'not in your 222 stored orders'
+    assert_includes unsynced, 'amazon order sync'
+    refute_equal never, unsynced
+  end
+
+  # Threading the denominator through `item.rb` is the half that can rot
+  # silently: drop the merge and the formatter falls back to printing nothing,
+  # which is exactly the old behaviour and breaks no formatter test.
+  def test_the_item_command_passes_the_denominator_it_actually_has
+    reset_store!
+    unsynced, = with_worker(->(*) { FakeWorker.new }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[item B0747R1M51 --fresh]) }
+    end
+    assert_includes unsynced, 'no local orders to check'
+
+    seed_order!(SAMPLE_ORDER.merge('order_id' => '111-0000000-0000009',
+                                   'items' => [{ 'title' => 'Something else',
+                                                 'link' => '/dp/B00UNRELATED' }]))
+    stocked, = with_worker(->(*) { FakeWorker.new }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[item B0747R1M51 --fresh]) }
+    end
+    assert_includes stocked, 'not in your 1 stored order'
+    refute_equal unsynced, stocked
+  end
+
+  # Collapsing runs is what makes the line readable at two decades of history;
+  # a gap is the one thing in it worth reading, so it must survive collapsing.
+  def test_stored_years_collapse_to_runs_but_keep_their_gaps
+    reset_store!
+    store = Amazon::Store.new
+    %w[2019 2020 2021 2024].each_with_index do |y, i|
+      store.write_order(SAMPLE_ORDER.merge('order_id' => "111-0000000-000000#{i}",
+                                           'order_placed' => "#{y}-06-01"))
+    end
+    store.commit_index!
+
+    out, = capture_io_streams { Amazon::CLI.run(%w[order list --year 1995]) }
+    assert_includes out, 'stored years: 2019–2021, 2024'
+    assert_includes out, '4 stored orders'
+  end
+
+  # The denominator is a required argument, not a defaulted one: a caller that
+  # doesn't know what it searched can't print an empty result at all. This is
+  # the invariant living in the signature instead of in a runtime branch no
+  # user could reach.
+  def test_an_empty_result_cannot_be_printed_without_saying_what_was_searched
+    assert_raises(ArgumentError) { fmt.list([]) }
+    assert_raises(ArgumentError) { fmt.search([], 'zzz') }
+  end
+
+  # `item` dumps `data` wholesale in JSON mode, so the denominator reaches
+  # `--json` as a side effect of a `merge` in `item.rb`. That made it true by
+  # accident — a contract with no assertion at all, which is the inverse of a
+  # guard that can't fail and just as quiet. `"purchases": []` is worse for a
+  # script acting unattended than for a human who might smell something off.
+  def test_the_json_payload_carries_the_denominator_too
+    reset_store!
+    out, = with_worker(->(*) { FakeWorker.new }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[--json item B0747R1M51 --fresh]) }
+    end
+    payload = JSON.parse(out)
+    assert_equal [], payload['purchases']
+    assert_equal 0, payload['purchases_searched'], 'an empty purchases list needs its denominator'
+
+    seed_order!(SAMPLE_ORDER.merge('order_id' => '111-0000000-0000009',
+                                   'items' => [{ 'title' => 'Something else',
+                                                 'link' => '/dp/B00UNRELATED' }]))
+    out, = with_worker(->(*) { FakeWorker.new }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[--json item B0747R1M51 --fresh]) }
+    end
+    assert_equal 1, JSON.parse(out)['purchases_searched']
   end
 end
