@@ -20,6 +20,7 @@ from login import (  # noqa: E402
     ORDER_MARKERS,
     ORDERS_URL,
     describe_state,
+    is_amazon_domain,
     is_signin_url,
     marker_counts,
     order_access_ok,
@@ -461,9 +462,23 @@ class MarkerReportTest(unittest.TestCase):
     the next reading of that coming from a stale comment.
     """
 
-    # The live measurement, verbatim.
+    # The live measurement, verbatim. Ten orders on the page; the container is
+    # the single <section> all ten cards sit inside, so it counts 1, not 10.
     LIVE = {
         ".order-card, .js-order-card": 10,
+        ".your-orders-content-container": 1,
+        "[data-component=orderCard]": 0,
+        "#ordersContainer": 0,
+        "#your-orders-content": 0,
+    }
+
+    # Same URL, fresh context, no storage state — Amazon bounces to /ap/signin.
+    # This is the half of the measurement that makes a marker worth having: the
+    # card selector is *present* on the page we must reject, and only the URL
+    # check keeps that 1 from reading as proof.
+    BOUNCED = {
+        ".order-card, .js-order-card": 1,
+        ".your-orders-content-container": 0,
         "[data-component=orderCard]": 0,
         "#ordersContainer": 0,
         "#your-orders-content": 0,
@@ -480,7 +495,7 @@ class MarkerReportTest(unittest.TestCase):
     def test_the_report_names_the_markers_that_matched(self):
         msgs = [e["msg"] for e in emitted(lambda: report_markers(self.LIVE))]
         self.assertEqual(len(msgs), 1)
-        self.assertIn("1 of 4 markers", msgs[0])
+        self.assertIn("2 of 5 markers", msgs[0])
         self.assertIn(".order-card, .js-order-card (10)", msgs[0])
 
     def test_the_report_does_not_list_markers_that_matched_nothing(self):
@@ -495,8 +510,54 @@ class MarkerReportTest(unittest.TestCase):
         # Amazon next month, is allowed to disagree with the measurement above.
         counts = dict(self.LIVE, **{"#ordersContainer": 1})
         msg = [e["msg"] for e in emitted(lambda: report_markers(counts))][0]
-        self.assertIn("2 of 4 markers", msg)
+        self.assertIn("3 of 5 markers", msg)
         self.assertIn("#ordersContainer (1)", msg)
+
+    def test_the_container_marker_is_absent_from_the_page_we_must_reject(self):
+        # What makes a marker worth adding: it has to separate the two pages,
+        # not merely appear on the good one. The card selector does not — it
+        # counts 1 on the sign-in page — so it is the URL half of
+        # `order_access_ok` doing that work today, alone.
+        self.assertEqual(self.BOUNCED[".your-orders-content-container"], 0)
+        self.assertEqual(self.LIVE[".your-orders-content-container"], 1)
+        self.assertGreater(self.BOUNCED[".order-card, .js-order-card"], 0)
+
+    def test_the_bounced_page_is_refused_despite_matching_a_marker(self):
+        # The measurement above, run through the gate it exists to justify.
+        self.assertFalse(order_access_ok(SIGNIN, sum(self.BOUNCED.values())))
+        self.assertTrue(order_access_ok(ORDERS, sum(self.LIVE.values())))
+
+
+class AmazonDomainTest(unittest.TestCase):
+    """Which cookies reach the jar. Measured: 46 of 68 in a real login context
+    are third-party ad-tech that Amazon's own pages loaded."""
+
+    def test_amazon_domains_are_ours(self):
+        for d in ("amazon.com", ".amazon.com", "www.amazon.com", ".www.amazon.com"):
+            self.assertTrue(is_amazon_domain(d), d)
+
+    def test_a_suffix_match_is_not_a_domain_match(self):
+        # The bug in `endswith("amazon.com")`. Unreachable through the login
+        # flow, which is the premise this module has been wrong about most.
+        self.assertFalse(is_amazon_domain("notamazon.com"))
+        self.assertFalse(is_amazon_domain(".notamazon.com"))
+        self.assertFalse(is_amazon_domain("evilamazon.com"))
+
+    def test_the_third_party_cookies_a_real_login_collects_are_dropped(self):
+        # Names taken from an actual storage state, not invented.
+        for d in (".doubleclick.net", ".pubmatic.com", ".rubiconproject.com",
+                  ".casalemedia.com", ".demdex.net", ".taboola.com"):
+            self.assertFalse(is_amazon_domain(d), d)
+
+    def test_amazon_adsystem_is_not_carried(self):
+        # Correctly excluded by the old test too, but only by accident of not
+        # ending in the string. Now it is excluded because it is a different
+        # domain, which is the reason that survives Amazon renaming things.
+        self.assertFalse(is_amazon_domain(".amazon-adsystem.com"))
+
+    def test_nothing_is_not_ours(self):
+        self.assertFalse(is_amazon_domain(None))
+        self.assertFalse(is_amazon_domain(""))
 
 
 class OrderMarkersTest(unittest.TestCase):

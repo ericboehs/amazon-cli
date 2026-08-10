@@ -107,8 +107,23 @@ IDLE_PATHS = ("", "/", "/gp/css/homepage.html", "/gp/css/homepage")
 # `live.py`: this gate is what stands between a working login and a refused one,
 # so if `.order-card` goes the way the other three went, *every* login fails and
 # the fallbacks contribute nothing to stopping it.
+# `.your-orders-content-container` is the one entry here verified on *both*
+# pages that matter, which is what a marker actually has to be: present on the
+# order list (it is the <section> every one of the ten cards sits inside) and
+# absent from the sign-in page Amazon bounces a dead session to. Measured
+# 2026-08-10 against a fresh context with no storage state, landing on
+# /ap/signin: zero. That makes it strictly more discriminating than the card
+# selector currently carrying every login, which counts 1 there — the URL check
+# in `order_access_ok` is the only reason that 1 does not pass for proof, and
+# now that number is measured rather than asserted.
+#
+# It is NOT evidence for the empty-account case below. Whether that section
+# renders for an account with zero orders is unmeasured, and assuming it does —
+# because containers usually do — would be the retracted claim again, one
+# selector over.
 ORDER_MARKERS = (
     ".order-card, .js-order-card",
+    ".your-orders-content-container",
     "[data-component=orderCard]",
     "#ordersContainer",
     "#your-orders-content",
@@ -131,6 +146,23 @@ def describe_state(url: str | None) -> str:
     if is_order_history_url(url):
         return "on the orders page, but the order list hasn't rendered"
     return f"on {url[:60]}"
+
+
+def is_amazon_domain(domain: str | None) -> bool:
+    """Ours, for the purposes of what gets written to the jar.
+
+    An `endswith("amazon.com")` substring test would accept `notamazon.com`.
+    Unreachable through the login flow, which only ever visits Amazon and the
+    ad-tech Amazon's pages load — a measured 46 of the 68 cookies in a real
+    context are third-party (`.doubleclick.net`, `.pubmatic.com`, and 29 other
+    domains), and they are dropped here rather than written to disk. The
+    correct test costs nothing, and "unreachable today" is the premise that has
+    been wrong most often in this module.
+    """
+    if not domain:
+        return False
+    d = domain.lstrip(".")
+    return d == "amazon.com" or d.endswith(".amazon.com")
 
 
 def is_signin_url(url: str | None) -> bool:
@@ -172,7 +204,9 @@ def order_access_ok(url: str | None, order_cards: int) -> bool:
 
     The URL, because the sign-in page carries nodes that match the order-card
     selector — counting markers without checking where we are is how a
-    recognized-but-unauthenticated session used to pass for a real one.
+    recognized-but-unauthenticated session used to pass for a real one. That is
+    now a measurement and not a warning: on /ap/signin, reached with no storage
+    state at all, `.order-card, .js-order-card` counts exactly 1.
 
     The markers, because the URL alone only says what we asked for, not what
     Amazon served.
@@ -194,9 +228,18 @@ def order_access_ok(url: str | None, order_cards: int) -> bool:
 
     So on today's markup an account with no orders times out at ten minutes
     having been signed in the whole time. Left as a known gap rather than
-    guessed at: closing it needs the real container id from a live empty
-    account, and inventing a selector here would restore exactly the false
-    assurance this docstring just lost.
+    guessed at: closing it needs the real container from a live empty account,
+    and inventing a selector here would restore exactly the false assurance
+    this docstring just lost.
+
+    How the wrong one got written is worth keeping, because it is not
+    carelessness: `your-orders-content` is genuinely on the page — as a *class*
+    prefix on the <section> wrapping the cards, never as an id. A half-recalled
+    real string reads exactly like a checked one.
+
+    `.your-orders-content-container` is the candidate, and it is in
+    ORDER_MARKERS on its own merits. It is not promoted to closing this gap,
+    because it has only been measured on an account that *has* orders.
     """
     if not url or is_signin_url(url) or not is_order_history_url(url):
         return False
@@ -669,7 +712,7 @@ def main() -> int:
         # Collapse duplicate names once, here, so the cookie the gate judges and
         # the cookie the jar records are the same object by construction.
         amazon_cookies = resolve_cookies(
-            [c for c in context.cookies() if c.get("domain", "").endswith("amazon.com")]
+            [c for c in context.cookies() if is_amazon_domain(c.get("domain"))]
         )
 
         # Check before writing. Order history rendering proves this *window* can
