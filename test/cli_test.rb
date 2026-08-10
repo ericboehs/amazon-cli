@@ -1524,7 +1524,7 @@ class WorkerProtocolTest < Minitest::Test
   def test_a_log_that_prints_nothing_does_not_erase_the_progress_bar
     body = <<~SCRIPT
       STDIN.gets
-      puts({event: 'total', year: 2026, count: 2}.to_json)
+      puts({event: 'total', year: 2026, listed: 2, new: 2, cached: 0}.to_json)
       puts({event: 'progress', year: 2026, i: 1, n: 2, order_id: 'ORD-A'}.to_json)
       puts({event: 'log', level: 'info', msg: 'routine'}.to_json)
       puts({event: 'progress', year: 2026, i: 2, n: 2, order_id: 'ORD-B'}.to_json)
@@ -1813,15 +1813,40 @@ class ProgressTest < Minitest::Test
   def test_progress_reports_year_ticks_and_totals
     _, err = capture_io_streams do
       p = progress
-      p.start('year' => 2025, 'count' => 2)
+      p.start('year' => 2025, 'listed' => 6, 'new' => 2, 'cached' => 4)
       p.tick('i' => 1, 'n' => 2, 'date' => '2025-01-01', 'grand_total' => 12.5,
              'order_id' => '111-1', 'title' => 'Widget')
       p.finish('count' => 2, 'skipped' => 4)
     end
-    assert_includes err, 'year 2025: 2 orders'
+    assert_includes err, 'year 2025: 6 orders (2 new, 4 already stored)'
     assert_includes err, '$12.50'
     assert_includes err, '111-1'
-    assert_includes err, 'done: 2 orders (4 skipped)'
+    assert_includes err, 'done: 2 orders (4 already stored)'
+  end
+
+  # The bug Eric hit: 206 orders listed for 2026, all already on disk, reported
+  # as "year 2026: 0 orders" on an account holding 222 of them — the same
+  # sentence a year Amazon lists nothing for produces. Both lines are asserted
+  # in one test and compared, because the defect was never in either string on
+  # its own; it was that the two were equal.
+  def test_a_fully_cached_year_does_not_read_like_an_empty_one
+    _, cached_err = capture_io_streams do
+      progress.start('year' => 2026, 'listed' => 206, 'new' => 0, 'cached' => 206)
+    end
+    _, empty_err = capture_io_streams do
+      progress.start('year' => 2006, 'listed' => 0, 'new' => 0, 'cached' => 0)
+    end
+    assert_includes cached_err, 'year 2026: 206 orders, all already stored'
+    assert_includes empty_err, 'year 2006: Amazon listed no orders'
+    refute_equal cached_err.sub('2026', 'Y'), empty_err.sub('2006', 'Y')
+  end
+
+  def test_done_distinguishes_nothing_new_from_nothing_found
+    _, nothing_new = capture_io_streams { progress.finish('count' => 0, 'skipped' => 206) }
+    _, nothing_found = capture_io_streams { progress.finish('count' => 0, 'skipped' => 0) }
+    assert_includes nothing_new, 'done: no new orders (206 already stored)'
+    assert_includes nothing_found, 'done: no orders found'
+    refute_equal nothing_new, nothing_found
   end
 
   def test_tick_handles_missing_date_and_total
@@ -1904,7 +1929,7 @@ class WorkerSyncTest < Minitest::Test
   def test_sync_collects_orders_and_reports_progress
     body = <<~SCRIPT
       STDIN.gets
-      puts({event: 'total', year: 2025, count: 2}.to_json)
+      puts({event: 'total', year: 2025, listed: 2, new: 2, cached: 0}.to_json)
       puts({event: 'progress', i: 1, n: 2, date: '2025-01-01', grand_total: 12.5,
             order_id: '111-1', title: 'Widget'}.to_json)
       puts({event: 'order', data: { 'order_id' => '111-1' }}.to_json)
@@ -1915,8 +1940,25 @@ class WorkerSyncTest < Minitest::Test
       orders = nil
       _, err = capture_io_streams { orders = Amazon::Worker.new.sync(**sync_args) }
       assert_equal %w[111-1 111-2], orders.map { |o| o['order_id'] }
-      assert_includes err, 'year 2025: 2 orders'
-      assert_includes err, 'done: 2 orders (1 skipped)'
+      assert_includes err, 'year 2025: 2 orders (2 new, 0 already stored)'
+      assert_includes err, 'done: 2 orders (1 already stored)'
+    end
+  end
+
+  # The sync log records what was written, which is zero on a healthy run over
+  # an up-to-date archive. These are what let the line say which zero it was.
+  def test_sync_totals_accumulate_across_years
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'total', year: 2025, listed: 10, new: 1, cached: 9}.to_json)
+      puts({event: 'total', year: 2026, listed: 206, new: 0, cached: 206}.to_json)
+      puts({event: 'done', count: 1, skipped: 215}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      w = Amazon::Worker.new(quiet: true)
+      capture_io_streams { w.sync(**sync_args) }
+      assert_equal 216, w.listed_count
+      assert_equal 215, w.known_count
     end
   end
 
@@ -2204,6 +2246,31 @@ end
 # A unique all-alphabetic token per index. Digits can't be used: they break
 # clauses and fall out of the word scanner, so "body 7" and "body 8" would
 # reduce to the same content words and read as duplicates.
+
+  # sync.rb is filtered out of the coverage gate, so nothing here is graded and
+  # this line went years without a test. It is also the *persistent* record — a
+  # console line is gone when the terminal scrolls, but `count=0` sat in the log
+  # for months meaning two opposite things on different days.
+  def sync_log_line(count, **kw)
+    Amazon::Commands::Order::Sync
+      .new(Amazon::GlobalOptions.new(json: false, quiet: true, verbose: false))
+      .send(:append_sync_log, [2026], count, **kw)
+    File.readlines(Amazon::Config.sync_log_path).last
+  end
+
+  def test_the_sync_log_separates_nothing_new_from_nothing_listed
+    up_to_date = sync_log_line(0, listed: 206, known: 206)
+    empty = sync_log_line(0, listed: 0, known: 0)
+    assert_includes up_to_date, 'count=0  listed=206  known=206'
+    assert_includes empty, 'count=0  listed=0  known=0'
+    refute_equal up_to_date.split(nil, 2).last, empty.split(nil, 2).last
+  end
+
+  def test_the_sync_log_still_marks_partial_runs
+    line = sync_log_line(3, listed: 10, known: 7, partial: "boom\nsecond line")
+    assert_includes line, 'count=3  listed=10  known=7'
+    assert_includes line, 'status=partial  error=boom second line'
+  end
 def tag(i) = "zz#{i.to_s.tr('0123456789', 'abcdefghij')}"
 
 # Builds review samples for the heuristics. Defaults describe a plausibly

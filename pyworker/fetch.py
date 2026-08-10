@@ -30,6 +30,7 @@ import random
 import sys
 import time
 import traceback
+from collections.abc import Container, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -197,6 +198,31 @@ def clear_dead_session(cookies_path: Path) -> bool:
         emit("log", level="warn", msg=f"could not clear the dead session's cookies: {e}")
         return False
     return True
+
+
+def split_known(
+    orders: Sequence[Any], known_order_ids: Container[str]
+) -> tuple[list[Any], dict[str, int]]:
+    """Partition a year's listing, and the `total` event's payload alongside it.
+
+    Three numbers rather than one, because a zero in `new` has two opposite
+    causes — Amazon listed nothing, or everything it listed is already on disk —
+    and an event carrying only that number cannot say which happened. It used to
+    send `count` and `new` from the same variable, so `worker.rb` printed
+    "year 2026: 0 orders" for an account holding 222 of them.
+
+    These key names are a contract with `Worker::Progress#start` on the Ruby
+    side, which reads all three by name. Nothing in either suite crosses that
+    boundary, so a rename here fails no test over there — hence pinning the
+    names in `SplitKnownTest` rather than leaving them implicit in a kwargs
+    call halfway down `main`.
+    """
+    new_orders = [o for o in orders if o.order_number not in known_order_ids]
+    return new_orders, {
+        "listed": len(orders),
+        "new": len(new_orders),
+        "cached": len(orders) - len(new_orders),
+    }
 
 
 def restore_jar(cookies_path: Path, jar_before: str | None, reason: str) -> bool:
@@ -704,11 +730,10 @@ def main() -> int:
                 guard.restore(f"the failed {year} history fetch")
                 return 1
 
-            n = len(orders)
-            new_orders = [o for o in orders if o.order_number not in known_order_ids]
-            new_n = len(new_orders)
-            cached_count = n - new_n
-            emit("total", year=int(year), count=new_n, new=new_n, cached=cached_count)
+            new_orders, totals = split_known(orders, known_order_ids)
+            new_n = totals["new"]
+            cached_count = totals["cached"]
+            emit("total", year=int(year), **totals)
             skipped += cached_count
             if cached_count:
                 emit("log", level="info", msg=f"year {year}: skipping {cached_count} already-stored orders")

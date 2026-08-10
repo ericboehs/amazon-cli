@@ -36,11 +36,16 @@ module Amazon
 
       orders = []
       error_msg = nil
+      @listed_count = 0
+      @known_count = 0
       progress = Progress.new(quiet: @quiet)
       run(request) do |event|
         case event["event"]
         when "order"    then orders << event["data"]
-        when "total"    then progress.start(event)
+        when "total"
+          @listed_count += event["listed"].to_i
+          @known_count += event["cached"].to_i
+          progress.start(event)
         when "progress" then progress.tick(event)
         when "log"
           # Only erase the bar for a message that is actually going to land on
@@ -63,6 +68,13 @@ module Amazon
     # failure. The caller has to decide what to do — silently exiting 0 makes a
     # partial sync indistinguishable from a complete one to cron and `&&`.
     attr_reader :partial_error
+
+    # What Amazon listed across every year of the last sync, and how much of it
+    # we already held. The sync log records how many orders were *written*, and
+    # a zero there is ambiguous for the same reason the console line was: it
+    # can't say whether nothing was listed or nothing was new. These let the
+    # caller write down which one it saw.
+    attr_reader :listed_count, :known_count
 
     # Live product lookup. Raises Error with a nudge toward `amazon login` when
     # the saved session is missing, has expired, or Amazon serves a captcha.
@@ -108,7 +120,7 @@ module Amazon
 
       def start(event)
         return if @quiet
-        warn("year #{event["year"]}: #{event["count"]} orders")
+        warn(listing_summary(event))
         @start_time = nil
       end
 
@@ -149,12 +161,38 @@ module Amazon
       def finish(event)
         clear
         return if @quiet
-        skipped = event["skipped"].to_i
-        suffix = skipped.positive? ? " (#{skipped} skipped)" : ""
-        warn("done: #{event["count"]} orders#{suffix}")
+        warn(done_summary(event))
       end
 
       private
+
+      # A zero here has two opposite meanings — Amazon listed nothing, or it
+      # listed only orders already on disk — and this line used to print the
+      # new-order count under a label that reads as the year's total, so both
+      # came out as "year 2026: 0 orders" on an account with 222 of them. Lead
+      # with what Amazon served; a zero is only reported when nothing was.
+      def listing_summary(event)
+        listed = event["listed"].to_i
+        new_count = event["new"].to_i
+        cached = event["cached"].to_i
+        year = "year #{event["year"]}:"
+        return "#{year} Amazon listed no orders" if listed.zero?
+        return "#{year} #{listed} orders, all already stored" if new_count.zero?
+        "#{year} #{listed} orders (#{new_count} new, #{cached} already stored)"
+      end
+
+      # Same distinction as `listing_summary`, at the end of the run. "skipped"
+      # was doing the disambiguating work here and doing it badly: it reads as
+      # "something went wrong and we moved on" rather than "already on disk",
+      # so the sentence people trusted was the leading zero.
+      def done_summary(event)
+        fetched = event["count"].to_i
+        stored = event["skipped"].to_i
+        return "done: no new orders (#{stored} already stored)" if fetched.zero? && stored.positive?
+        return "done: no orders found" if fetched.zero?
+        suffix = stored.positive? ? " (#{stored} already stored)" : ""
+        "done: #{fetched} orders#{suffix}"
+      end
 
       def bar(i, n)
         return "[" + ("░" * BAR_WIDTH) + "]" if n.to_i.zero?

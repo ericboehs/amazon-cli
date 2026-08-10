@@ -66,7 +66,8 @@ module Amazon
           store.commit_index!
 
           partial = worker.partial_error
-          append_sync_log(years, orders.size, partial: partial)
+          append_sync_log(years, orders.size, listed: worker.listed_count,
+                                              known: worker.known_count, partial: partial)
           log "wrote #{orders.size} orders to #{Amazon::Config.orders_dir}"
           # A partial sync must not exit 0: cron jobs and `&&` chains have no
           # other way to tell it apart from a complete one.
@@ -152,14 +153,18 @@ module Amazon
           "'" + s.gsub("'", "'\\''") + "'"
         end
 
-        def append_sync_log(years, count, partial: nil)
+        def append_sync_log(years, count, listed: 0, known: 0, partial: nil)
           path = Amazon::Config.sync_log_path
           FileUtils.mkdir_p(File.dirname(path))
           # Mark partial runs, so a truncated count isn't logged in the same
           # shape as a complete one.
           status = partial ? "  status=partial  error=#{partial.gsub(/\s+/, " ")}" : ""
+          # `count` alone made a healthy run over an up-to-date archive identical
+          # to a run that listed nothing. This is the persistent record, so the
+          # ambiguity outlived the console line by months of entries.
           File.open(path, "a") do |f|
-            f.puts "#{Time.now.utc.iso8601}  years=#{years.join(",")}  count=#{count}#{status}"
+            f.puts "#{Time.now.utc.iso8601}  years=#{years.join(",")}  " \
+                   "count=#{count}  listed=#{listed}  known=#{known}#{status}"
           end
         end
 
