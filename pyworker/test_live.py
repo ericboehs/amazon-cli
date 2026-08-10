@@ -4,6 +4,7 @@ Run with: python -m unittest discover -s pyworker
 No Playwright needed — these functions never touch a browser.
 """
 
+import copy
 import io
 import json
 import unittest
@@ -1284,15 +1285,69 @@ except ImportError:  # pragma: no cover - exercised by the bare-interpreter CI j
     HAVE_BS4 = False
 
 
+# Amazon's own display:none utilities. Modelled by name because that is what
+# the markup carries — bs4 has no cascade, so a class list and an inline style
+# are the only hiding this fake can honestly see, and inventing more would be
+# the fake agreeing with us again.
+HIDING_CLASSES = ("aok-hidden", "a-hidden")
+
+
+def _hidden(node):
+    """True if this node alone is display:none, by class or inline style."""
+    if any(c in HIDING_CLASSES for c in (node.get("class") or [])):
+        return True
+    return "display:none" in (node.get("style") or "").replace(" ", "").lower()
+
+
+def _rendered(node):
+    return not any(_hidden(a) for a in [node, *node.parents] if hasattr(a, "get"))
+
+
+def _text_of(node):
+    """Every descendant string, including <style> and <script> source.
+
+    Not `get_text()`. bs4 sorts stylesheet and script contents into their own
+    NavigableString subclasses and `get_text()` skips them by default, so the
+    fixture's `<style>` block was invisible to the fake — which meant
+    `without_style_nodes` had nothing to subtract and every assertion about
+    CSS being stripped passed without any CSS ever being present. The test
+    named for the leak could not have failed if the fix were removed.
+    """
+    return "".join(node.find_all(string=True))
+
+
 class DomLocator:
     """A Playwright-shaped locator backed by parsed HTML.
 
     Implements only what `browser.text()` and `browser.attr()` actually call.
-    `inner_text` returns the node's full text *including* any <style> children,
-    which is not a shortcut: it is what a real `innerText` returns for a
-    container with no layout box, and that is precisely the case that put CSS
-    in the output. A fake that quietly dropped style text would make the bug
-    untestable here.
+
+    `inner_text` follows the two branches real `innerText` has, both measured
+    against Chrome rather than reasoned from the spec:
+
+      * A node that is **not being rendered** returns its full descendant text.
+        That is the branch that put CSS in the output — `#availability_feature_div`
+        has no layout box, so its `<style>` children came through verbatim — and
+        a fake that dropped style text would make that bug untestable here.
+      * A node that **is** being rendered excludes descendants that aren't. A
+        hidden `<span>` inside a visible container contributes nothing.
+
+    The distinction matters in the direction that bites: on the amazon-sold
+    fixture the merchant selector matches twice, and the second is an
+    `aok-hidden` popover twin. bs4's `get_text()` alone models neither branch —
+    it would have reported that twin's text out of a visible container.
+
+    Two things it deliberately does not model, both for the same reason —
+    whether an element has a layout box is a live-rendering fact bs4 cannot
+    know, so the fake states what the markup states and guesses in the
+    direction that can only cause false *failures*:
+
+      * A node hidden only by the cascade reads as rendered here.
+      * `<style>`/`<script>` text is included in both branches, though a real
+        rendered container would exclude it. `#availability_feature_div` had
+        no layout box on the live page, which is why the CSS leaked at all,
+        and nothing in the captured markup records that. Including it always
+        keeps `without_style_nodes` under test; excluding it would restore the
+        exact false pass this fake was built to end.
     """
 
     def __init__(self, nodes):
@@ -1312,10 +1367,20 @@ class DomLocator:
         return DomLocator([m for n in self._nodes for m in n.select(sel)])
 
     def inner_text(self):
-        return self._nodes[0].get_text() if self._nodes else ""
+        if not self._nodes:
+            return ""
+        node = self._nodes[0]
+        if not _rendered(node):
+            # Unrendered: innerText is specified to fall back to textContent,
+            # and Chrome does — measured, including nested and <style> text.
+            return node.get_text()
+        clone = copy.copy(node)  # bs4's __copy__ is a deep copy
+        for kid in clone.find_all(_hidden):
+            kid.decompose()
+        return _text_of(clone)
 
     def all_text_contents(self):
-        return [n.get_text() for n in self._nodes]
+        return [_text_of(n) for n in self._nodes]
 
     def get_attribute(self, name):
         return self._nodes[0].get(name) if self._nodes else None
@@ -1427,6 +1492,78 @@ class RealMarkupSellerTest(unittest.TestCase):
         page = DomPage.from_fixture("buybox_third_party.html")
         got = text(page, "#merchant-info", "#tabular-buybox")
         self.assertIn("Amazon Resale", got or "")
+
+
+class DomFakeFidelityTest(unittest.TestCase):
+    """The fake's own tests. If it drifts from Playwright, every test built on
+    it starts asserting something Amazon never does.
+
+    Each expectation below was measured against real Chrome through Playwright
+    on the equivalent markup, not derived from the spec — the two disagree in
+    the case that matters most here, and it is the case with no layout box.
+    """
+
+    HTML = (
+        '<div id="direct_hidden" class="aok-hidden">HIDDEN TWIN TEXT</div>'
+        '<div id="visible_parent">VISIBLE TEXT'
+        '  <span class="aok-hidden">HIDDEN CHILD TEXT</span></div>'
+        '<div id="hidden_parent" class="aok-hidden">OUTER<span>INNER</span></div>'
+        '<div id="inline" style="display: none">INLINE HIDDEN</div>'
+    )
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest("beautifulsoup4 is not installed (this is the bare-interpreter CI job)")
+        self.page = DomPage(self.HTML)
+
+    def test_a_hidden_node_still_yields_its_own_text(self):
+        # Chrome: inner_text == 'HIDDEN TWIN TEXT', NOT ''. An element with no
+        # layout box is "not being rendered", and innerText then falls back to
+        # textContent. Getting this backwards would make a hidden match look
+        # like a dead selector, which is the opposite of what production does.
+        self.assertEqual(self.page.locator("#direct_hidden").inner_text(), "HIDDEN TWIN TEXT")
+        self.assertEqual(self.page.locator("#inline").inner_text(), "INLINE HIDDEN")
+
+    def test_a_hidden_node_yields_its_descendants_too(self):
+        # Same branch: the fallback is textContent, so nesting is included.
+        got = self.page.locator("#hidden_parent").inner_text()
+        self.assertIn("OUTER", got)
+        self.assertIn("INNER", got)
+
+    def test_a_rendered_node_drops_its_hidden_children(self):
+        # The branch bs4 gets wrong on its own: get_text() would return both.
+        got = self.page.locator("#visible_parent").inner_text()
+        self.assertIn("VISIBLE TEXT", got)
+        self.assertNotIn("HIDDEN CHILD TEXT", got)
+
+    def test_the_style_leak_still_reproduces(self):
+        # The guard on the above. `#availability_feature_div` is hidden by
+        # layout, not by markup, so it reads as rendered here — which means
+        # modelling hiding must not quietly start dropping <style> text and
+        # take RealMarkupCleanTextTest's subject with it.
+        page = DomPage.from_fixture("buybox_amazon_sold.html")
+        self.assertIn("{", page.locator("#availability_feature_div").inner_text())
+
+
+class RealMarkupHiddenTwinTest(unittest.TestCase):
+    """Why `.first` is the right pick for the seller, stated as evidence."""
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest("beautifulsoup4 is not installed (this is the bare-interpreter CI job)")
+
+    def test_the_second_merchant_match_is_a_hidden_popover_twin(self):
+        # The multi-match the old fake could not express. Both matches carry
+        # the same text, and the second sits inside an aok-hidden popover
+        # trigger — so `.first` is correct, and now for a checkable reason
+        # rather than because the fake only ever had one node to give.
+        page = DomPage.from_fixture("buybox_amazon_sold.html")
+        matches = page.locator(SELLER_SELECTORS[0])
+        self.assertEqual(matches.count(), 2)
+        self.assertEqual(clean_text(matches.first.inner_text()), "Amazon.com")
+        self.assertEqual(clean_text(matches.nth(1).inner_text()), "Amazon.com")
+        self.assertTrue(_rendered(matches.first._nodes[0]))
+        self.assertFalse(_rendered(matches.nth(1)._nodes[0]))
 
 
 class RealMarkupCleanTextTest(unittest.TestCase):
