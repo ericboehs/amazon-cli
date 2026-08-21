@@ -22,12 +22,13 @@ module Amazon
 
         def run(argv)
           fresh = false
-          images = false
+          images = nil
           target = nil
           while (a = argv.shift)
             case a
             when "--fresh" then fresh = true
             when "--image", "--images" then images = true
+            when "--no-image", "--no-images" then images = false
             when "-h", "--help"
               puts help_text
               return 0
@@ -77,7 +78,7 @@ module Amazon
 
         def help_text
           <<~HELP
-            Usage: amazon subscribe show <id-or-search> [--fresh] [--json]
+            Usage: amazon subscribe show <id-or-search> [--no-image] [--fresh] [--json]
 
             Everything Amazon knows about one subscription: the product and its
             ASIN, who sells it, the schedule, the discount you're getting, any
@@ -96,9 +97,9 @@ module Amazon
             subscribe upcoming` has the prices.
 
             Options:
-              --image  Draw the product photo beside the details (needs chafa)
-              --fresh  Ignore the cache and re-read Amazon
-              --json   JSON output
+              --no-image  Skip the product photo
+              --fresh     Ignore the cache and re-read Amazon
+              --json      JSON output
           HELP
         end
       end

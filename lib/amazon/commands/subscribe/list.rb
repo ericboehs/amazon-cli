@@ -19,12 +19,13 @@ module Amazon
         def run(argv)
           load_all = false
           fresh = false
-          images = false
+          images = nil
           while (a = argv.shift)
             case a
             when "--all" then load_all = true
             when "--fresh" then fresh = true
             when "--image", "--images" then images = true
+            when "--no-image", "--no-images" then images = false
             when "-h", "--help"
               puts help_text
               return 0
@@ -56,7 +57,7 @@ module Amazon
 
         def help_text
           <<~HELP
-            Usage: amazon subscribe list [--all] [--fresh] [--json]
+            Usage: amazon subscribe list [--all] [--no-image] [--fresh] [--json]
 
             Lists your Subscribe & Save subscriptions: what ships next, when,
             how often, and what it costs.
@@ -78,14 +79,15 @@ module Amazon
             copy of `upcoming` and `show` too, since all three describe the
             same account.
 
-            --image swaps the table for one block per subscription with its
-            product photo alongside. Needs chafa; images are cached on disk.
+            In a terminal each subscription is a block with its product photo
+            alongside; --no-image gives the plain table instead, which is also
+            what you get when stdout is a pipe or chafa isn't installed.
 
             Options:
-              --all    Page through every subscription, not just the first page
-              --image  Draw the product photo beside each subscription
-              --fresh  Ignore the cache and re-read Amazon
-              --json   JSON output
+              --all       Page through every subscription, not just the first page
+              --no-image  Plain table, no product photos
+              --fresh     Ignore the cache and re-read Amazon
+              --json      JSON output
           HELP
         end
       end

@@ -350,14 +350,13 @@ amazon subscribe list --all           # click past the first 30
 amazon subscribe upcoming             # the next delivery, with prices
 amazon subscribe upcoming --all       # every scheduled delivery
 amazon subscribe show dishwasher      # one subscription in full, by id or by title
-amazon subscribe list --image         # with the product photos (needs chafa)
-amazon subscribe upcoming --image     # …and in the delivery view too
+amazon subscribe list --no-image      # plain table, no product photos
 amazon subscribe list --fresh         # ignore the 30-minute cache
 amazon subscribe upcoming --json | jq '.[0].subtotal'
 ```
 
 ```
-$ amazon subscribe list
+$ amazon subscribe list --no-image
 next              every     qty  price   subscription_id             item
 September 2       2 months  1    $14.22  SNSD0_CPWMW84DZS0X826Y8P77  Gain Liquid Laundry Deterge…
 September 30      6 months  1    15%     SNST0_3DDC5AB24AB74C1087BE  Amazon Basic Care All Day A…
@@ -366,7 +365,7 @@ showing 30 of 59 — pass --all for the rest
 ```
 
 ```
-$ amazon subscribe upcoming
+$ amazon subscribe upcoming --no-image
 Sep 2  3 items  $48.95  · next
   Last day to edit delivery: Thursday, August 27
   Estimated savings for this delivery: $1.95
@@ -447,8 +446,8 @@ the website twenty minutes ago and one that never changed look identical
 otherwise. `--fresh` on any of them drops all three, since they describe one
 account; when write commands land they will invalidate through the same door.
 
-`--image` on `list`, `upcoming`, and `show` draws the product photo beside
-each entry.
+`list`, `upcoming`, and `show` draw the product photo beside each entry when
+they're printing to a terminal; `--no-image` gives you the plain table.
 Rendering is chafa's job, not this CLI's: it negotiates with the terminal and
 emits kitty graphics, sixel, or unicode half-blocks depending on what
 answered, which is a thing to shell out to rather than reimplement worse. The
@@ -456,12 +455,12 @@ table gives way to one block per subscription, because six columns and a
 photograph is a wall.
 
 ```
-$ amazon subscribe list --image
+$ amazon subscribe list
 ┌────────┐  Gain Liquid Laundry Detergent, Freshness, Odor Defense, 154 fl oz
 │ (photo)│  September 2 · every 2 months · $14.22
 └────────┘  SNSD0_CPWMW84DZS0X826Y8P77
 
-$ amazon subscribe upcoming --image
+$ amazon subscribe upcoming
 Sep 2  3 items  $48.95  · next
   Last day to edit delivery: Thursday, August 27
 ┌────┐  Gain Liquid Laundry Detergent, Freshness, Odor Defense
@@ -474,8 +473,10 @@ under a delivery heading and one delivery can hold eighteen of them. The price
 moves off the front of the line and onto its own: a price column indented past
 a photograph is a column of one.
 
-Images are skipped, with one line on stderr, when stdout isn't a terminal or
-chafa isn't installed — a pipe gets the table, not megabytes of escape codes.
+Images are skipped when stdout isn't a terminal or chafa isn't installed — a
+pipe gets the table, not megabytes of escape codes. That happens silently
+unless you typed `--image`, because a default that can't run shouldn't make
+every `| grep` apologise for a feature nobody asked for.
 Photos are cached on disk by URL and size, so the second run draws instantly.
 
 Two things about that layout were measured rather than assumed, and both were

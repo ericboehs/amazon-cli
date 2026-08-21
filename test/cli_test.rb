@@ -4824,6 +4824,39 @@ class SubscribeImageFlagTest < Minitest::Test
     refute_includes out, "\e[?7l"
   end
 
+  # Photos are the default, so the pipe case is now the common case. Explaining
+  # it every time would make every `| grep` apologise for a thing nobody asked
+  # for — the warning belongs to the flag, not to the feature.
+  def test_a_pipe_says_nothing_when_the_flag_was_not_typed
+    out, err = run_cli(%w[subscribe list])
+    refute_includes err, "images need a terminal"
+    refute_includes err, "chafa"
+    assert_includes out, "subscription_id"
+  end
+
+  def test_no_image_is_accepted_everywhere_in_both_spellings
+    %w[--no-image --no-images].each do |flag|
+      %w[list upcoming show].each do |sub|
+        reset_subscribe_cache!
+        argv = sub == "show" ? ["subscribe", sub, "dishwasher", flag] : ["subscribe", sub, flag]
+        out, err = run_cli(argv)
+        refute_includes err, "unknown"
+        refute_empty out
+      end
+    end
+  end
+
+  # Declining is silent by definition: you already know why there are no
+  # pictures, because you said so.
+  def test_no_image_never_explains_itself
+    cmd = Amazon::Commands::Subscribe::List.new(
+      Amazon::GlobalOptions.new(json: false, quiet: false, verbose: false)
+    )
+    Amazon::Thumbnail.command = false
+    _, err = capture_io_streams { assert_nil cmd.send(:thumbnails, false, 6) }
+    assert_empty err
+  end
+
   def test_show_degrades_to_plain_text_with_one_line_of_explanation
     Amazon::Thumbnail.command = false
     out, err = run_cli(%w[subscribe show dishwasher --image])
@@ -4850,7 +4883,7 @@ class SubscribeImageFlagTest < Minitest::Test
   def test_the_flag_is_documented_where_it_works
     %w[list show upcoming].each do |sub|
       out, = capture_io_streams { Amazon::CLI.run(["subscribe", sub, "--help"]) }
-      assert_includes out, "--image"
+      assert_includes out, "--no-image"
     end
   end
 
@@ -4861,14 +4894,15 @@ class SubscribeImageFlagTest < Minitest::Test
 
   # The renderer is handed to the formatter only when it can actually draw —
   # which needs a terminal, so this one hands the command a stdout that says
-  # it is one.
-  def test_a_working_terminal_gets_a_renderer
+  # it is one. nil is the no-flag case, and it has to behave like --image.
+  def test_a_working_terminal_gets_a_renderer_without_being_asked
     cmd = Amazon::Commands::Subscribe::List.new(
       Amazon::GlobalOptions.new(json: false, quiet: false, verbose: false)
     )
     real = $stdout
     $stdout = FakeTTY.new
     begin
+      refute_nil cmd.send(:thumbnails, nil, 6)
       refute_nil cmd.send(:thumbnails, true, 6)
       assert_nil cmd.send(:thumbnails, false, 6)
     ensure

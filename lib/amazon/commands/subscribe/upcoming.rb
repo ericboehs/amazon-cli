@@ -24,12 +24,13 @@ module Amazon
         def run(argv)
           limit = DEFAULT_LIMIT
           fresh = false
-          images = false
+          images = nil
           while (a = argv.shift)
             case a
             when "--all" then limit = nil
             when "--fresh" then fresh = true
             when "--image", "--images" then images = true
+            when "--no-image", "--no-images" then images = false
             when "--limit"
               limit = positive_arg!("--limit", argv.shift)
             when "-h", "--help"
@@ -57,7 +58,7 @@ module Amazon
 
         def help_text
           <<~HELP
-            Usage: amazon subscribe upcoming [--limit N | --all] [--fresh] [--json]
+            Usage: amazon subscribe upcoming [--limit N | --all] [--no-image] [--fresh] [--json]
 
             Shows each scheduled Subscribe & Save delivery: what's in it, and —
             for the one shipping next — the price Amazon will charge and the
@@ -75,11 +76,11 @@ module Amazon
             account.
 
             Options:
-              --limit N  Show N deliveries (default #{DEFAULT_LIMIT})
-              --all      Show every scheduled delivery
-              --image    Draw the product photo beside each item (needs chafa)
-              --fresh    Ignore the cache and re-read Amazon
-              --json     JSON output (always every delivery, unaffected by --limit)
+              --limit N   Show N deliveries (default #{DEFAULT_LIMIT})
+              --all       Show every scheduled delivery
+              --no-image  Plain lines, no product photos
+              --fresh     Ignore the cache and re-read Amazon
+              --json      JSON output (every delivery, unaffected by --limit)
           HELP
         end
       end
