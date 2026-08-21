@@ -51,8 +51,9 @@ module Amazon
             return 2
           end
 
-          Amazon::Formatter.new(json: @global.json)
-            .subscription(detail, thumbnails: thumbnails(images, IMAGE_ROWS))
+          renderer = thumbnails(images, IMAGE_ROWS)
+          Amazon::Formatter.new(json: @global.json).subscription(detail, thumbnails: renderer)
+          report_missing_images(renderer)
           0
         end
 

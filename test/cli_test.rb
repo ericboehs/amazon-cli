@@ -5017,6 +5017,11 @@ class StubThumbnails
     @asked << url
     url.nil? ? nil : @blob
   end
+
+  # The real renderer counts what it couldn't fetch so the command can say so.
+  attr_accessor :failures
+
+  def failures = @failures || 0
 end
 
 class ThumbnailLayoutTest < Minitest::Test
@@ -6157,6 +6162,38 @@ class ThumbnailHardeningTest < Minitest::Test
     assert_equal ['chafa', '--size=12x6', '/x.jpg'], t.send(:render_command, '/x.jpg')
   end
 
+  # A failed download is three layers of silent nil and a blank left margin,
+  # which is exactly what a product with no photo looks like.
+  def test_failures_are_counted_so_someone_can_say_so
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:download) { |_u| nil }
+    t.prefetch(%w[https://e.com/a.jpg https://e.com/b.jpg])
+    assert_equal 2, t.failures
+  end
+
+  def test_a_raise_counts_once_not_twice
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:download) { |_u| raise 'nope' }
+    t.prefetch(['https://e.com/a.jpg'])
+    assert_equal 1, t.failures
+  end
+
+  def test_nothing_to_report_when_nothing_failed
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:download) { |_u| '/tmp/x.img' }
+    t.prefetch(['https://e.com/a.jpg'])
+    assert_equal 0, t.failures
+  end
+
+  # A placeholder is not a failure: Amazon's "no image available" graphic is
+  # correctly skipped, and apologising for it would be noise on every run.
+  def test_a_skipped_placeholder_is_not_a_failure
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:download) { |_u| flunk('should not have been fetched') }
+    t.prefetch(['https://m.media-amazon.com/images/I/no-img.jpg'])
+    assert_equal 0, t.failures
+  end
+
   # Eight threads share one Hash.
   def test_concurrent_fetches_all_land
     t = Amazon::Thumbnail.new(rows: 4)
@@ -6165,6 +6202,51 @@ class ThumbnailHardeningTest < Minitest::Test
     t.prefetch(urls)
     t.define_singleton_method(:download) { |_u| flunk('should have been cached') }
     urls.each { |u| assert t.send(:drawable?, u) }
+  end
+end
+
+# The end of the "silent nil" chain: whether anyone actually tells the user.
+class MissingImageReportTest < Minitest::Test
+  include Amazon::Commands::Subscribe::Images
+
+  def setup
+    @global = Amazon::GlobalOptions.new(json: false, quiet: false, verbose: false)
+  end
+
+  def report(renderer)
+    _, err = capture_io_streams { report_missing_images(renderer) }
+    err
+  end
+
+  def test_it_says_how_many_and_only_when_there_were_any
+    stub = StubThumbnails.new
+    stub.failures = 3
+    assert_includes report(stub), '3 photos could not be fetched'
+  end
+
+  def test_one_photo_is_not_pluralised
+    stub = StubThumbnails.new
+    stub.failures = 1
+    assert_includes report(stub), '1 photo could not be fetched'
+  end
+
+  def test_a_clean_run_says_nothing
+    assert_empty report(StubThumbnails.new)
+  end
+
+  # --no-image, a pipe, and no chafa all arrive here as nil, and none of them
+  # is a failure to apologise for.
+  def test_text_only_says_nothing
+    assert_empty report(nil)
+  end
+
+  # Every view that can show a photo has to ask, or the count is collected and
+  # thrown away.
+  def test_every_view_with_photos_reports
+    %w[list show upcoming].each do |cmd|
+      src = File.read(File.expand_path("../lib/amazon/commands/subscribe/#{cmd}.rb", __dir__))
+      assert_includes src, 'report_missing_images(renderer)', "#{cmd} collects failures silently"
+    end
   end
 end
 

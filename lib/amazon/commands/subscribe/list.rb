@@ -37,10 +37,12 @@ module Amazon
 
           Amazon::Config.load
           payload = cached("list:all=#{load_all}", fresh: fresh) { scrape(load_all) }
+          renderer = thumbnails(images, IMAGE_ROWS)
           Amazon::Formatter.new(json: @global.json).subscriptions(
             payload["rows"], total: payload["total"], loaded_all: load_all,
-            thumbnails: thumbnails(images, IMAGE_ROWS)
+            thumbnails: renderer
           )
+          report_missing_images(renderer)
           0
         end
 

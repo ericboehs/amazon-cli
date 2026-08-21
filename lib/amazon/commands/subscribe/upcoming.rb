@@ -56,8 +56,10 @@ module Amazon
             { "cards" => cards, "_degraded" => worker.degradations }
           end
           cards = payload["cards"]
+          renderer = thumbnails(images, IMAGE_ROWS)
           Amazon::Formatter.new(json: @global.json)
-            .deliveries(cards, limit: limit, thumbnails: thumbnails(images, IMAGE_ROWS))
+            .deliveries(cards, limit: limit, thumbnails: renderer)
+          report_missing_images(renderer)
           0
         end
 

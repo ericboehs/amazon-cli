@@ -38,6 +38,16 @@ module Amazon
 
     attr_reader :cols, :rows
 
+    # How many photos were wanted and couldn't be had.
+    #
+    # Every failure in here returns nil, on purpose: a thumbnail is decoration
+    # and none of it should interrupt a listing. But three nils deep, a blank
+    # left margin is indistinguishable from a product that has no photo, and
+    # the user is left to wonder whether the CLI or their network is broken.
+    # Counting them costs nothing and lets the caller say one sentence at the
+    # end instead of nothing at all.
+    attr_reader :failures
+
     # `rows` drives everything: the width follows from it, because terminal
     # cells are about twice as tall as they are wide and a thumbnail that
     # ignores that is a portrait of a squashed bottle.
@@ -55,6 +65,8 @@ module Amazon
 
       @stream = stream
       @cache = {}
+      # Not for control flow — for saying so afterwards. See `failures`.
+      @failures = 0
       # Eight threads write to @cache. CRuby's GVL makes that survivable in
       # practice rather than by contract, and this costs nothing on a Hash
       # that is written 59 times.
@@ -127,9 +139,11 @@ module Amazon
     # Distinct from `download`'s own rescue: that one knows which failures are
     # expected, this one exists because the list is never complete.
     def safe_download(url)
-      download(url)
-    rescue StandardError => e
-      warn "amazon: could not fetch a thumbnail (#{e.class}) — showing text only" if $VERBOSE
+      path = download(url)
+      @failures += 1 if path.nil?
+      path
+    rescue StandardError
+      @failures += 1
       nil
     end
 

@@ -28,6 +28,16 @@ module Amazon
           warn "amazon: #{reason}" if requested
           nil
         end
+
+        # Say once, after the listing, that some photos are missing. Without
+        # this a failed download is three layers of silent nil and a blank
+        # margin that looks exactly like a product with no picture.
+        def report_missing_images(renderer)
+          return unless renderer&.failures&.positive?
+
+          warn "amazon: #{renderer.failures} " \
+               "#{renderer.failures == 1 ? "photo" : "photos"} could not be fetched"
+        end
       end
     end
   end
