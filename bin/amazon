@@ -7,6 +7,7 @@ ROOT = Pathname(__dir__).join("..").realpath
 $LOAD_PATH.unshift(ROOT.join("lib").to_s)
 
 require "amazon/config"
+require "amazon/secrets"
 require "amazon/cache"
 require "amazon/store"
 require "amazon/reviews"

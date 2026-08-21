@@ -46,6 +46,7 @@ Minitest.after_run { FileUtils.remove_entry(TMP) if File.directory?(TMP) }
 
 $LOAD_PATH.unshift(File.join(ROOT, 'lib'))
 require 'amazon/config'
+require 'amazon/secrets'
 require 'amazon/cache'
 require 'amazon/store'
 require 'amazon/reviews'
@@ -111,9 +112,25 @@ ensure
   mod.const_set(name, original)
 end
 
-def write_config!
+def write_config!(extra = {})
   Amazon::Config.ensure_dirs!
-  File.write(Amazon::Config.config_path, JSON.generate({ 'email' => 'test@example.com' }))
+  File.write(Amazon::Config.config_path, JSON.generate({ 'email' => 'test@example.com' }.merge(extra)))
+end
+
+# Swaps the 1Password reader for a hash. Nothing in the suite may shell out to
+# `op` — it would prompt for a fingerprint on the developer's machine and hang
+# forever on CI.
+def with_secrets(values)
+  original = Amazon::Secrets.method(:read)
+  Amazon::Secrets.define_singleton_method(:read) do |ref|
+    value = values[ref]
+    raise Amazon::Secrets::Error, "op read failed for #{ref}: not signed in" if value.nil?
+
+    value
+  end
+  yield
+ensure
+  Amazon::Secrets.define_singleton_method(:read, original)
 end
 
 # All tests share one XDG root, so wipe the archive before seeding — otherwise
@@ -5106,5 +5123,226 @@ class DeliveryThumbnailLayoutTest < Minitest::Test
     out, = capture_io_streams { fmt.deliveries([SAMPLE_DELIVERY]) }
     assert_match(/^\s+\$14\.22\s+Example Laundry Detergent/, out)
     refute_includes out, "\e7"
+  end
+end
+
+# The password reaches the browser worker over a pipe and is never written
+# anywhere. These tests run a fake worker that echoes its stdin back, which is
+# the only way to prove what was sent without reading a real Chrome window.
+class LoginCredentialsTest < Minitest::Test
+  ECHO = <<~'SCRIPT'
+    line = $stdin.gets
+    puts({ event: 'log', msg: "stdin=#{line.to_s.strip}" }.to_json)
+    puts({ event: 'done', count: 1, cookies_path: '/tmp/cookies.json' }.to_json)
+  SCRIPT
+
+  def login = Amazon::Commands::Login.new(Amazon::GlobalOptions.new(json: false, quiet: false, verbose: false))
+
+  def run_login(argv = [], refs: {}, secrets: {})
+    write_config!(refs)
+    with_secrets(secrets) do
+      with_login_python(ECHO) { capture_io_streams { login.run(argv) } }
+    end
+  end
+
+  def sent(err)
+    line = err.lines.find { |l| l.include?("stdin=") }
+    JSON.parse(line.split("stdin=", 2).last.strip)
+  end
+
+  def test_the_password_and_otp_are_handed_to_the_worker
+    _, err = run_login(
+      refs: { 'password_op_ref' => 'op://Personal/Amazon/password', 'otp_op_ref' => 'op://Personal/Amazon/otp' },
+      secrets: { 'op://Personal/Amazon/password' => 'hunter2',
+                 'op://Personal/Amazon/otp' => 'otpauth://totp/Amazon?secret=JBSWY3DPEHPK3PXP' }
+    )
+    assert_equal({ 'password' => 'hunter2', 'otp_secret' => 'otpauth://totp/Amazon?secret=JBSWY3DPEHPK3PXP' },
+                 sent(err))
+  end
+
+  # The OTP is optional; a config with only a password must not send a null and
+  # must not read a ref that isn't there.
+  def test_a_missing_otp_ref_is_simply_absent
+    _, err = run_login(
+      refs: { 'password_op_ref' => 'op://Personal/Amazon/password' },
+      secrets: { 'op://Personal/Amazon/password' => 'hunter2' }
+    )
+    assert_equal({ 'password' => 'hunter2' }, sent(err))
+  end
+
+  # Every failure here is recoverable by a human with a keyboard, so none of
+  # them may stop the login.
+  def test_a_1password_failure_warns_and_carries_on
+    _, err = run_login(
+      refs: { 'password_op_ref' => 'op://Personal/Amazon/password' },
+      secrets: {}
+    )
+    assert_includes err, 'no credentials from 1Password'
+    assert_includes err, 'sign in by hand'
+    assert_includes err, 'saved 1 cookies'
+    assert_equal 'stdin=', err.lines.find { |l| l.include?('stdin=') }.strip
+  end
+
+  def test_no_ref_in_config_means_nothing_is_sent
+    _, err = run_login
+    assert_equal 'stdin=', err.lines.find { |l| l.include?('stdin=') }.strip
+    refute_includes err, '1Password'
+  end
+
+  # --manual is for when you'd rather type it, and it must not touch `op` at
+  # all — reading the ref is what triggers the fingerprint prompt.
+  def test_manual_skips_1password_entirely
+    write_config!('password_op_ref' => 'op://Personal/Amazon/password')
+    asked = []
+    with_secrets({}) do
+      Amazon::Secrets.define_singleton_method(:read) { |ref| asked << ref; 'never' }
+      _, err = with_login_python(ECHO) { capture_io_streams { login.run(%w[--manual]) } }
+      assert_empty asked
+      assert_equal 'stdin=', err.lines.find { |l| l.include?('stdin=') }.strip
+    end
+  end
+
+  # No config file means autofill was never on offer, so there is nothing to
+  # apologise for — the window opens and you type, exactly as before.
+  def test_a_missing_config_is_neither_fatal_nor_worth_mentioning
+    FileUtils.rm_f(Amazon::Config.config_path)
+    with_secrets({}) do
+      _, err = with_login_python(ECHO) { capture_io_streams { assert_equal 0, login.run([]) } }
+      refute_includes err, '1Password'
+      assert_equal 'stdin=', err.lines.find { |l| l.include?('stdin=') }.strip
+    end
+  end
+
+  # A worker that exits before reading leaves us writing into a closed pipe.
+  # That is its stderr's story to tell, not an EPIPE traceback's.
+  def test_a_worker_that_never_reads_stdin_does_not_crash_the_cli
+    write_config!('password_op_ref' => 'op://Personal/Amazon/password')
+    body = <<~'SCRIPT'
+      puts({ event: 'error', msg: 'playwright not installed' }.to_json)
+      exit 2
+    SCRIPT
+    with_secrets({ 'op://Personal/Amazon/password' => 'hunter2' }) do
+      _, err = with_login_python(body) { capture_io_streams { assert_equal 2, login.run([]) } }
+      assert_includes err, 'playwright not installed'
+    end
+  end
+
+  def test_an_unknown_option_is_a_usage_error
+    _, err = capture_io_streams { assert_equal 2, login.run(%w[--headless]) }
+    assert_includes err, 'unknown login option: --headless'
+  end
+
+  def test_the_help_explains_the_extension_less_window
+    out, = capture_io_streams { assert_equal 0, login.run(%w[--help]) }
+    assert_includes out, '--manual'
+    assert_includes out, 'no extensions'
+  end
+end
+
+# Nothing in here may run the real `op`. An earlier draft of this file called
+# Secrets.read with a live reference to see it fail, and instead of failing it
+# succeeded — printing a real password into the test output. A unit test is not
+# a place to find out whether your 1Password session happens to be unlocked.
+class SecretsTest < Minitest::Test
+  def with_capture3(out:, err:, ok:)
+    original = Open3.method(:capture3)
+    status = Object.new
+    status.define_singleton_method(:success?) { ok }
+    calls = []
+    Open3.define_singleton_method(:capture3) do |*args|
+      calls << args
+      [out, err, status]
+    end
+    yield calls
+  ensure
+    Open3.define_singleton_method(:capture3, original)
+  end
+
+  def test_it_shell_quotes_the_reference
+    assert_includes Amazon::Secrets.command('op://Personal/Amazon/password').last,
+                    "op read 'op://Personal/Amazon/password'"
+  end
+
+  # `\'` in a gsub *replacement* string is $POSTMATCH, not an escaped quote, so
+  # the two-arg form pasted the rest of the string in after every apostrophe.
+  def test_an_apostrophe_is_quoted_and_not_duplicated
+    quoted = Amazon::Secrets.command("op://it's/x").last
+    assert_includes quoted, %q(op read 'op://it'\''s/x')
+    refute_includes quoted, "s/xs/x"
+  end
+
+  def test_it_signs_in_before_reading
+    assert_includes Amazon::Secrets.command('op://a/b').last, 'op signin --account my'
+  end
+
+  def test_a_successful_read_is_chomped
+    with_capture3(out: "hunter2\n", err: '', ok: true) do |calls|
+      assert_equal 'hunter2', Amazon::Secrets.read('op://Personal/Amazon/password')
+      assert_equal Amazon::Secrets.command('op://Personal/Amazon/password'), calls.first
+    end
+  end
+
+  # The message names the reference, never the value — this is the string that
+  # ends up in a warning on someone's terminal.
+  def test_a_failed_read_names_the_ref
+    with_capture3(out: '', err: "authorization prompt dismissed\n", ok: false) do
+      e = assert_raises(Amazon::Secrets::Error) { Amazon::Secrets.read('op://Personal/Amazon/password') }
+      assert_includes e.message, 'op://Personal/Amazon/password'
+      assert_includes e.message, 'authorization prompt dismissed'
+    end
+  end
+end
+
+class LoginPipeTest < Minitest::Test
+  def login = Amazon::Commands::Login.new(Amazon::GlobalOptions.new(json: false, quiet: false, verbose: false))
+
+  # A worker that dies before reading leaves us writing into a closed pipe.
+  # Its stderr already says why; an EPIPE traceback on top would bury that.
+  def test_writing_to_a_closed_pipe_is_survivable
+    read_end, write_end = IO.pipe
+    read_end.close
+    login.send(:send_request, write_end, { password: 'hunter2' })
+  end
+
+  def test_an_empty_request_writes_nothing_and_still_closes
+    read_end, write_end = IO.pipe
+    login.send(:send_request, write_end, {})
+    assert write_end.closed?
+    assert_equal '', read_end.read
+  end
+
+  # An error with no message at all still has to produce a sentence.
+  def test_a_wordless_failure_still_warns
+    write_config!('password_op_ref' => 'op://Personal/Amazon/password')
+    original = Amazon::Secrets.method(:read)
+    Amazon::Secrets.define_singleton_method(:read) { |_ref| raise Amazon::Secrets::Error, '' }
+    _, err = capture_io_streams { assert_empty login.send(:credentials) }
+    assert_includes err, 'no credentials from 1Password'
+  ensure
+    Amazon::Secrets.define_singleton_method(:read, original)
+  end
+
+  # Events this version doesn't know about are Amazon's problem to add and
+  # ours to ignore, not to print raw.
+  def test_an_unknown_event_is_ignored
+    body = <<~'SCRIPT'
+      puts({ event: 'heartbeat', beat: 3 }.to_json)
+      puts({ event: 'done', count: 1, cookies_path: '/tmp/cookies.json' }.to_json)
+    SCRIPT
+    with_login_python(body) do
+      _, err = capture_io_streams { assert_equal 0, login.run([]) }
+      refute_includes err, 'heartbeat'
+      assert_includes err, 'saved 1 cookies'
+    end
+  end
+
+  # No venv means the system interpreter, which is how this runs on a machine
+  # that installed the deps globally.
+  def test_it_falls_back_to_system_python
+    original = File.method(:executable?)
+    File.define_singleton_method(:executable?) { |_path| false }
+    assert_equal 'python3', login.send(:python_cmd).first
+  ensure
+    File.define_singleton_method(:executable?, original)
   end
 end

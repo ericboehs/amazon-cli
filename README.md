@@ -130,6 +130,7 @@ lib/amazon/
     search.rb           live product search
     order.rb            `amazon order …` dispatcher
     order/              sync, list, show, search over the local archive
+    secrets.rb          1Password reads, for sync and login
     thumbnail.rb        product photos in the terminal, via chafa
     subscribe.rb        `amazon subscribe …` dispatcher
     subscribe/          list, upcoming, show (Subscribe & Save, read-only)
@@ -144,6 +145,7 @@ pyworker/
   fetch.py              order history: drives amazon-orders, emits NDJSON
   live.py               live product/search scraper
   subscriptions.py      Subscribe & Save scraper (subscriptions + deliveries)
+  otp.py                TOTP secrets, shared by sync and login
   browser.py            shared Playwright session + selector fallbacks
   login.py              Playwright headed login, persists cookies
   test_live.py          unittest for the parsing helpers (no browser needed)
@@ -217,6 +219,16 @@ brew install chafa
 }
 ```
 
+`amazon login` uses both refs too: it types the password into the browser
+window and answers the authenticator prompt with a code derived from
+`otp_op_ref`, leaving the window open only for the things a human has to do —
+a captcha, a "was this you?". It also clicks "Not now" on Amazon's
+post-sign-in upsells, which is otherwise where the flow parks itself while
+you're looking somewhere else. `--manual` turns all of that off. Note the
+window is a throwaway Chrome profile with no extensions, so your password
+manager's toolbar button isn't in it; that's what makes the autofill worth
+having.
+
 The `op://` references use the [1Password CLI](https://developer.1password.com/docs/cli/);
 swap in your own password manager or just hardcode a value if you must.
 `otp_op_ref` can point directly at a 1Password one-time-password field: `op
@@ -226,7 +238,8 @@ without persisting or logging it. The Python worker never logs credentials.
 ## Use
 
 ```bash
-amazon login                  # one-time browser login (handles captcha + 2FA)
+amazon login                  # browser login; fills password + 2FA from 1Password
+amazon login --manual         # …or type them yourself
 ```
 
 ### Live (queries Amazon now)

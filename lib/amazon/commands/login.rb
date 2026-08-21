@@ -11,28 +11,44 @@ module Amazon
       end
 
       def run(argv)
+        manual = false
         while (a = argv.shift)
           case a
+          when "--manual" then manual = true
           when "-h", "--help"
             puts <<~HELP
-              Usage: amazon login
+              Usage: amazon login [--manual]
 
-              Opens a real browser window so you can log in to Amazon manually
-              (solving any captcha or 2FA), then waits until your order history
-              loads before saving anything — Amazon guards orders separately, so
-              a session that greets you by name still can't read them.
+              Opens a real browser window and signs you in to Amazon, then waits
+              until your order history loads before saving anything — Amazon
+              guards orders separately, so a session that greets you by name
+              still can't read them.
 
-              Cookies are saved so subsequent `amazon order sync` calls skip the
-              login flow.
+              With `password_op_ref` (and optionally `otp_op_ref`) in your
+              config, the password and 2FA code are read from 1Password and
+              typed in for you, leaving the window there for anything only a
+              human can do — a captcha, a "was this you?" prompt. Without them,
+              or with --manual, you type everything yourself.
+
+              The window is a throwaway Chrome profile with no extensions, so
+              your password manager's toolbar button isn't in it. That is what
+              --manual costs you.
+
+              Cookies are saved so subsequent `amazon order sync` and
+              `amazon subscribe` calls skip the login flow.
             HELP
             return 0
+          else
+            warn "unknown login option: #{a}"
+            return 2
           end
         end
 
         Amazon::Config.ensure_dirs!
+        request = manual ? {} : credentials
 
         Open3.popen3(*python_cmd, chdir: PYWORKER) do |stdin, stdout, stderr, wait|
-          stdin.close
+          send_request(stdin, request)
           # Kept even when not printing it. login.py can die before it emits a
           # single event — a missing interpreter, a broken playwright install —
           # and the traceback explaining why is on this stream. Discarding it
@@ -81,6 +97,47 @@ module Amazon
       end
 
       private
+
+      # The password and TOTP, straight from 1Password to the worker's stdin.
+      #
+      # Silent when nothing was configured: no config file, or no
+      # `password_op_ref` in it, means autofill was never on offer, and a
+      # warning would be the CLI apologising for a feature you didn't ask for.
+      # A configured ref that fails to read is the opposite — you asked, and
+      # you need to know why the window is waiting.
+      #
+      # Either way the login continues. Every failure here is recoverable by a
+      # human with a keyboard, which is exactly what happened before this
+      # existed.
+      def credentials
+        ref = configured_password_ref
+        return {} unless ref
+
+        {
+          password: Amazon::Secrets.read(ref),
+          otp_secret: (otp = Amazon::Config.load.otp_op_ref) ? Amazon::Secrets.read(otp) : nil
+        }.compact
+      rescue StandardError => e
+        warn "amazon login: no credentials from 1Password (#{e.message.lines.first&.strip}) — sign in by hand"
+        {}
+      end
+
+      def configured_password_ref
+        Amazon::Config.load.password_op_ref
+      rescue StandardError
+        nil
+      end
+
+      # One line of JSON, then the pipe closes. The worker reads at most one
+      # line, so anything else would sit in a buffer nobody drains.
+      def send_request(stdin, request)
+        stdin.write("#{JSON.generate(request)}\n") unless request.empty?
+        stdin.close
+      rescue Errno::EPIPE
+        # The worker died before reading — its stderr says why, and that is a
+        # better message than a broken pipe.
+        nil
+      end
 
       def parse_event(line)
         JSON.parse(line)

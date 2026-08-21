@@ -35,9 +35,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
-
 from browser import session_rejected
+
+# Re-exported: the sync worker's request carries an OTP field, and test_fetch
+# has always imported this name from here.
+from otp import normalize_otp_secret  # noqa: F401
 
 # amazon-orders is imported inside `main()`, not here. CI runs the pyworker
 # tests on a bare interpreter with no dependency install, so anything imported
@@ -600,29 +602,6 @@ def _fetch_with_retry(api: Any, order: Any, backoff: list[float],
 def _name_some(numbers: list[str], limit: int = 5) -> str:
     shown = ", ".join(numbers[:limit])
     return shown + (f" (and {len(numbers) - limit} more)" if len(numbers) > limit else "")
-
-
-def normalize_otp_secret(value: Any) -> str | None:
-    """Turn a 1Password TOTP field into the secret amazon-orders expects.
-
-    ``op read`` returns an ``otpauth://`` URI for a one-time-password field,
-    while amazon-orders passes its argument to ``pyotp.TOTP`` as a raw Base32
-    secret. Accept both shapes so config can keep an ordinary 1Password field
-    reference instead of storing or duplicating the secret itself.
-    """
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value:
-        raise ValueError("the OTP value must be a non-empty string")
-    if not value.lower().startswith("otpauth://"):
-        return value
-
-    parsed = urlsplit(value)
-    secret = parse_qs(parsed.query).get("secret", [None])[0]
-    if not secret:
-        # Never include the URI in this message: its query string is the secret.
-        raise ValueError("the otpauth URI has no secret parameter")
-    return secret
 
 
 def main() -> int:
