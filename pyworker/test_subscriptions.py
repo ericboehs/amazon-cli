@@ -27,11 +27,19 @@ from subscriptions import (
     NAVIGATION_KEY,
     NEXT_DELIVERY_SELECTOR,
     PAGINATION_KEY,
+    CANCEL_CONFIRM,
+    CANCEL_CONSEQUENCES,
+    CANCEL_DIALOG,
+    CANCEL_HEADING,
+    CANCEL_REASON_SELECT,
+    CANCEL_SAVINGS,
     SCHEDULE_SELECTOR,
     SKIP_BUTTON,
     SUBSCRIPTION_CARD,
     SUBSCRIPTION_LIST_URL,
+    CancelReasonUnknown,
     NoSuchSubscription,
+    NotCancellable,
     NotSkippable,
     _cards,
     _card_by_query,
@@ -51,8 +59,14 @@ from subscriptions import (
     parse_label_date,
     parse_schedule,
     product_image,
+    _texts,
+    cancel_reasons,
+    cancel_subscription,
+    choose_reason,
+    savings_text,
     open_deliveries_tab,
     skip_delivery_item,
+    verify_cancelled,
     verify_skipped,
     scrape_delivery_card,
     scrape_delivery_item,
@@ -1196,3 +1210,225 @@ class SkipDeliveryItemTest(unittest.TestCase):
                 self.assertTrue(buttons)
             else:
                 self.assertEqual(buttons, [])
+
+
+class CancelReasonsTest(unittest.TestCase):
+    """The reason dropdown, read off the captured cancellation page."""
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        self.page = DomPage.from_fixture("cancel_subscription.html")
+        self.reasons = cancel_reasons(self.page)
+
+    def test_it_reads_every_reason_amazon_offers(self):
+        self.assertEqual(len(self.reasons), 8)
+        self.assertIn("stopped_using", [r["key"] for r in self.reasons])
+
+    # The prompt option has an empty value and is not a reason; sending it
+    # would be sending the string "Select reason for cancellation".
+    def test_the_placeholder_is_not_a_reason(self):
+        self.assertNotIn("", [r["value"] for r in self.reasons])
+        labels = [r["label"] for r in self.reasons]
+        self.assertNotIn("Select reason for cancellation", labels)
+
+    # Keys are the memorable tail of a 56-character value. Hard-coding the
+    # whole string would also hard-code Amazon's internal naming.
+    def test_keys_are_the_tail_of_amazons_value(self):
+        r = next(r for r in self.reasons if r["key"] == "accident")
+        self.assertTrue(r["value"].startswith("SnS_MYD_SnsCancelReason_"))
+        self.assertTrue(r["value"].endswith("accident"))
+
+    def test_no_reason_asked_for_means_none_is_sent(self):
+        self.assertIsNone(choose_reason(self.reasons, None))
+        self.assertIsNone(choose_reason(self.reasons, ""))
+
+    def test_a_key_resolves_to_the_option_value(self):
+        self.assertTrue(choose_reason(self.reasons, "accident").endswith("accident"))
+
+    def test_hyphens_are_forgiven(self):
+        self.assertEqual(
+            choose_reason(self.reasons, "stopped-using"),
+            choose_reason(self.reasons, "stopped_using"),
+        )
+
+    def test_the_full_label_works_too(self):
+        value = choose_reason(self.reasons, "I no longer use this product")
+        self.assertTrue(value.endswith("stopped_using"))
+
+    # Silently sending no reason would be a worse answer than an error: the
+    # user asked to say something specific and would never learn it wasn't
+    # said.
+    def test_an_unknown_reason_is_refused_and_lists_the_real_ones(self):
+        with self.assertRaises(CancelReasonUnknown) as e:
+            choose_reason(self.reasons, "too_many_cats")
+        self.assertIn("no_more_needed", str(e.exception))
+
+
+class CancelPageTest(unittest.TestCase):
+    """What the cancellation page says, before anyone agrees to it."""
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        self.page = DomPage.from_fixture("cancel_subscription.html")
+
+    def test_the_heading_is_amazons_question(self):
+        self.assertEqual(text(self.page, CANCEL_HEADING), "Cancel your subscription?")
+
+    # The two consequences are the whole reason the dry run exists. The second
+    # is the one that surprises people: cancelling also cancels the order in
+    # the box that is being assembled right now.
+    def test_it_reads_back_what_cancelling_costs(self):
+        said = _texts(self.page, CANCEL_CONSEQUENCES)
+        self.assertIn("You will no longer receive your Subscribe & Save discount.", said)
+        self.assertTrue(any("haven't yet entered the delivery process" in s for s in said))
+
+    def test_the_savings_banner_is_carried_through(self):
+        self.assertIn("$16.92", savings_text(self.page, CANCEL_SAVINGS))
+
+    # The screen-reader copy of the amount is not a second amount. Shown to a
+    # user, "You have saved $16.92 $16.92 on this subscription!" reads as a
+    # rendering bug, which is what it is.
+    def test_the_screen_reader_duplicate_is_not_printed_twice(self):
+        said = savings_text(self.page, CANCEL_SAVINGS)
+        self.assertEqual(said.count("$16.92"), 1)
+        self.assertEqual(said, "You have saved $16.92 on this subscription!")
+
+    def test_the_same_banner_on_the_detail_page_is_deduped_too(self):
+        detail = DomPage.from_fixture("subscription_detail.html")
+        self.assertEqual(savings_text(detail, CANCEL_SAVINGS).count("$12.34"), 1)
+
+    def test_a_banner_that_is_not_there_stays_none(self):
+        self.assertIsNone(savings_text(DomPage("<div></div>"), CANCEL_SAVINGS))
+
+    def test_the_confirm_button_is_where_we_think_it_is(self):
+        self.assertEqual(self.page.locator(CANCEL_CONFIRM).count(), 1)
+
+
+class CancelPage(SkipPage):
+    """The cancel flow: a list to resolve the target, then Amazon's own page.
+
+    `select_option` records rather than acts, because what matters is which
+    value would have been sent — a fake that "selected" something could not
+    tell an unsent reason from a wrong one.
+    """
+
+    def __init__(self, *, has_form=True, still_listed=False):
+        super().__init__(tab=False)
+        self._has_form = has_form
+        self._still_listed = still_listed
+        self.selected = []
+        self.cancelled = False
+        self._load_list()
+
+    def _load_list(self):
+        html = (FIXTURES / "subscriptions_list.html").read_text(encoding="utf-8")
+        root = self._soup.select_one("#root")
+        # Inside the container the real selector insists on: cards loose in the
+        # page are exactly what a broken scrape sees, and would make this fake
+        # disagree with production about what "found it" means.
+        box = BeautifulSoup(
+            '<div class="subscription-list-container"></div>', "html.parser"
+        ).div
+        for card in BeautifulSoup(html, "html.parser").select(SUBSCRIPTION_CARD):
+            box.append(card)
+        root.append(box)
+
+    def goto(self, url, **_kw):
+        self.gotos.append(url)
+        root = self._soup.select_one("#root")
+        if "cancelSubscription" in url:
+            root.clear()
+            if self._has_form:
+                page = (FIXTURES / "cancel_subscription.html").read_text(encoding="utf-8")
+                root.append(BeautifulSoup(page, "html.parser").select_one(CANCEL_DIALOG))
+        else:
+            root.clear()
+            if not self.cancelled or self._still_listed:
+                self._load_list()
+
+    def select_option(self, selector, value):
+        self.selected.append((selector, value))
+
+    def clicked(self, node, timeout):
+        super().clicked(node, timeout)
+        if node.get("id") == "confirmCancelLink":
+            self.cancelled = True
+
+
+class CancelSubscriptionTest(unittest.TestCase):
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        self.page = CancelPage()
+
+    def cancel(self, query="Dishwasher", confirm=False, reason=None, sub_id=None):
+        return cancel_subscription(self.page, sub_id, query, confirm, reason)
+
+    def test_a_dry_run_reads_the_page_and_agrees_to_nothing(self):
+        result = self.cancel()
+        self.assertFalse(result["cancelled"])
+        self.assertIsNone(result["verified"])
+        self.assertEqual(result["heading"], "Cancel your subscription?")
+        self.assertEqual(len(result["consequences"]), 2)
+        self.assertFalse(self.page.cancelled)
+
+    # Resolved through the list, so a title search works and a stray id gets a
+    # refusal instead of somebody else's cancellation page.
+    def test_the_target_is_resolved_before_the_cancel_page_is_opened(self):
+        result = self.cancel()
+        self.assertTrue(result["subscription_id"].startswith("SNS"))
+        self.assertIn(result["subscription_id"], self.page.gotos[-1])
+        self.assertTrue(result["title"])
+
+    def test_the_dry_run_offers_the_reasons_it_would_accept(self):
+        self.assertIn("accident", self.cancel()["reasons"])
+
+    def test_confirming_clicks_through_and_verifies_it_is_gone(self):
+        result = self.cancel(confirm=True)
+        self.assertTrue(result["cancelled"])
+        self.assertTrue(result["verified"])
+        self.assertIn("confirmCancelLink", [c[1] for c in self.page.clicks])
+
+    # Amazon's page reloads either way; only the list says which happened.
+    def test_a_subscription_still_listed_afterwards_is_reported_as_such(self):
+        self.page = CancelPage(still_listed=True)
+        result = self.cancel(confirm=True)
+        self.assertTrue(result["cancelled"])
+        self.assertIs(result["verified"], False)
+
+    def test_a_verification_that_cannot_be_made_is_none(self):
+        page = CancelPage()
+        page.goto = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("network"))
+        self.assertIsNone(verify_cancelled(page, "SNSD0_FIXTURESUB0000000001"))
+
+    # Amazon marks the field "(Optional)", so the default puts no words in the
+    # user's mouth.
+    def test_no_reason_is_sent_unless_one_was_asked_for(self):
+        self.cancel(confirm=True)
+        self.assertEqual(self.page.selected, [])
+
+    def test_a_reason_reaches_the_dropdown(self):
+        self.cancel(confirm=True, reason="accident")
+        selector, value = self.page.selected[0]
+        self.assertEqual(selector, CANCEL_REASON_SELECT)
+        self.assertTrue(value.endswith("accident"))
+
+    # Refused before the confirm click, not after: a cancellation that went
+    # through with the wrong reason attached cannot be taken back.
+    def test_a_bad_reason_stops_before_anything_is_clicked(self):
+        with self.assertRaises(CancelReasonUnknown):
+            self.cancel(confirm=True, reason="too_many_cats")
+        self.assertFalse(self.page.cancelled)
+
+    def test_a_page_with_no_cancel_form_is_a_refusal_not_a_crash(self):
+        self.page = CancelPage(has_form=False)
+        with self.assertRaises(NotCancellable) as e:
+            self.cancel()
+        self.assertIn("already be cancelled", str(e.exception))
+
+    def test_an_unknown_subscription_never_reaches_a_cancel_page(self):
+        with self.assertRaises(NoSuchSubscription):
+            self.cancel(query="bicycle")
+        self.assertFalse(any("cancelSubscription" in u for u in self.page.gotos))

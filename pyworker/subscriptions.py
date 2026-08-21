@@ -94,6 +94,18 @@ DELIVERY_HEADER = ".delivery-header-message"
 MODAL_WAIT_MS = 15000
 TAB_WAIT_MS = 20000
 
+CANCEL_URL = "https://www.amazon.com/auto-deliveries/cancelSubscription?subscriptionId={}"
+CANCEL_DIALOG = "#cancel-subscription-dialog"
+CANCEL_HEADING = f"{CANCEL_DIALOG} h1"
+# Amazon's own list of what cancelling does. Two items today, and the second
+# one — that a box already being assembled gets cancelled too — is the one
+# nobody expects from a word like "cancel".
+CANCEL_CONSEQUENCES = f"{CANCEL_DIALOG} ul li"
+CANCEL_SAVINGS = "#subscription-savings-banner"
+CANCEL_REASON_SELECT = "#sns-cancellation-dropdown"
+CANCEL_CONFIRM = "#confirmCancelLink"
+CANCEL_FORM = "form[name=cancelForm]"
+
 # `.a-truncate-full` is the untruncated copy Amazon keeps for screen readers;
 # `.a-truncate-cut` next to it is the visible one, ellipsised mid-word. Reading
 # the cut span would silently store "Cascade Free & Clear Dishwasher Detergent…"
@@ -779,8 +791,16 @@ def _card_by_query(page: Any, query: str) -> Any:
     return matches[0][0] if matches else None
 
 
+class CancelReasonUnknown(RuntimeError):
+    """The reason asked for is not one Amazon offers."""
+
+
 class NotSkippable(RuntimeError):
     """The subscription exists but nothing about it can be skipped right now."""
+
+
+class NotCancellable(RuntimeError):
+    """Amazon will not offer a cancellation for this subscription."""
 
 
 def open_deliveries_tab(page: Any) -> None:
@@ -955,6 +975,141 @@ def verify_skipped(page: Any, sub_id: str | None) -> bool | None:
         return None
 
 
+# `.a-price` renders the amount twice: once visible, once in an `.a-offscreen`
+# span for screen readers. That class clips rather than hides, so innerText
+# includes both and the banner reads "You have saved $3.90 $3.90 on this
+# subscription!". `first_money` already copes when parsing a number out of it;
+# this is for the times the sentence itself is shown to someone.
+DOUBLED_MONEY_RE = re.compile(r"(\$[\d,]+(?:\.\d+)?)\s*\1")
+
+
+def savings_text(scope: Any, selector: str) -> str | None:
+    raw = text(scope, selector)
+    return DOUBLED_MONEY_RE.sub(r"\1", raw) if raw else raw
+
+
+def cancel_reasons(page: Any) -> list[dict[str, str]]:
+    """The reason dropdown, as {key, value, label}.
+
+    Keys are derived from Amazon's option values rather than hard-coded:
+    the values are 60-character strings like
+    `SnS_MYD_SnsCancelReason_sns_cancel_reason_no_more_needed`, and the tail is
+    the only part of that a person could remember. Deriving them also means a
+    reason Amazon adds or renames shows up in `--help` output on its own.
+    """
+    out = []
+    for opt in _cards(page, f"{CANCEL_REASON_SELECT} option"):
+        try:
+            value = opt.get_attribute("value") or ""
+            label = (opt.inner_text() or "").strip()
+        except Exception:  # noqa: BLE001
+            continue
+        if not value:
+            continue  # the "Select reason for cancellation" prompt
+        out.append({"key": value.rsplit("sns_cancel_reason_", 1)[-1], "value": value, "label": label})
+    return out
+
+
+def choose_reason(reasons: Sequence[dict[str, str]], wanted: str | None) -> str | None:
+    """Amazon's option value for a reason key, or None to send no reason.
+
+    None is the default and it is deliberate: Amazon marks this field
+    "(Optional)", so a CLI that invented one would be putting words in the
+    user's mouth to a company that reads them.
+    """
+    if not wanted:
+        return None
+    needle = wanted.strip().lower().replace("-", "_")
+    for r in reasons:
+        if needle in (r["key"], r["label"].lower()):
+            return r["value"]
+    known = ", ".join(r["key"] for r in reasons)
+    raise CancelReasonUnknown(f"unknown cancellation reason {wanted!r}. Amazon offers: {known}")
+
+
+def open_cancel_page(page: Any, sub_id: str) -> None:
+    page.goto(CANCEL_URL.format(sub_id), wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(PAGE_SETTLE_MS)
+    guard(page)
+    if page.locator(CANCEL_FORM).count() == 0:
+        raise NotCancellable(
+            f"Amazon did not offer a cancellation form for {sub_id} — it may "
+            "already be cancelled. `amazon subscribe list` shows what is active."
+        )
+
+
+def cancel_subscription(
+    page: Any, sub_id: str | None, query: str | None, confirm: bool, reason: str | None
+) -> dict[str, Any]:
+    """Cancel a subscription outright, or read back what doing so would cost.
+
+    Resolved through the subscription list rather than by trusting the id
+    straight to a URL, so a typo is a refusal instead of a cancel page for
+    something that isn't yours to see — and so a title search works here the
+    same way it does everywhere else.
+    """
+    card = find_subscription_card(page, sub_id, query)
+    resolved = card.get_attribute("data-subscription-id")
+    from_card = scrape_subscription_card(card) or {}
+
+    open_cancel_page(page, resolved)
+    reasons = cancel_reasons(page)
+    value = choose_reason(reasons, reason)
+
+    result = {
+        "subscription_id": resolved,
+        "title": from_card.get("title"),
+        "next_delivery_date": from_card.get("next_delivery_date"),
+        "next_delivery_label": from_card.get("next_delivery_label"),
+        "heading": text(page, CANCEL_HEADING),
+        # Amazon's words for what is lost, in Amazon's order.
+        "consequences": [t for t in _texts(page, CANCEL_CONSEQUENCES) if t],
+        "lifetime_savings_text": savings_text(page, CANCEL_SAVINGS),
+        "reasons": [r["key"] for r in reasons],
+        "reason": reason,
+        "cancelled": False,
+        "verified": None,
+    }
+    if not confirm:
+        return result
+
+    if value:
+        page.select_option(CANCEL_REASON_SELECT, value)
+    confirm_button = page.locator(CANCEL_CONFIRM).first
+    if not _clickable(confirm_button):
+        raise RuntimeError("the cancel page has no confirm button")
+    confirm_button.click(timeout=CLICK_TIMEOUT_MS)
+    page.wait_for_timeout(PAGE_SETTLE_MS)
+    result["cancelled"] = True
+    result["verified"] = verify_cancelled(page, resolved)
+    return result
+
+
+def verify_cancelled(page: Any, sub_id: str) -> bool | None:
+    """Gone from the active list, checked across every page of it.
+
+    Pages through rather than reading the first thirty: a subscription that
+    was on page two before the cancel is absent from page one either way, and
+    a check that can only return "yes" is not a check.
+    """
+    try:
+        open_subscription_list(page)
+        load_all_pages(page)
+        return _card_by_id(page, sub_id) is None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _texts(scope: Any, selector: str) -> list[str]:
+    out = []
+    for node in _cards(scope, selector):
+        try:
+            out.append(clean_text(node.inner_text()))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 def edit_modal_url(card: Any) -> str | None:
     """The modal URL the card publishes for itself, if it still does."""
     for node in _cards(card, "[data-a-modal]"):
@@ -1004,7 +1159,7 @@ def scrape_subscription_detail(page: Any) -> dict[str, Any]:
                 f"{DETAIL_SAVINGS_BOX} .a-price",
             )
         ),
-        "lifetime_savings_text": text(page, DETAIL_SAVINGS_BOX),
+        "lifetime_savings_text": savings_text(page, DETAIL_SAVINGS_BOX),
         "tier_level": attr(page, "[data-tiered-level]", "data-tiered-level"),
         # Which actions Amazon is offering on this subscription. Read-only
         # today, but it is the difference between "you can cancel this" and
@@ -1131,6 +1286,27 @@ def main() -> int:
                     emit("skip", data=skip_delivery_item(page, sub_id, query, confirm))
                     emit("done", count=1)
 
+                elif action == "cancel":
+                    sub_id = req.get("subscription_id")
+                    query = req.get("query")
+                    if not sub_id and not query:
+                        emit("error", msg="cancel requires subscription_id or query")
+                        return 2
+                    confirm = bool(req.get("confirm"))
+                    emit(
+                        "log",
+                        level="info",
+                        msg=("cancelling " if confirm else "checking what cancelling ")
+                        + f"{sub_id or query} would do",
+                    )
+                    emit(
+                        "cancel",
+                        data=cancel_subscription(
+                            page, sub_id, query, confirm, req.get("reason")
+                        ),
+                    )
+                    emit("done", count=1)
+
                 else:
                     emit("error", msg=f"unknown action: {action!r}")
                     return 2
@@ -1142,6 +1318,9 @@ def main() -> int:
     except Blocked as e:
         emit("error", msg=str(e), kind="blocked")
         return 1
+    except (NotCancellable, CancelReasonUnknown) as e:
+        emit("error", msg=str(e), kind="not_cancellable")
+        return 2
     except NotSkippable as e:
         # Not a failure of ours and not a user typo either — the account is
         # simply not in a state where this can happen.

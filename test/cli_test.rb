@@ -72,6 +72,7 @@ require 'amazon/commands/subscribe/images'
 require 'amazon/commands/subscribe/list'
 require 'amazon/commands/subscribe/show'
 require 'amazon/commands/subscribe/skip'
+require 'amazon/commands/subscribe/cancel'
 require 'amazon/commands/subscribe/upcoming'
 
 require 'minitest/autorun'
@@ -3655,13 +3656,45 @@ class FakeSubscribeWorker
     @skip_result.merge('confirmed' => confirm)
   end
 
-  attr_reader :asked_for, :asked_confirm
+  def cancel(target, confirm:, reason: nil)
+    @calls += 1
+    @asked_for = target
+    @asked_confirm = confirm
+    @asked_reason = reason
+    return nil unless @cancel_result
+
+    @cancel_result.merge('cancelled' => confirm)
+  end
+
+  attr_reader :asked_for, :asked_confirm, :asked_reason
 
   def with_skip(result)
     @skip_result = result
     self
   end
+
+  def with_cancel(result)
+    @cancel_result = result
+    self
+  end
 end
+
+SAMPLE_CANCEL = {
+  'subscription_id' => 'SNSD0_FIXTURESUB0000000001',
+  'title' => 'Example Dishwasher Detergent Gel, Lemon, 75oz',
+  'next_delivery_label' => 'September 30',
+  'next_delivery_date' => '2026-09-30',
+  'heading' => 'Cancel your subscription?',
+  'consequences' => [
+    'You will no longer receive your Subscribe & Save discount.',
+    "We will cancel any orders of this item that haven't yet entered the delivery process."
+  ],
+  'lifetime_savings_text' => "You have saved\n$16.92\n$16.92 on this subscription!",
+  'reasons' => %w[no_more_needed stopped_using accident other],
+  'reason' => nil,
+  'cancelled' => false,
+  'verified' => nil
+}.freeze
 
 SAMPLE_SKIP = {
   'subscription_id' => 'SNSD0_FIXTURESUB0000000001',
@@ -4493,6 +4526,56 @@ class SubscribeWorkerProtocolTest < Minitest::Test
       capture_io_streams { result = w.skip('dishwasher', confirm: true) }
       assert_nil result
       assert_includes w.not_found, 'nothing in the next delivery can be skipped'
+    end
+  end
+
+  # The reason is a separate field from the target, and a cancellation sent
+  # with the wrong one attached cannot be taken back.
+  def test_cancel_sends_the_target_the_confirm_flag_and_the_reason
+    body = <<~'SCRIPT'
+      req = JSON.parse(STDIN.gets)
+      puts({event: 'cancel', data: req}.to_json)
+      puts({event: 'done', count: 1}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      result = nil
+      capture_io_streams { result = worker.cancel('SNSD0_ABC', confirm: true, reason: 'accident') }
+      assert_equal 'SNSD0_ABC', result['subscription_id']
+      assert_equal 'accident', result['reason']
+      assert result['confirm']
+
+      capture_io_streams { result = worker.cancel('dishwasher', confirm: false) }
+      assert_equal 'dishwasher', result['query']
+      assert_nil result['reason']
+    end
+  end
+
+  # A reason Amazon doesn't offer, and a subscription that has no cancel form,
+  # are both facts about the account rather than scraper failures.
+  def test_a_refused_cancellation_is_reported_not_raised
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: "unknown cancellation reason 'cats'", kind: 'not_cancellable'}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      w = worker
+      result = nil
+      capture_io_streams { result = w.cancel('dishwasher', confirm: true, reason: 'cats') }
+      assert_nil result
+      assert_includes w.not_found, 'unknown cancellation reason'
+    end
+  end
+
+  def test_a_real_failure_during_cancel_still_raises
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: 'Timeout: the cancel page never loaded'}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      err = assert_raises(Amazon::Worker::Error) do
+        capture_io_streams { worker.cancel('dishwasher', confirm: true) }
+      end
+      assert_includes err.message, 'live lookup failed'
     end
   end
 
@@ -5569,5 +5652,163 @@ class SubscribeSkipCommandTest < Minitest::Test
   def test_the_namespace_lists_it
     out, = capture_io_streams { Amazon::CLI.run(%w[subscribe]) }
     assert_includes out, 'skip'
+  end
+end
+
+# Cancelling is the one thing in this namespace that can't be undone from the
+# CLI, so nearly all of this grades what it refuses to do and what it insists
+# on saying first.
+class SubscribeCancelCommandTest < Minitest::Test
+  def setup
+    write_config!
+    reset_subscribe_cache!
+  end
+
+  def worker(result = SAMPLE_CANCEL)
+    FakeSubscribeWorker.new.with_cancel(result)
+  end
+
+  def run_cancel(argv, worker = worker())
+    out = err = nil
+    code = with_worker(->(*) { worker }) do
+      out, err = capture_io_streams { @code = Amazon::CLI.run(argv) }
+      @code
+    end
+    [out, err, code]
+  end
+
+  def test_without_yes_it_describes_the_cancellation_and_does_not_do_it
+    out, _err, code = run_cancel(%w[subscribe cancel dishwasher])
+    assert_equal 2, code
+    assert_includes out, 'would cancel'
+    assert_includes out, 'Example Dishwasher Detergent'
+    assert_includes out, 'pass --yes'
+  end
+
+  # The line nobody expects from a word like "cancel": the box being packed
+  # right now goes too. It is Amazon's sentence and it survives verbatim.
+  def test_the_dry_run_says_the_pending_order_goes_too
+    out, = run_cancel(%w[subscribe cancel dishwasher])
+    assert_includes out, "haven't yet entered the delivery process"
+    assert_includes out, 'no longer receive your Subscribe & Save discount'
+  end
+
+  def test_it_says_what_the_subscription_has_saved_so_far
+    out, = run_cancel(%w[subscribe cancel dishwasher])
+    assert_includes out, '$16.92'
+    # Amazon's banner is three lines of markup; a multi-line field would break
+    # the block layout of everything under it.
+    refute_includes out.split("$16.92").first.split("\n").last, "\n"
+  end
+
+  def test_the_dry_run_lists_the_reasons_it_would_accept
+    out, = run_cancel(%w[subscribe cancel dishwasher])
+    assert_includes out, 'stopped_using'
+  end
+
+  def test_yes_cancels_and_reports_the_verification
+    w = worker(SAMPLE_CANCEL.merge('verified' => true))
+    out, _err, code = run_cancel(%w[subscribe cancel dishwasher --yes], w)
+    assert_equal 0, code
+    assert w.asked_confirm
+    assert_includes out, 'cancelled'
+    assert_includes out, 'gone from your subscriptions'
+  end
+
+  # The worst failure this command has: Amazon accepted it, the subscription
+  # is still there, and the terminal says "cancelled".
+  def test_a_subscription_still_listed_afterwards_is_reported_loudly
+    out, = run_cancel(%w[subscribe cancel dishwasher --yes],
+                      worker(SAMPLE_CANCEL.merge('verified' => false)))
+    assert_includes out, 'still in your subscriptions'
+  end
+
+  def test_a_check_that_could_not_be_made_is_not_reported_as_failure
+    out, = run_cancel(%w[subscribe cancel dishwasher --yes],
+                      worker(SAMPLE_CANCEL.merge('verified' => nil)))
+    assert_includes out, "couldn't re-read"
+    refute_includes out, 'still in your subscriptions'
+  end
+
+  # Amazon marks the field optional, so the default says nothing rather than
+  # inventing a motive and sending it to a company that reads them.
+  def test_no_reason_is_sent_unless_one_is_given
+    w = worker
+    run_cancel(%w[subscribe cancel dishwasher --yes], w)
+    assert_nil w.asked_reason
+  end
+
+  def test_a_reason_reaches_the_worker_in_both_spellings
+    w = worker
+    run_cancel(%w[subscribe cancel dishwasher --yes --reason accident], w)
+    assert_equal 'accident', w.asked_reason
+    run_cancel(%w[subscribe cancel dishwasher --yes --reason=stopped_using], w)
+    assert_equal 'stopped_using', w.asked_reason
+  end
+
+  def test_a_reason_amazon_does_not_offer_comes_back_as_a_refusal
+    w = FakeSubscribeWorker.new(not_found: "unknown cancellation reason 'cats'. Amazon offers: accident, other")
+    _out, err, code = run_cancel(%w[subscribe cancel dishwasher --yes --reason cats], w)
+    assert_equal 2, code
+    assert_includes err, 'Amazon offers:'
+  end
+
+  def test_a_confirmed_cancellation_clears_the_cache
+    w = worker(SAMPLE_CANCEL.merge('verified' => true))
+    reads = nil
+    with_worker(->(*) { w }) do
+      capture_io_streams do
+        Amazon::CLI.run(%w[subscribe list])
+        before = w.calls
+        Amazon::CLI.run(%w[subscribe cancel dishwasher --yes])
+        Amazon::CLI.run(%w[subscribe list])
+        reads = w.calls - before - 1
+      end
+    end
+    assert_equal 1, reads, 'the list would still show a subscription that no longer exists'
+  end
+
+  def test_json_is_the_whole_record
+    out, = run_cancel(%w[--json subscribe cancel dishwasher --yes],
+                      worker(SAMPLE_CANCEL.merge('verified' => true)))
+    parsed = JSON.parse(out)
+    assert parsed['cancelled']
+    assert_equal 2, parsed['consequences'].length
+  end
+
+  def test_it_needs_something_to_cancel
+    _out, err, code = run_cancel(%w[subscribe cancel])
+    assert_equal 2, code
+    assert_includes err, 'usage:'
+  end
+
+  def test_it_takes_one_subscription_at_a_time
+    _out, err, code = run_cancel(['subscribe', 'cancel', 'dish', 'mop'])
+    assert_equal 2, code
+    assert_includes err, 'one subscription at a time'
+  end
+
+  def test_unknown_options_are_refused
+    _out, err, code = run_cancel(%w[subscribe cancel dishwasher --force])
+    assert_equal 2, code
+    assert_includes err, 'unknown cancel option'
+  end
+
+  def test_a_miss_passes_amazons_wording_through
+    w = FakeSubscribeWorker.new(not_found: "no active subscription matching 'zzz'.")
+    _out, err, code = run_cancel(%w[subscribe cancel zzz], w)
+    assert_equal 2, code
+    assert_includes err, 'no active subscription'
+  end
+
+  def test_the_help_distinguishes_it_from_skip
+    out, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[subscribe cancel --help]) }
+    assert_includes out, 'not a skip'
+    assert_includes out, '--reason'
+  end
+
+  def test_the_namespace_lists_it
+    out, = capture_io_streams { Amazon::CLI.run(%w[subscribe]) }
+    assert_includes out, 'cancel'
   end
 end

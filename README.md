@@ -107,8 +107,9 @@ date        order_id             total    status
   `amazon subscribe upcoming` shows the deliveries themselves and the last
   day you can still change each one; `amazon subscribe show` opens one
   subscription in full. Reads cache for 30 minutes. `amazon subscribe skip`
-  drops one item from the next delivery — the only write here, and it needs
-  `--yes` and proves it worked.
+  drops one item from the next delivery and `amazon subscribe cancel` ends a
+  subscription for good — both need `--yes`, and both prove it worked before
+  saying so.
 - **Incremental sync** — only fetches orders not already on disk. A `--full`
   flag re-fetches everything.
 - **Parallel detail fetches** — `ThreadPoolExecutor` with a tunable worker
@@ -135,7 +136,7 @@ lib/amazon/
     secrets.rb          1Password reads, for sync and login
     thumbnail.rb        product photos in the terminal, via chafa
     subscribe.rb        `amazon subscribe …` dispatcher
-    subscribe/          list, upcoming, show, skip (Subscribe & Save)
+    subscribe/          list, upcoming, show, skip, cancel (Subscribe & Save)
     login.rb, config.rb, buy.rb
   config.rb             XDG paths, config load
   store.rb              JSON read/write, index, ASIN purchase history
@@ -367,6 +368,8 @@ amazon subscribe upcoming --all       # every scheduled delivery
 amazon subscribe show dishwasher      # one subscription in full, by id or by title
 amazon subscribe skip bodymed         # what skipping it would do — changes nothing
 amazon subscribe skip bodymed --yes   # actually drop it from the next delivery
+amazon subscribe cancel syringes      # what cancelling would cost — changes nothing
+amazon subscribe cancel syringes --yes --reason stopped_using
 amazon subscribe list --no-image      # plain table, no product photos
 amazon subscribe list --fresh         # ignore the 30-minute cache
 amazon subscribe upcoming --json | jq '.[0].subtotal'
@@ -495,6 +498,42 @@ two-word search that lost its quotes than a request to skip two things.
 
 A confirmed skip drops all three cached views, since the delivery it just
 changed is in every one of them.
+
+#### Cancelling a subscription
+
+`cancel` ends the subscription outright. Same contract as `skip` — nothing
+without `--yes`, and the dry run is Amazon's own page read back:
+
+```
+$ amazon subscribe cancel syringes
+would cancel Care Touch Disposable Syringes Without Needle Luer Lock
+  next delivery September 30
+  You have saved $3.90 on this subscription!
+  You will no longer receive your Subscribe & Save discount.
+  We will cancel any orders of this item that haven't yet entered the delivery process.
+  reasons: no_more_needed, stopped_using, different_flavor_brand_scent, …
+  nothing changed — pass --yes to cancel it
+```
+
+That second consequence is the reason this prints before it acts: cancelling
+doesn't just stop future deliveries, it pulls the item out of the box already
+being assembled. "Cancel" doesn't sound like that, and Amazon's sentence says
+it better than a paraphrase would.
+
+Verification pages through your **entire** active list, not the first thirty.
+A subscription that lived on page two is missing from page one whether or not
+the cancel worked, and a check that can only return "yes" isn't a check.
+
+The reason is optional — Amazon says so on the page — so none is sent unless
+you pass `--reason`. The keys come off Amazon's own dropdown at runtime
+(`stopped_using`, `accident`, `product_too_expensive`, …), which is why the
+dry run can list them and why a reason Amazon adds later needs no code change
+here. An unrecognised one is refused *before* the confirm click: a
+cancellation that went through with the wrong reason attached can't be taken
+back.
+
+Cancelling is not reversible from this CLI. Amazon's page notes you can
+reactivate an item later on the website.
 
 All three read-only views cache for 30 minutes, and a cached read says its age on stderr
 (`[cached 12 minutes ago — --fresh to re-read]`) — a schedule you changed on

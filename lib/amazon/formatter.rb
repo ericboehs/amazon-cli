@@ -286,7 +286,47 @@ module Amazon
       end
     end
 
+    # The result of a cancellation, confirmed or merely contemplated.
+    def cancellation(result)
+      return puts(JSON.pretty_generate(result)) if @json
+
+      title = result["title"] || "(untitled subscription)"
+      if result["cancelled"]
+        puts "#{green("cancelled")} #{bold(title)}"
+        puts cancel_verdict(result["verified"])
+      else
+        puts "#{bold("would cancel")} #{bold(title)}"
+        cancellation_facts(result).each { |line| puts line }
+        puts dim("  nothing changed — pass --yes to cancel it")
+      end
+    end
+
     private
+
+    def cancellation_facts(result)
+      lines = []
+      if (nxt = result["next_delivery_label"] || result["next_delivery_date"])
+        lines << dim("  next delivery #{nxt}")
+      end
+      lines << dim("  #{squish(result["lifetime_savings_text"])}") if result["lifetime_savings_text"]
+      # Amazon's list, in Amazon's order. The second line — that a box already
+      # being assembled goes too — is the one nobody expects from "cancel".
+      Array(result["consequences"]).each { |c| lines << "  #{yellow(c)}" }
+      lines << dim("  reasons: #{Array(result["reasons"]).join(", ")}") if result["reasons"]&.any?
+      lines
+    end
+
+    def cancel_verdict(verified)
+      case verified
+      when true  then dim("  confirmed — it's gone from your subscriptions")
+      when false then red("  but it is still in your subscriptions — check Amazon")
+      else dim("  Amazon accepted it; couldn't re-read the list to confirm")
+      end
+    end
+
+    def squish(text)
+      text.to_s.gsub(/\s+/, " ").strip
+    end
 
     # A click that returned without error is not evidence, so the three
     # outcomes stay three: it left the delivery, it didn't, or we couldn't

@@ -191,6 +191,27 @@ module Amazon
       result
     end
 
+    # End a subscription, or read back what ending it would cost. Same
+    # confirm: contract as `skip` — false stops at the page that describes it.
+    def cancel(id_or_query, confirm:, reason: nil)
+      result = nil
+      key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
+      request = { action: "cancel", key => id_or_query, confirm: confirm, reason: reason }
+      run(request, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "cancel" then result = event["data"]
+        when "log"    then log_event(event)
+        when "error"
+          unless %w[not_found not_skippable not_cancellable].include?(event["kind"])
+            raise Error, live_error(event)
+          end
+
+          @not_found = event["msg"]
+        end
+      end
+      result
+    end
+
     class Progress
       BAR_WIDTH = 20
 
