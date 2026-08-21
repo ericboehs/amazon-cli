@@ -79,16 +79,56 @@ def launch(p: Any, headless: bool = True) -> Any:
         return p.chromium.launch(headless=headless)
 
 
+# Amazon's sign-in page loads `IdentityWebAuthnAssets` and ships a live
+# challenge in `webAuthnGetParametersForButton`. That script calls
+# `navigator.credentials.get()` on load, and because `launch()` prefers real
+# Chrome over bundled Chromium, the request reaches the macOS platform
+# authenticator: a Touch ID passkey sheet appears on screen, raised by a
+# headless background scrape the user did not know had started.
+#
+# `guard()` does notice the sign-in page and stop — but only after the page has
+# loaded and its scripts have run, which is after the prompt is already up.
+# There is nothing to fix downstream; the request must never be made.
+#
+# Declining is expressed the way a user cancelling the sheet would be, so
+# Amazon's own error handling covers it, and the availability probes answer
+# "no authenticator here" so well-behaved script skips the attempt entirely.
+# Only headless contexts get this. `login.py` builds its own context, because
+# there a passkey is a legitimate thing for a person to reach for.
+NO_WEBAUTHN_JS = """
+(() => {
+  const deny = () => Promise.reject(
+    new DOMException('No authenticator available', 'NotAllowedError'));
+  try {
+    if (window.PublicKeyCredential) {
+      window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable =
+        () => Promise.resolve(false);
+      window.PublicKeyCredential.isConditionalMediationAvailable =
+        () => Promise.resolve(false);
+    }
+    if (navigator.credentials) {
+      navigator.credentials.get = deny;
+      navigator.credentials.create = deny;
+    }
+  } catch (e) { /* a browser without WebAuthn needs nothing done to it */ }
+})();
+"""
+
+
 def new_context(browser: Any) -> Any:
     state = storage_state_path()
     if not state.exists():
         raise NotLoggedIn(f"no saved session at {state} — run: amazon login")
-    return browser.new_context(
+    context = browser.new_context(
         storage_state=str(state),
         viewport={"width": 1280, "height": 900},
         user_agent=UA,
         locale="en-US",
     )
+    # On the context, not the page: the prompt is raised by whatever Amazon
+    # redirects us *to*, which is by definition not the page we opened.
+    context.add_init_script(NO_WEBAUTHN_JS)
+    return context
 
 
 # Amazon serves these instead of the real page when it thinks we're a bot.

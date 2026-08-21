@@ -523,6 +523,16 @@ module Amazon
           # popen3's own teardown closes the pipes and frees the reader.
           err_thread.join(2)
         end
+      rescue Interrupt
+        # Ctrl-C in a terminal signals the whole foreground process group, so
+        # the worker usually gets it too. Usually is not a guarantee: signal
+        # only the parent — a supervisor, a `kill -INT` on the pid — and
+        # popen3's teardown blocks on `wait_thr` for a child that was never
+        # told to stop, so "stopped" prints and the CLI hangs anyway. And the
+        # child is a browser: abandoning it leaves Chrome running with no
+        # terminal attached to it.
+        stop_worker(wait)
+        raise
       end
     rescue Error => e
       # Every failure out of `run` gets the worker's own last words attached
@@ -583,6 +593,24 @@ module Amazon
     def malformed_note(count)
       return "" if count.zero?
       " after #{count} unparseable line#{"s" unless count == 1} on the event channel"
+    end
+
+    # Stop the worker process, politely and then not.
+    #
+    # TERM lets Playwright close the browser it launched; a browser killed
+    # outright leaves its own children behind. The wait is short because this
+    # runs while someone is holding Ctrl-C wondering why nothing happened.
+    def stop_worker(wait)
+      return unless wait.alive?
+
+      Process.kill("TERM", wait.pid)
+      return if wait.join(3)
+
+      Process.kill("KILL", wait.pid)
+      wait.join(2)
+    rescue Errno::ESRCH, Errno::EPERM
+      # Already gone, or never ours to signal.
+      nil
     end
 
     def python_cmd(script)

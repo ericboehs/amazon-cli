@@ -118,8 +118,43 @@ module Amazon
           otp_secret: (otp = Amazon::Config.load.otp_op_ref) ? Amazon::Secrets.read(otp) : nil
         }.compact
       rescue StandardError => e
-        warn "amazon login: no credentials from 1Password (#{e.message.lines.first&.strip}) — sign in by hand"
+        warn "amazon login: no credentials from 1Password " \
+             "(#{e.message.lines.first&.strip}) — sign in by hand"
+        # The overwhelmingly common cause is that 1Password could not ask.
+        # `op` raises its prompt through the desktop app, and with the screen
+        # locked there is no frontmost process to attach it to — so it fails
+        # with an AppleScript error, or waits two minutes for a prompt nobody
+        # can see and reports "authorization timeout". Either way the only
+        # trace is a word buried in a sentence about a file path, while the
+        # browser opens and sits on a form nobody is going to fill.
+        #
+        # Worth its own line: the remedy is a few seconds long, and the
+        # alternative is typing a password and a 2FA code by hand.
+        warn "amazon login: #{locked_hint(e)}" if (hint = locked_hint(e))
         {}
+      end
+
+      # What `op` says when it could not get an answer from the vault. The
+      # AppleScript failure is in here because that is what a locked screen
+      # actually produces — observed, not guessed:
+      #   response: promptError
+      #   System Events got an error: Can't get application process 1 whose
+      #   frontmost = true. Invalid index. (-1719)
+      LOCKED_MARKERS = {
+        "authorization timeout" => "1Password asked for approval and nobody answered — " \
+                                   "unlock the screen, then retry for a hands-off login",
+        "prompterror" => "1Password could not show its unlock prompt — is the screen locked? " \
+                         "Unlock it, then retry for a hands-off login",
+        "system events" => "1Password could not show its unlock prompt — is the screen locked? " \
+                           "Unlock it, then retry for a hands-off login",
+        "not signed in" => "1Password is signed out — run `op signin`, then retry " \
+                           "for a hands-off login"
+      }.freeze
+
+      def locked_hint(error)
+        said = error.message.downcase
+        _, hint = LOCKED_MARKERS.find { |marker, _| said.include?(marker) }
+        hint
       end
 
       def configured_password_ref

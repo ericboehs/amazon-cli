@@ -7,6 +7,11 @@ No Playwright needed — these functions never touch a browser.
 import io
 import json
 import math
+import pathlib
+import tempfile
+from unittest import mock
+
+import browser as browser_mod
 import re
 import unittest
 from contextlib import redirect_stdout
@@ -2184,3 +2189,73 @@ class FixtureHygieneTest(unittest.TestCase):
             text = path.read_text(encoding="utf-8").lower()
             for tell in ("ericboehs", "@gmail", "@oddball", "boehs"):
                 self.assertNotIn(tell, text, f"{path.name} names its source")
+
+
+class HeadlessWebAuthnTest(unittest.TestCase):
+    """A background scrape must not be able to raise a passkey prompt.
+
+    Amazon's sign-in page loads `IdentityWebAuthnAssets` with a live challenge
+    in `webAuthnGetParametersForButton`. `launch()` prefers real Chrome, so
+    that request reaches the macOS platform authenticator and puts a Touch ID
+    sheet on screen — from `amazon subscribe upcoming`, which the user has no
+    reason to think opened a browser at all.
+
+    `guard()` does catch the sign-in redirect, but only once the page has
+    loaded and run its scripts, which is after the prompt is up.
+    """
+
+    class FakeContext:
+        def __init__(self):
+            self.init_scripts = []
+
+        def add_init_script(self, script):
+            self.init_scripts.append(script)
+
+    class FakeBrowser:
+        def __init__(self):
+            self.context = HeadlessWebAuthnTest.FakeContext()
+            self.kwargs = None
+
+        def new_context(self, **kwargs):
+            self.kwargs = kwargs
+            return self.context
+
+    def context_for(self, tmp):
+        state = pathlib.Path(tmp) / "storage_state.json"
+        state.write_text("{}")
+        browser = self.FakeBrowser()
+        with mock.patch.object(browser_mod, "storage_state_path", lambda: state):
+            return browser, browser_mod.new_context(browser)
+
+    def test_every_headless_context_disables_webauthn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ctx = self.context_for(tmp)
+        self.assertEqual(len(ctx.init_scripts), 1)
+        script = ctx.init_scripts[0]
+        self.assertIn("navigator.credentials", script)
+        self.assertIn("isUserVerifyingPlatformAuthenticatorAvailable", script)
+        self.assertIn("isConditionalMediationAvailable", script)
+
+    # An init script, not a per-page call: the prompt is raised by whatever
+    # Amazon redirects us *to*, which is not the page we opened.
+    def test_it_is_installed_on_the_context_not_a_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ctx = self.context_for(tmp)
+        self.assertTrue(ctx.init_scripts, "nothing would run before Amazon's own scripts")
+
+    def test_the_session_is_still_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            browser, _ = self.context_for(tmp)
+        self.assertIn("storage_state", browser.kwargs)
+
+    def test_no_session_still_refuses_before_launching_anything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = pathlib.Path(tmp) / "nope.json"
+            with mock.patch.object(browser_mod, "storage_state_path", lambda: missing):
+                with self.assertRaises(browser_mod.NotLoggedIn):
+                    browser_mod.new_context(self.FakeBrowser())
+
+    # Rejecting the way a cancelled sheet does, so Amazon's own error handling
+    # covers it rather than an unhandled promise.
+    def test_it_declines_the_way_a_user_cancelling_would(self):
+        self.assertIn("NotAllowedError", browser_mod.NO_WEBAUTHN_JS)

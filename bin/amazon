@@ -38,4 +38,17 @@ require "amazon/commands/subscribe/cancel"
 require "amazon/commands/subscribe/schedule"
 require "amazon/commands/subscribe/upcoming"
 
-exit(Amazon::CLI.run(ARGV))
+# Ctrl-C is how you stop a live scrape, not a crash. Ruby's default handler
+# prints an Interrupt backtrace for every frame it unwound, and because the
+# worker runs under Open3.popen3 there are two of them — the main thread and
+# the stdout reader — so stopping a lookup filled two screens with our
+# internals and buried the fact that nothing was written.
+#
+# 130 is the shell's convention for "killed by SIGINT", which keeps
+# `amazon ... && next-thing` from running `next-thing` after an abort.
+begin
+  exit(Amazon::CLI.run(ARGV))
+rescue Interrupt
+  warn "\namazon: stopped"
+  exit(130)
+end

@@ -6280,6 +6280,121 @@ class MissingImageReportTest < Minitest::Test
   end
 end
 
+# Autofill silently not happening is worse than autofill failing loudly: the
+# browser opens either way, and the user is left looking at a password form
+# wondering why the thing that was supposed to fill it didn't.
+# Ctrl-C during a live scrape. Two things have to happen: the worker has to
+# stop, and the person has to be told something other than a stack trace.
+class WorkerInterruptTest < Minitest::Test
+  # A wait_thr stand-in. `alive?` reports whether the child is still there.
+  class FakeWait
+    attr_reader :signals, :pid
+
+    def initialize(dies_on: 'TERM', pid: 4242)
+      @dies_on = dies_on
+      @pid = pid
+      @signals = []
+      @alive = true
+    end
+
+    def alive? = @alive
+
+    def die! = @alive = false
+
+    def take(sig)
+      @signals << sig
+      @alive = false if sig == @dies_on
+    end
+
+    def join(_timeout = nil) = @alive ? nil : self
+  end
+
+  # Hand-rolled, like the rest of this file.
+  def with_kill(handler)
+    original = Process.method(:kill)
+    Process.define_singleton_method(:kill) { |sig, pid| handler.call(sig, pid) }
+    yield
+  ensure
+    Process.define_singleton_method(:kill, original)
+  end
+
+  def stop(wait)
+    with_kill(->(sig, _pid) { wait.take(sig) }) { Amazon::Worker.new.send(:stop_worker, wait) }
+    wait.signals
+  end
+
+  # TERM first, so Playwright can close the browser it launched. A browser
+  # killed outright leaves its own children behind.
+  def test_a_polite_worker_gets_only_a_term
+    assert_equal %w[TERM], stop(FakeWait.new(dies_on: 'TERM'))
+  end
+
+  def test_a_worker_that_ignores_term_is_killed
+    assert_equal %w[TERM KILL], stop(FakeWait.new(dies_on: 'KILL'))
+  end
+
+  def test_a_worker_that_already_exited_is_left_alone
+    wait = FakeWait.new
+    wait.die!
+    assert_empty stop(wait), "signalled a process that had already exited"
+  end
+
+  # The child may exit between the check and the signal.
+  def test_a_child_that_vanishes_mid_signal_is_not_an_error
+    wait = FakeWait.new(dies_on: 'never')
+    with_kill(->(*) { raise Errno::ESRCH }) do
+      assert_nil Amazon::Worker.new.send(:stop_worker, wait)
+    end
+  end
+
+  # Ctrl-C signals the whole foreground process group, so the worker usually
+  # gets it too — but only usually, and `popen3` then blocks forever waiting
+  # for a child nobody told to stop.
+  def test_the_binary_turns_an_interrupt_into_one_line_and_130
+    src = File.read(File.expand_path('../bin/amazon', __dir__))
+    assert_includes src, 'rescue Interrupt'
+    assert_includes src, 'exit(130)'
+  end
+end
+
+class LoginVaultLockedTest < Minitest::Test
+  def hint(msg)
+    Amazon::Commands::Login.allocate.send(:locked_hint, RuntimeError.new(msg))
+  end
+
+  # Verbatim from a locked Mac: `op` reaches the vault through the desktop
+  # app, and with the screen locked there is no frontmost process to hang a
+  # prompt on.
+  def test_the_applescript_failure_a_locked_screen_produces_is_recognised
+    said = "op read failed for op://a/b: [ERROR] response: promptError\n" \
+           "40:97: execution error: System Events got an error: Can't get " \
+           "application process 1 whose frontmost = true. Invalid index. (-1719)"
+    assert_includes hint(said), 'screen locked'
+  end
+
+  # And what it produces when the prompt is raised but nobody is there.
+  def test_an_unanswered_prompt_is_recognised
+    assert_includes hint('op read failed for op://a/b: [ERROR] authorization timeout'),
+                    'nobody answered'
+  end
+
+  def test_a_signed_out_vault_says_to_sign_in
+    assert_includes hint('op read failed: [ERROR] account is not signed in'), 'op signin'
+  end
+
+  # A missing field is not a locked vault, and telling someone to unlock a
+  # vault that is already open is how a hint becomes noise.
+  def test_an_ordinary_failure_gets_no_extra_line
+    assert_nil hint("op read failed for op://a/b: item 'x' does not have a field 'y'")
+  end
+
+  def test_every_marker_actually_produces_a_hint
+    Amazon::Commands::Login::LOCKED_MARKERS.each_key do |marker|
+      refute_nil hint("op read failed: #{marker}"), "#{marker} is listed but leads nowhere"
+    end
+  end
+end
+
 class SecretsPostconditionTest < Minitest::Test
   # Hand-rolled, like the rest of this file, and above all never touching the
   # real `op`: a test that shells out to a password manager is a test that
