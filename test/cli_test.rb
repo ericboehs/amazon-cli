@@ -528,6 +528,36 @@ class CacheTest < Minitest::Test
   # {"rows" => [], "total" => nil} — sailed past it and pinned a failed scrape
   # for the full TTL. `upcoming` caches a bare array and was protected; two
   # commands, same failure, opposite behaviour.
+  # Adding `_degraded` to these wrappers inverted the guard exactly where it
+  # matters most: an empty scrape that *also* warned it had given up became a
+  # non-empty wrapper, so the one payload carrying evidence of its own failure
+  # was the one that got pinned for the TTL.
+  def test_a_warning_does_not_make_an_empty_scrape_look_like_an_answer
+    cache = Amazon::Cache.new('t')
+    assert cache.send(:empty_collection?, { 'cards' => [], '_degraded' => ['gave up'] })
+    assert cache.send(:empty_collection?, { 'rows' => [], 'total' => nil, '_degraded' => ['x'] })
+  end
+
+  def test_a_warning_alongside_real_rows_is_still_an_answer
+    cache = Amazon::Cache.new('t')
+    refute cache.send(:empty_collection?, { 'cards' => [{ 'a' => 1 }], '_degraded' => ['x'] })
+    refute cache.send(:empty_collection?, { 'title' => 'x', 'actions' => [], '_degraded' => ['x'] })
+  end
+
+  # End to end, through the thing that actually writes files.
+  def test_a_degraded_empty_scrape_is_not_written_to_disk
+    reset_subscribe_cache!
+    cache = Amazon::Cache.new('subscribe')
+    calls = 0
+    2.times do
+      cache.fetch('k') do
+        calls += 1
+        { 'cards' => [], '_degraded' => ['show more would not click'] }
+      end
+    end
+    assert_equal 2, calls, 'a failed scrape was cached and re-served'
+  end
+
   def test_a_wrapper_around_no_rows_is_still_nothing
     ns = "wrapped-#{rand(1_000_000)}"
     cache = Amazon::Cache.new(ns)

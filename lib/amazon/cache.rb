@@ -8,6 +8,12 @@ module Amazon
   class Cache
     DEFAULT_TTL = 900 # 15 minutes
 
+    # Where a worker records what it had to give up on. Metadata about the
+    # scrape rather than part of it, which matters in two places: it is
+    # replayed on every cache hit, and it is excluded when deciding whether a
+    # payload is empty.
+    DEGRADED_KEY = "_degraded".freeze
+
     # `read:` and `write:` are separate because `--fresh` means "don't trust
     # what's on disk", not "don't record what I just fetched". Disabling both
     # would leave the stale entry in place with its original mtime, so a
@@ -44,7 +50,7 @@ module Amazon
     # like a whole one.
     def replay_degradations(data)
       return unless @hit && data.is_a?(Hash)
-      Array(data["_degraded"]).each { |msg| warn "amazon: [cached] #{msg}" }
+      Array(data[DEGRADED_KEY]).each { |msg| warn "amazon: [cached] #{msg}" }
     end
 
     def read(key)
@@ -118,7 +124,13 @@ module Amazon
       # Only wrappers qualify: every value has to be a collection or nil. A
       # record with real fields and one empty list in it — a subscription
       # detail with no actions — is a genuine result and stays cacheable.
-      values = value.values
+      #
+      # `_degraded` is metadata about the scrape, not part of it, and has to be
+      # set aside before judging. Counting it inverted this guard exactly where
+      # it matters most: a scrape that returned nothing *and* warned it had
+      # given up became a non-empty wrapper, so the one payload carrying
+      # evidence of its own failure was the one that got pinned for the TTL.
+      values = value.reject { |k, _| k == DEGRADED_KEY }.values
       collections = values.select { |v| v.is_a?(Array) || v.is_a?(Hash) }
       collections.any? &&
         values.all? { |v| v.nil? || v.is_a?(Array) || v.is_a?(Hash) } &&
