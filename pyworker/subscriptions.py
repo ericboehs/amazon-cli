@@ -1454,7 +1454,15 @@ def main() -> int:
     if not raw.strip():
         emit("error", msg="no request on stdin")
         return 2
-    req = json.loads(raw)
+    # Above the big `try` below, so this needs its own — without it a malformed
+    # request killed the worker with a traceback and no `error` event, and the
+    # Ruby side reported a closed pipe rather than the reason. `fetch.py` and
+    # `login.py` both already did this; this file was the odd one out.
+    try:
+        req = json.loads(raw)
+    except json.JSONDecodeError as e:
+        emit("error", msg=f"invalid request JSON: {e}")
+        return 2
     action = req.get("action")
 
     try:

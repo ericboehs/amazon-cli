@@ -5999,6 +5999,64 @@ end
 # The exit codes are the only part of a mutation a script can see, and they
 # had drifted: skip and cancel exited 2 for a dry run while schedule exited 0,
 # and all three exited 0 after printing a red "it didn't work".
+# Ruby names four `kind` strings; Python emits them. Nothing checked that the
+# two lists were the same list, so renaming a kind on either side turns a clean
+# exit-2 refusal into "amazon: live lookup failed" at exit 1 — with both test
+# suites green, because each one is right about its own half.
+class RefusalKindContractTest < Minitest::Test
+  WORKER = 'pyworker/subscriptions.py'.freeze
+
+  # Every `emit("error", ..., kind="x")` in a handler, with the code it exits.
+  # Line-based rather than one regex: `msg=str(e)` puts a close-paren in the
+  # middle of the call, which the obvious pattern stops at. (The vacuity guard
+  # below is how that was caught rather than shipped as a green no-op.)
+  def handlers
+    lines = File.readlines(WORKER)
+    lines.each_with_index.filter_map do |line, i|
+      kind = line[/kind="(\w+)"/, 1]
+      next unless kind
+
+      exit_line = lines[i + 1, 3].to_a.find { |l| l =~ /^\s*return \d+/ }
+      next unless exit_line
+
+      [kind, exit_line[/\d+/].to_i]
+    end.uniq
+  end
+
+  def test_the_python_worker_still_emits_kinds_at_all
+    refute_empty handlers, 'the scan found nothing — this test would pass vacuously'
+  end
+
+  # An exit-2 kind means "a fact about your account", and Ruby has to know to
+  # report it rather than raise.
+  def test_every_refusal_python_emits_is_one_ruby_tolerates
+    handlers.select { |_, code| code == 2 }.each do |kind, _|
+      assert_includes Amazon::Worker::REFUSALS, kind,
+                      "#{kind} exits 2 in #{WORKER} but Ruby raises on it"
+    end
+  end
+
+  # And the reverse: a kind Ruby quietly tolerates but Python never sends is
+  # either a typo or a leftover, and both look identical from here.
+  def test_every_refusal_ruby_tolerates_is_one_python_sends
+    sent = handlers.map(&:first)
+    Amazon::Worker::REFUSALS.each do |kind|
+      assert_includes sent, kind, "Ruby tolerates #{kind}, which #{WORKER} never emits"
+    end
+  end
+
+  # not_logged_in and blocked exit 1 on purpose: they are failures to reach
+  # Amazon, not answers from it, and swallowing them would report "nothing
+  # matched" to someone whose session has expired.
+  def test_a_failure_to_reach_amazon_is_not_a_refusal
+    handlers.select { |_, code| code == 1 }.each do |kind, _|
+      refute_includes Amazon::Worker::REFUSALS, kind,
+                      "#{kind} means we could not read the account; it must not be swallowed"
+    end
+    assert_includes handlers.map(&:first), 'not_logged_in'
+  end
+end
+
 class MutationExitCodeTest < Minitest::Test
   M = Amazon::Commands::Subscribe::Mutation
 

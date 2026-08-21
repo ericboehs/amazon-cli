@@ -14,10 +14,17 @@ selector-keyed dict is not good enough here.
 from __future__ import annotations
 
 import json
+import io
+import json
+import sys
+import types
 import unittest
+import unittest.mock
+from contextlib import contextmanager, redirect_stdout
 from datetime import date
 
 from browser import text
+import subscriptions
 from subscriptions import (
     CLICK_TIMEOUT_MS,
     DELIVERY_CARD,
@@ -44,6 +51,7 @@ from subscriptions import (
     CancelReasonUnknown,
     NoSuchSubscription,
     NotCancellable,
+    NotLoggedIn,
     NotSchedulable,
     NotSkippable,
     ScheduleChoiceUnknown,
@@ -72,7 +80,12 @@ from subscriptions import (
     choose_reason,
     change_schedule,
     normalize_frequency,
+    fetch_delivery_cards,
     savings_text,
+    scrape_deliveries,
+    scrape_subscriptions,
+    page_state,
+    NAVIGATION_KEY,
     schedule_note,
     select_options,
     selected_option,
@@ -1693,3 +1706,411 @@ class ChangeScheduleTest(unittest.TestCase):
         with self.assertRaises(NoSuchSubscription):
             change_schedule(self.page, None, "bicycle", False)
         self.assertFalse(any("consumptionPattern" in u for u in self.page.gotos))
+
+
+@contextmanager
+def collecting():
+    """`emitted` takes a callable; these tests need the value *and* the log."""
+    buf = io.StringIO()
+    events = []
+    with redirect_stdout(buf):
+        yield events
+    events.extend(
+        json.loads(line) for line in buf.getvalue().splitlines() if line.strip()
+    )
+
+
+class TrunkPage(DomPage):
+    """A page that navigates the way a browser does: the old document goes away.
+
+    That property is the point. `scrape_subscriptions` reads the navigation
+    state *before* it joins the delivery facts, because the deliveries-tab URL
+    is published only by the list page and the join navigates off it. A fake
+    that kept every fixture's markup loaded at once would be happy either way,
+    which is how the one ordering constraint in the read path stays untested
+    while every function it calls is covered.
+    """
+
+    LIST = "subscriptionList"
+
+    def __init__(self, *, future=True, deliveries=True, pages=2):
+        super().__init__("<div id='root'></div>")
+        self._future = future
+        self._deliveries = deliveries
+        self._pages_left = pages - 1
+        self.gotos = []
+        self.clicks = []
+        self._show("subscriptions_list.html")
+
+    def _show(self, fixture, keep=""):
+        self._soup = BeautifulSoup(
+            (FIXTURES / fixture).read_text(encoding="utf-8") + keep, "html.parser"
+        )
+
+    def goto(self, url, **_kw):
+        self.gotos.append(url)
+        if self.LIST in url:
+            self._show("subscriptions_list.html")
+        elif "futureDeliveryList" in url:
+            # Amazon serves the future deliveries as their own fragment; the
+            # fixture holds both, so trim to the one this URL would return.
+            self._show("deliveries.html")
+            for card in self._soup.select(".delivery-card[data-delivery-type='current']"):
+                card.decompose()
+        elif "auto-deliveries/ajax/" in url:
+            self._show("deliveries.html", keep=self._future_state())
+            for card in self._soup.select(".delivery-card:not([data-delivery-type='current'])"):
+                card.decompose()
+        else:
+            self._soup = BeautifulSoup("<div></div>", "html.parser")
+
+    def _future_state(self):
+        if not self._future:
+            return ""
+        return (
+            '<script type="a-state" data-a-state=\'{"key":"future-delivery-list"}\'>'
+            '{"ajaxUrl":"https://www.amazon.com/auto-deliveries/ajax/futureDeliveryList?x=1"}'
+            "</script>"
+        )
+
+    def locator(self, sel):
+        return SkipLocator(self._soup.select(sel), self)
+
+    def clicked(self, node, _timeout):
+        """The one click in the read path: "Show more subscriptions".
+
+        It appends the rest of the list and leaves `loadedItemCount` frozen at
+        3, which is what the live page does — the loop has to count cards.
+        """
+        self.clicks.append(node.get("class"))
+        if "subscription-pagination-trigger" not in (node.get("class") or []):
+            return
+        if not self._pages_left:
+            return
+        self._pages_left -= 1
+        box = self._soup.select_one(".subscription-list-container")
+        template = self._soup.select(SUBSCRIPTION_CARD)[0]
+        for n in range(4):
+            copy = BeautifulSoup(str(template), "html.parser").div
+            copy["data-subscription-id"] = f"SNSD0_PAGETWOSUB000000000{n}"
+            box.append(copy)
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+    def title(self):
+        return "Subscribe & Save"
+
+    @property
+    def url(self):
+        return "https://www.amazon.com/auto-deliveries/subscriptionList"
+
+
+class ScrapeSubscriptionsTest(unittest.TestCase):
+    """The whole of `amazon subscribe list`, end to end over real markup."""
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        self.page = TrunkPage()
+
+    def scrape(self, **kw):
+        with collecting() as events:
+            rows, total = scrape_subscriptions(self.page, **kw)
+        self.events = events
+        return rows, total
+
+    def test_it_returns_the_cards_and_amazons_own_total(self):
+        rows, total = self.scrape()
+        self.assertEqual(len(rows), 3)
+        # 7, from the pagination state — not 3. The disagreement is the point:
+        # it is how `list` knows to say "showing 3 of 7".
+        self.assertEqual(total, 7)
+
+    # Prices live on the deliveries fragment, which is reachable only through
+    # a URL the *list* page publishes.
+    def test_prices_survive_the_navigation_that_fetches_them(self):
+        rows, _ = self.scrape()
+        priced = [r for r in rows if r.get("price") is not None]
+        self.assertTrue(priced, "the price column is empty — nav state read too late?")
+        self.assertEqual(priced[0]["price"], 14.22)
+
+    def test_rows_come_back_soonest_first(self):
+        rows, _ = self.scrape()
+        dates = [r["next_delivery_date"] for r in rows if r["next_delivery_date"]]
+        self.assertEqual(dates, sorted(dates))
+
+    def test_the_date_comes_from_the_delivery_not_the_label(self):
+        rows, _ = self.scrape()
+        dated = next(r for r in rows if r.get("price") is not None)
+        # The card says "September 2"; the delivery card knows the year.
+        self.assertEqual(dated["next_delivery_date"], "2026-09-02")
+
+    def test_prices_can_be_declined(self):
+        rows, _ = self.scrape(with_prices=False)
+        self.assertTrue(all(r.get("price") is None for r in rows))
+        self.assertFalse(
+            any("ajax" in u for u in self.page.gotos),
+            "--no-prices still paid for the deliveries fetch",
+        )
+
+    # A deliveries view that fails costs the price column, not the schedules
+    # the user actually asked for — but it has to say so, or an account with
+    # broken prices looks like an account with no upcoming deliveries.
+    def test_a_broken_deliveries_view_costs_prices_and_says_so(self):
+        self.page = TrunkPage(deliveries=False)
+        real_goto = self.page.goto
+
+        def only_the_list(url, **kw):
+            if "auto-deliveries/ajax/" in url:
+                raise RuntimeError("the deliveries fragment timed out")
+            real_goto(url, **kw)
+
+        self.page.goto = only_the_list
+        rows, _ = self.scrape()
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(r.get("price") is None for r in rows))
+        warnings = [e for e in self.events if e.get("level") == "warn"]
+        self.assertTrue(any("prices" in w["msg"] for w in warnings))
+        self.assertTrue(any("schedules are still real" in w["msg"] for w in warnings))
+
+    # Three cards on page one, seven in the account. Pagination clicks rather
+    # than re-requesting, and counts cards rather than believing
+    # `loadedItemCount` — which the fake leaves frozen at 3, as Amazon does.
+    def test_asking_for_every_page_gets_every_page(self):
+        rows, total = self.scrape(load_all=True)
+        self.assertEqual(len(rows), 7)
+        self.assertEqual(total, 7)
+
+    def test_the_default_stops_at_the_first_page(self):
+        rows, _ = self.scrape()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(self.page.clicks, [])
+
+
+class ScrapeDeliveriesTest(unittest.TestCase):
+    """The whole of `amazon subscribe upcoming`."""
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        self.page = TrunkPage()
+
+    def test_it_reads_the_current_delivery_and_the_future_ones(self):
+        with collecting():
+            cards = scrape_deliveries(self.page)
+        self.assertEqual([c["date"] for c in cards], ["2026-09-02", "2026-09-30"])
+        self.assertEqual(len(cards[0]["items"]), 2)
+
+    def test_cards_are_ordered_by_date(self):
+        with collecting():
+            cards = scrape_deliveries(TrunkPage())
+        self.assertEqual([c["date"] for c in cards], sorted(c["date"] for c in cards))
+
+    # Half an answer that looks whole: without the future fragment this returns
+    # only the next delivery, which is also what an account with one delivery
+    # looks like.
+    def test_no_future_fragment_says_so_rather_than_looking_empty(self):
+        page = TrunkPage(future=False)
+        with collecting() as events:
+            cards = scrape_deliveries(page)
+        self.assertEqual(len(cards), 1)
+        self.assertTrue(
+            any("only the current delivery" in e.get("msg", "") for e in events)
+        )
+
+    # `fetch_delivery_cards` takes the navigation state as an argument instead
+    # of reading it, because the deliveries-tab URL is published only by the
+    # list page and by the time anyone wants it the caller may have navigated
+    # away. Nothing enforced that but a docstring: the parameter could be
+    # ignored in favour of a fresh `page_state` read and every other test here
+    # would still pass, because they all happen to call it while the list is
+    # still loaded. This one calls it after navigating off.
+    def test_the_tab_url_comes_from_the_caller_not_from_whatever_is_loaded(self):
+        page = TrunkPage()
+        nav = page_state(page, NAVIGATION_KEY)
+        page.goto("https://www.amazon.com/gp/css/homepage.html")  # anywhere else
+        self.assertIsNone(page_state(page, NAVIGATION_KEY), "the fake still has the list loaded")
+        with collecting():
+            cards = fetch_delivery_cards(page, nav)
+        self.assertEqual(len(cards), 2)
+
+    def test_a_list_page_that_publishes_no_tab_url_is_an_error_not_an_empty_list(self):
+        page = TrunkPage()
+        page._soup = BeautifulSoup("<div class='subscription-list-container'></div>", "html.parser")
+        with self.assertRaisesRegex(RuntimeError, "deliveries-tab URL"):
+            with collecting():
+                fetch_delivery_cards(page, {})
+
+
+class WorkerProtocolTest(unittest.TestCase):
+    """`main()` — the NDJSON dispatch the Ruby side is written against.
+
+    Never executed by any test until now, which left the whole contract
+    unpinned: the event names Ruby switches on, the `kind` strings it treats as
+    refusals, and the exit codes. Renaming an event here is invisible to both
+    suites and turns a working command into "live lookup failed".
+
+    The scrapers are stubbed out on purpose. They have their own tests against
+    real markup; what is under test here is the adapter around them.
+    """
+
+    def setUp(self):
+        self.patched = {}
+        fake_module = types.ModuleType("playwright.sync_api")
+        fake_module.sync_playwright = lambda: _FakePlaywright()
+        self.addCleanup(sys.modules.pop, "playwright.sync_api", None)
+        sys.modules["playwright.sync_api"] = fake_module
+        self.patch("launch", lambda *_a, **_kw: _FakeBrowser())
+        self.patch("new_context", lambda *_a, **_kw: _FakeContext())
+
+    def patch(self, name, value):
+        self.patched[name] = getattr(subscriptions, name, None)
+        self.addCleanup(setattr, subscriptions, name, self.patched[name])
+        setattr(subscriptions, name, value)
+
+    def run_action(self, request):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with unittest.mock.patch.object(sys, "stdin", io.StringIO(json.dumps(request) + "\n")):
+                code = subscriptions.main()
+        events = [json.loads(x) for x in buf.getvalue().splitlines() if x.strip()]
+        return code, events
+
+    @staticmethod
+    def names(events):
+        return [e["event"] for e in events]
+
+    def test_each_action_emits_the_event_its_ruby_caller_reads(self):
+        # The pairing itself is the contract. Worker#subscriptions reads
+        # "subscription", Worker#skip reads "skip", and so on.
+        for action, stub, event in [
+            ("subscriptions", ("scrape_subscriptions", lambda *a, **k: ([{"title": "Soap"}], 7)), "subscription"),
+            ("deliveries", ("scrape_deliveries", lambda *a, **k: [{"date": "2026-09-02"}]), "delivery"),
+            ("subscription", ("scrape_subscription", lambda *a, **k: {"title": "Soap"}), "detail"),
+            ("skip", ("skip_delivery_item", lambda *a, **k: {"confirmed": True}), "skip"),
+            ("cancel", ("cancel_subscription", lambda *a, **k: {"cancelled": True}), "cancel"),
+            ("schedule", ("change_schedule", lambda *a, **k: {"applied": True}), "schedule"),
+        ]:
+            with self.subTest(action=action):
+                self.patch(*stub)
+                code, events = self.run_action({"action": action, "query": "soap"})
+                self.assertEqual(code, 0)
+                self.assertIn(event, self.names(events))
+                self.assertEqual(self.names(events)[-1], "done")
+
+    def test_the_total_rides_on_done_where_the_ruby_side_looks_for_it(self):
+        self.patch("scrape_subscriptions", lambda *a, **k: ([{"title": "Soap"}], 59))
+        _, events = self.run_action({"action": "subscriptions"})
+        done = events[-1]
+        self.assertEqual(done["count"], 1)
+        self.assertEqual(done["total"], 59)
+
+    def test_an_unknown_action_is_a_usage_error(self):
+        code, events = self.run_action({"action": "reticulate"})
+        self.assertEqual(code, 2)
+        self.assertEqual(events[-1]["event"], "error")
+
+    def test_every_targeted_action_insists_on_a_target(self):
+        for action in ("subscription", "skip", "cancel", "schedule"):
+            with self.subTest(action=action):
+                code, events = self.run_action({"action": action})
+                self.assertEqual(code, 2)
+                self.assertIn("requires subscription_id or query", events[-1]["msg"])
+
+    def test_nothing_on_stdin_is_reported_rather_than_crashed(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with unittest.mock.patch.object(sys, "stdin", io.StringIO("")):
+                code = subscriptions.main()
+        self.assertEqual(code, 2)
+        self.assertIn("no request on stdin", buf.getvalue())
+
+    # A malformed request used to raise above the try, killing the worker with
+    # a traceback on stderr and no `error` event — so the Ruby side reported a
+    # closed pipe instead of the reason.
+    def test_a_malformed_request_still_gets_an_error_event(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with unittest.mock.patch.object(sys, "stdin", io.StringIO("{not json\n")):
+                code = subscriptions.main()
+        events = [json.loads(x) for x in buf.getvalue().splitlines() if x.strip()]
+        self.assertEqual(code, 2)
+        self.assertEqual(events[-1]["event"], "error")
+
+    def test_confirm_reaches_the_mutation_and_defaults_to_off(self):
+        seen = {}
+
+        def spy(_page, sub_id, query, confirm, *rest):
+            seen["confirm"] = confirm
+            return {"confirmed": confirm}
+
+        self.patch("skip_delivery_item", spy)
+        self.run_action({"action": "skip", "query": "soap"})
+        self.assertFalse(seen["confirm"], "a request without confirm must be a dry run")
+        self.run_action({"action": "skip", "query": "soap", "confirm": True})
+        self.assertTrue(seen["confirm"])
+
+    # The exit codes and `kind` strings, which are the whole refusal protocol.
+    def test_refusals_carry_a_kind_and_exit_two(self):
+        for exc, kind in [
+            (NoSuchSubscription("nope"), "not_found"),
+            (NotSkippable("too late"), "not_skippable"),
+            (NotCancellable("already gone"), "not_cancellable"),
+            (CancelReasonUnknown("no such reason"), "not_cancellable"),
+            (NotSchedulable("no form"), "not_schedulable"),
+            (ScheduleChoiceUnknown("no such quantity"), "not_schedulable"),
+        ]:
+            with self.subTest(kind=kind):
+                self.patch("skip_delivery_item", _raiser(exc))
+                code, events = self.run_action({"action": "skip", "query": "soap"})
+                self.assertEqual(code, 2)
+                self.assertEqual(events[-1]["kind"], kind)
+
+    def test_a_genuine_failure_has_no_kind_and_exits_one(self):
+        self.patch("skip_delivery_item", _raiser(RuntimeError("the modal never appeared")))
+        code, events = self.run_action({"action": "skip", "query": "soap"})
+        self.assertEqual(code, 1)
+        self.assertNotIn("kind", events[-1])
+        self.assertIn("RuntimeError", events[-1]["msg"])
+
+    def test_being_signed_out_is_its_own_kind(self):
+        self.patch("skip_delivery_item", _raiser(NotLoggedIn("sign in")))
+        code, events = self.run_action({"action": "skip", "query": "soap"})
+        self.assertEqual(code, 1)
+        self.assertEqual(events[-1]["kind"], "not_logged_in")
+
+    def test_the_browser_is_closed_even_when_the_scrape_explodes(self):
+        closed = []
+        self.patch("launch", lambda *_a, **_kw: _FakeBrowser(closed))
+        self.patch("skip_delivery_item", _raiser(RuntimeError("boom")))
+        self.run_action({"action": "skip", "query": "soap"})
+        self.assertEqual(closed, [True], "a crashed run left a browser process behind")
+
+
+def _raiser(exc):
+    def raise_it(*_a, **_kw):
+        raise exc
+
+    return raise_it
+
+
+class _FakePlaywright:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+class _FakeBrowser:
+    def __init__(self, closed=None):
+        self._closed = closed if closed is not None else []
+
+    def close(self):
+        self._closed.append(True)
+
+
+class _FakeContext:
+    def new_page(self):
+        return DomPage("<div></div>") if HAVE_BS4 else object()
