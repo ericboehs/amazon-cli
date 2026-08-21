@@ -57,9 +57,7 @@ module Amazon
           return refuse(worker.not_found) unless result
 
           Amazon::Formatter.new(json: @global.json).skip(result)
-          # A dry run did not do the thing that was asked, and a script that
-          # forgot --yes should be able to tell that from the exit code.
-          result["confirmed"] ? 0 : 2
+          Mutation.exit_code(applied: result["confirmed"], verified: result["verified"])
         end
 
         private

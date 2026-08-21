@@ -68,7 +68,11 @@ module Amazon
           return refuse(worker.not_found) unless result
 
           Amazon::Formatter.new(json: @global.json).schedule(result)
-          result["applied"] || !confirm ? 0 : 2
+          # With no --qty/--every/--next this asked a question rather than
+          # requesting a change, and it answered: that is a 0, not a dry run.
+          return 0 if wants.empty? && !confirm
+
+          Mutation.exit_code(applied: result["applied"], verified: result["verified"])
         end
 
         private

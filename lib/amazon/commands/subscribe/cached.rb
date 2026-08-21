@@ -11,7 +11,7 @@ module Amazon
       # `show` are three renderings of the same account, so `--fresh` on any of
       # them drops all of them: refreshing the list while `upcoming` still
       # serves a 25-minute-old copy of the same subscriptions is the staleness
-      # the flag was reached for. Writes will use the same door — a cancellation
+      # the flag was reached for. The writes use the same door — a cancellation
       # invalidates every view, not the one that issued it.
       module Cached
         NAMESPACE = "subscribe".freeze

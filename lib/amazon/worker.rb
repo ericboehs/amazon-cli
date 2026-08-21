@@ -151,6 +151,7 @@ module Amazon
     # ("you have no such subscription"), not a failure to reach Amazon, and the
     # two want different exit codes.
     def subscription(id_or_query)
+      begin_lookup!
       detail = nil
       key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
       run({ action: "subscription", key => id_or_query }, script: "subscriptions.py") do |event|
@@ -176,11 +177,22 @@ module Amazon
     # through verbatim rather than restating from the Ruby side.
     attr_reader :not_found
 
+    # Cleared at the start of every method that can set it. Without this a
+    # reused Worker answers a successful call with the refusal message from a
+    # previous one — survivable today only because each command builds its
+    # own instance, which is a fact about the callers rather than a property
+    # of this class.
+    def begin_lookup!
+      @not_found = nil
+    end
+    private :begin_lookup!
+
     # Skip one item out of the next delivery, or — with confirm: false — open
     # Amazon's confirmation dialog, read it, and walk away without agreeing to
     # it. The dry run is the same code path up to the last click, which is the
     # only kind of dry run worth having for a mutation.
     def skip(id_or_query, confirm:)
+      begin_lookup!
       result = nil
       key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
       request = { action: "skip", key => id_or_query, confirm: confirm }
@@ -200,6 +212,7 @@ module Amazon
     # End a subscription, or read back what ending it would cost. Same
     # confirm: contract as `skip` — false stops at the page that describes it.
     def cancel(id_or_query, confirm:, reason: nil)
+      begin_lookup!
       result = nil
       key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
       request = { action: "cancel", key => id_or_query, confirm: confirm, reason: reason }
@@ -219,6 +232,7 @@ module Amazon
     # Change quantity/frequency/next date, or read back what changing would
     # do. `confirm: false` stops at the page that describes it.
     def schedule(id_or_query, confirm:, quantity: nil, frequency: nil, next_date: nil)
+      begin_lookup!
       result = nil
       key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
       request = {

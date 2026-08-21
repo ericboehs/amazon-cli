@@ -71,6 +71,7 @@ require 'amazon/commands/subscribe/cached'
 require 'amazon/commands/subscribe/images'
 require 'amazon/commands/subscribe/list'
 require 'amazon/commands/subscribe/show'
+require 'amazon/commands/subscribe/mutation'
 require 'amazon/commands/subscribe/skip'
 require 'amazon/commands/subscribe/cancel'
 require 'amazon/commands/subscribe/schedule'
@@ -4704,6 +4705,32 @@ class SubscribeWorkerProtocolTest < Minitest::Test
     end
   end
 
+  # A refusal is a fact about one lookup, not about the worker. Left uncleared,
+  # a Worker that refused once answers every later success with the old
+  # message — which today is masked by every command building its own
+  # instance, i.e. by luck.
+  def test_a_refusal_does_not_outlive_the_call_that_caused_it
+    refusing = <<~SCRIPT
+      req = JSON.parse(STDIN.gets)
+      if req['query'] == 'bicycle'
+        puts({event: 'error', msg: 'no active subscription matching bicycle', kind: 'not_found'}.to_json)
+      else
+        puts({event: 'skip', data: {'confirmed' => true, 'verified' => true}}.to_json)
+      end
+      puts({event: 'done', count: 1}.to_json)
+    SCRIPT
+    with_python_cmd(refusing) do
+      w = worker
+      capture_io_streams { w.skip('bicycle', confirm: false) }
+      assert_includes w.not_found, 'bicycle'
+
+      result = nil
+      capture_io_streams { result = w.skip('dishwasher', confirm: true) }
+      assert result['confirmed']
+      assert_nil w.not_found, 'the previous refusal is still being reported'
+    end
+  end
+
   def test_a_real_failure_during_schedule_still_raises
     body = <<~SCRIPT
       STDIN.gets
@@ -5802,7 +5829,8 @@ class SubscribeSkipCommandTest < Minitest::Test
 
   def test_the_namespace_lists_it
     out, = capture_io_streams { Amazon::CLI.run(%w[subscribe]) }
-    assert_includes out, 'skip'
+    listed = out[/Subcommands:\n(.*?)(?:\n\n|\z)/m, 1].to_s
+    assert_match(/^\s+skip\s+\S/, listed)
   end
 end
 
@@ -5960,13 +5988,57 @@ class SubscribeCancelCommandTest < Minitest::Test
 
   def test_the_namespace_lists_it
     out, = capture_io_streams { Amazon::CLI.run(%w[subscribe]) }
-    assert_includes out, 'cancel'
+    listed = out[/Subcommands:\n(.*?)(?:\n\n|\z)/m, 1].to_s
+    assert_match(/^\s+cancel\s+\S/, listed)
   end
 end
 
 # `schedule` is the reversible mutation, so the grading leans on what it says
 # rather than on what it refuses — in particular on the delivery date it moves
 # without being asked to.
+# The exit codes are the only part of a mutation a script can see, and they
+# had drifted: skip and cancel exited 2 for a dry run while schedule exited 0,
+# and all three exited 0 after printing a red "it didn't work".
+class MutationExitCodeTest < Minitest::Test
+  M = Amazon::Commands::Subscribe::Mutation
+
+  def test_verified_is_the_only_zero
+    assert_equal 0, M.exit_code(applied: true, verified: true)
+  end
+
+  # `cancel X --yes && echo done` printed done after "still in your
+  # subscriptions".
+  def test_a_change_that_did_not_take_is_a_failure
+    assert_equal 1, M.exit_code(applied: true, verified: false)
+  end
+
+  def test_a_dry_run_is_not_a_failure_it_is_an_absence
+    assert_equal 2, M.exit_code(applied: false, verified: nil)
+    assert_equal 2, M.exit_code(applied: false, verified: true)
+  end
+
+  # The tri-state, carried out to the shell. 0 would let `--yes && deploy`
+  # treat "couldn't check" as confirmation; 1 would cry wolf on a mutation
+  # that almost certainly worked, and a warning that is usually wrong gets
+  # silenced.
+  def test_could_not_check_is_its_own_answer
+    assert_equal 3, M.exit_code(applied: true, verified: nil)
+  end
+
+  def test_the_three_commands_agree
+    codes = [
+      Amazon::Commands::Subscribe::Skip,
+      Amazon::Commands::Subscribe::Cancel,
+      Amazon::Commands::Subscribe::Schedule
+    ].map { |k| k.instance_method(:run).source_location.first }
+    codes.each do |file|
+      body = File.read(file)
+      assert_includes body, 'Mutation.exit_code',
+                      "#{File.basename(file)} still spells the rule itself"
+    end
+  end
+end
+
 class SubscribeScheduleCommandTest < Minitest::Test
   def setup
     write_config!
@@ -6067,15 +6139,30 @@ class SubscribeScheduleCommandTest < Minitest::Test
   def test_a_schedule_that_did_not_move_is_reported_loudly
     w = wanting(quantity: '2')
     w.with_schedule(w.instance_variable_get(:@schedule_result).merge('verified' => false))
-    out, = run_schedule(%w[subscribe schedule dishwasher --qty 2 --yes], w)
+    out, _err, code = run_schedule(%w[subscribe schedule dishwasher --qty 2 --yes], w)
     assert_includes out, 'still shows the old schedule'
+    assert_equal 1, code, 'a script chaining on this would think it worked'
+  end
+
+  # A named change that was never applied is a dry run, and exits like one —
+  # this is the inconsistency review caught: skip and cancel already did.
+  def test_a_dry_run_of_a_real_change_exits_two
+    _out, _err, code = run_schedule(%w[subscribe schedule dishwasher --qty 2], wanting(quantity: '2'))
+    assert_equal 2, code
+  end
+
+  # ...but asking what the item accepts is a question, and it was answered.
+  def test_asking_with_no_flags_exits_zero
+    _out, _err, code = run_schedule(%w[subscribe schedule dishwasher])
+    assert_equal 0, code
   end
 
   def test_a_check_that_could_not_be_made_is_not_reported_as_failure
     w = wanting(quantity: '2')
-    out, = run_schedule(%w[subscribe schedule dishwasher --qty 2 --yes], w)
+    out, _err, code = run_schedule(%w[subscribe schedule dishwasher --qty 2 --yes], w)
     assert_includes out, "couldn't re-read"
     refute_includes out, 'still shows the old schedule'
+    assert_equal 3, code, 'unverified is neither success nor failure'
   end
 
   # Caught before a browser opens: --yes with nothing to apply would submit
@@ -6180,8 +6267,21 @@ class SubscribeScheduleCommandTest < Minitest::Test
     assert_includes out, '--every'
   end
 
+  # The old version of this looked for the word anywhere in the help, which
+  # the prose above the list also contains — deleting the Subcommands: block
+  # left it passing.
   def test_the_namespace_lists_it
     out, = capture_io_streams { Amazon::CLI.run(%w[subscribe]) }
-    assert_includes out, 'schedule'
+    listed = out[/Subcommands:\n(.*?)(?:\n\n|\z)/m, 1].to_s
+    assert_match(/^\s+schedule\s+\S/, listed)
+  end
+
+  # Every subcommand that exists must be reachable from `amazon help`, or it
+  # may as well not: all three mutations were missing from it.
+  def test_the_top_level_help_names_every_subcommand
+    out, = capture_io_streams { Amazon::CLI.run(%w[help]) }
+    Amazon::Commands::SubscribeNamespace::SUBCOMMANDS.each do |name|
+      assert_includes out, "subscribe #{name}", "amazon help never mentions it"
+    end
   end
 end

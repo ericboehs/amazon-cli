@@ -34,9 +34,17 @@ Stdin (one-shot request):
     {"action":"subscription","subscription_id":"SNSD0_…"}
     {"action":"subscription","query":"dishwasher"}
 
-Read-only. Nothing here clicks skip, cancel, or a schedule change; the only
-clicks are "Show more subscriptions" (pagination) and opening an edit modal to
-read it.
+    {"action":"skip","query":"bodymed","confirm":true}
+    {"action":"cancel","subscription_id":"SNSD0_…","reason":"stopped_using"}
+    {"action":"schedule","query":"cascade","quantity":"2","frequency":"2-m"}
+
+The read actions click only "Show more subscriptions" (pagination) and the
+edit modal, to read it. The three write actions click for real, but only with
+`"confirm": true` in the request — without it they drive the same flow to the
+last button, read back Amazon's own dialog, and stop. Each one re-reads the
+subscription list afterwards and reports `verified` as true, false, or null:
+these dialogs close identically whether they worked or not, so a click that
+returned without error is not evidence.
 """
 
 from __future__ import annotations

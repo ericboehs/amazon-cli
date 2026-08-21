@@ -57,7 +57,7 @@ module Amazon
           return refuse(worker.not_found) unless result
 
           Amazon::Formatter.new(json: @global.json).cancellation(result)
-          result["cancelled"] ? 0 : 2
+          Mutation.exit_code(applied: result["cancelled"], verified: result["verified"])
         end
 
         private

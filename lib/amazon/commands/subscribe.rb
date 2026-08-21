@@ -3,11 +3,14 @@ module Amazon
     # Dispatcher for the `amazon subscribe …` namespace — Subscribe & Save.
     #
     # Named `subscribe` rather than `sns` or `subscribe-and-save`: the first is
-    # jargon and the second is a mouthful nobody types twice. Everything under
-    # it is read-only today; skip, schedule changes and cancellation are
-    # deliberately absent rather than half-implemented, because a subcommand
-    # that mutates a subscription and can't prove it worked is worse than one
-    # that doesn't exist.
+    # jargon and the second is a mouthful nobody types twice.
+    #
+    # `list`, `upcoming` and `show` read; `skip`, `cancel` and `schedule`
+    # write. The writes were held back until they could prove they worked,
+    # because a subcommand that mutates a subscription and reports success
+    # from a click that returned without error is worse than one that doesn't
+    # exist — so each re-reads Amazon afterwards and reports three outcomes,
+    # not two.
     class SubscribeNamespace
       SUBCOMMANDS = %w[list upcoming show skip cancel schedule].freeze
 
@@ -29,6 +32,7 @@ module Amazon
         when "schedule" then Subscribe::Schedule.new(@global).run(argv)
         else
           warn "unknown subscribe subcommand: #{sub}"
+          warn "did you mean: #{SUBCOMMANDS.join(', ')}?"
           warn help_text
           2
         end

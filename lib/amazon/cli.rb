@@ -86,6 +86,9 @@ module Amazon
           subscribe list      Your subscriptions and their schedules
           subscribe upcoming  Scheduled deliveries, prices, and edit deadlines
           subscribe show      One subscription in full
+          subscribe skip      Drop one item from the next delivery (needs --yes)
+          subscribe cancel    End a subscription (needs --yes)
+          subscribe schedule  Change quantity or how often it arrives (needs --yes)
 
         Other:
           login    Open a browser so you can sign in (handles captcha/2FA)

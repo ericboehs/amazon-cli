@@ -465,8 +465,8 @@ the data, not for the next box.
 
 #### Skipping a delivery
 
-`skip` is the only subcommand here that changes anything, and it won't
-without `--yes`:
+`skip` is the first of three subcommands here that change something, and none
+of them will without `--yes`:
 
 ```
 $ amazon subscribe skip bodymed
@@ -500,7 +500,31 @@ One subscription per invocation. Two bare words is far more likely to be a
 two-word search that lost its quotes than a request to skip two things.
 
 A confirmed skip drops all three cached views, since the delivery it just
-changed is in every one of them.
+changed is in every one of them. That happens on *attempt*, not on success: a
+click that landed and then failed to report back has still changed your
+account, and a cache that insists otherwise for half an hour is worse than one
+re-read.
+
+##### Exit codes
+
+The three outcomes above are only useful to a person reading the screen, so
+`skip`, `cancel` and `schedule` carry them out to the shell:
+
+| code | meaning |
+|---|---|
+| 0 | done, and confirmed by re-reading Amazon |
+| 1 | Amazon accepted the click and the change isn't there |
+| 2 | nothing was attempted — a dry run, or a refusal |
+| 3 | attempted, and the check couldn't be made |
+
+3 exists so `amazon subscribe cancel x --yes && something-else` doesn't treat
+"couldn't confirm" as confirmation. Folding it into 0 reports a shipped box as
+skipped; folding it into 1 cries wolf on a mutation that almost certainly
+worked, and a warning that's usually wrong gets ignored.
+
+`schedule` with no `--qty`/`--every`/`--next` is the exception: it asked what
+the item accepts rather than requesting a change, and it exits 0 because it
+answered.
 
 #### Cancelling a subscription
 
@@ -574,11 +598,13 @@ Unlike `skip` and `cancel`, this one is reversible: run it again. Verification
 re-reads your subscription list and compares the cadence the card now states
 against what you asked for.
 
-All three read-only views cache for 30 minutes, and a cached read says its age on stderr
+The three read-only views cache for 30 minutes, and a cached read says its age on stderr
 (`[cached 12 minutes ago — --fresh to re-read]`) — a schedule you changed on
 the website twenty minutes ago and one that never changed look identical
 otherwise. `--fresh` on any of them drops all three, since they describe one
-account; when write commands land they will invalidate through the same door.
+account, and `skip`, `cancel` and `schedule` invalidate through the same door
+the moment they are confirmed — on attempt, not on success, because a click
+that landed and then failed to report has still changed your account.
 
 `list`, `upcoming`, and `show` draw the product photo beside each entry when
 they're printing to a terminal; `--no-image` gives you the plain table.
@@ -630,7 +656,10 @@ in `data-a-hires`. Both are strings ending in a plausible filename, so reading
 has pictures and the rest have grey smudges. The fixtures carry that markup,
 and a test asserts they still do.
 
-Read-only for now: nothing here skips, reschedules, or cancels anything.
+The three mutations — `skip`, `cancel`, `schedule` — share one contract:
+nothing happens without `--yes`, the dry run shows Amazon's own wording rather
+than a paraphrase of it, and the result is verified by re-reading afterwards
+rather than inferred from a click that returned without error.
 
 ## Tuning sync speed
 
