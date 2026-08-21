@@ -798,12 +798,31 @@ module Amazon
       field && order[field]
     end
 
+    # Escape sequences take up no space on screen but plenty in a Ruby string,
+    # and this table pads with `String#length`. One dim() price in the column —
+    # `subscribe list` renders a discount that way whenever Amazon hasn't
+    # priced the delivery yet — added nine invisible characters to the widest
+    # cell, so every other row in that column got nine spaces too many and the
+    # columns after it stopped lining up. Only when colour was on, which is to
+    # say only when a person was looking: piping to a file disables colour and
+    # produces a perfectly aligned table.
+    ANSI_RE = /\e\[[0-9;]*m/
+
+    def display_width(str) = str.to_s.gsub(ANSI_RE, "").length
+
     def print_table(headers, rows)
       cols = headers.size
-      widths = Array.new(cols) { |i| [headers[i].length, *rows.map { |r| r[i].to_s.length }].max }
-      fmt = widths.map { |w| "%-#{w}s" }.join("  ")
-      puts bold(fmt % headers)
-      rows.each { |r| puts(fmt % r) }
+      widths = Array.new(cols) do |i|
+        [display_width(headers[i]), *rows.map { |r| display_width(r[i]) }].max
+      end
+      puts bold(pad_cells(headers, widths))
+      rows.each { |r| puts pad_cells(r, widths) }
+    end
+
+    def pad_cells(cells, widths)
+      cells.each_with_index.map do |cell, i|
+        "#{cell}#{" " * (widths[i] - display_width(cell))}"
+      end.join("  ")
     end
 
     def format_money(val)

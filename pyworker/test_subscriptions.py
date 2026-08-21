@@ -51,6 +51,7 @@ from subscriptions import (
     CancelReasonUnknown,
     NoSuchSubscription,
     NotCancellable,
+    Blocked,
     NotLoggedIn,
     NotSchedulable,
     NotSkippable,
@@ -90,7 +91,9 @@ from subscriptions import (
     schedule_note,
     select_options,
     selected_option,
+    verify_cancelled,
     verify_schedule,
+    verify_skipped,
     open_deliveries_tab,
     skip_delivery_item,
     verify_cancelled,
@@ -2183,3 +2186,63 @@ class DegradationRecordTest(unittest.TestCase):
             subscriptions.warn("something went wrong")
             emit("done", count=0, degraded=subscriptions.degradations())
         self.assertEqual(events[-1]["degraded"], ["something went wrong"])
+
+
+class UnverifiableReasonTest(unittest.TestCase):
+    """`verified: None` says a check could not be made, never why.
+
+    The two likely whys want opposite responses — an expired session wants
+    `amazon login`, a captcha wants a person in a browser — and neither is
+    recoverable from a tri-state or an exit code.
+    """
+
+    def setUp(self):
+        subscriptions._DEGRADED.clear()
+        self.addCleanup(subscriptions._DEGRADED.clear)
+
+    class Dead:
+        def __init__(self, error):
+            self._error = error
+
+        def goto(self, *_a, **_kw):
+            raise self._error
+
+        def locator(self, *_a, **_kw):
+            raise self._error
+
+    def verify(self, error):
+        with collecting() as events:
+            got = verify_skipped(self.Dead(error), "SNSD0_X")
+        return got, " ".join(e.get("msg", "") for e in events)
+
+    def test_it_is_still_none_not_false(self):
+        got, _ = self.verify(RuntimeError("frame detached"))
+        self.assertIsNone(got, "an unverifiable change must never read as a failed one")
+
+    def test_the_reason_is_recorded(self):
+        _, msgs = self.verify(RuntimeError("frame detached"))
+        self.assertIn("re-reading to confirm it failed", msgs)
+        self.assertIn("RuntimeError", msgs)
+        self.assertEqual(len(subscriptions.degradations()), 1)
+
+    def test_an_expired_session_says_to_sign_in(self):
+        _, msgs = self.verify(NotLoggedIn("signed out"))
+        self.assertIn("amazon login", msgs)
+
+    def test_a_challenge_says_to_go_look(self):
+        _, msgs = self.verify(Blocked("captcha"))
+        self.assertIn("browser", msgs)
+
+    # It must name which mutation it could not confirm: these run one at a
+    # time, but the message ends up in a scrollback with everything else.
+    def test_each_mutation_names_itself(self):
+        for fn, args, word in [
+            (verify_skipped, ("SNSD0_X",), "skip"),
+            (verify_cancelled, ("SNSD0_X",), "cancellation"),
+            (verify_schedule, ("SNSD0_X", {"quantity": None}), "schedule change"),
+        ]:
+            with self.subTest(word=word):
+                subscriptions._DEGRADED.clear()
+                with collecting() as events:
+                    fn(self.Dead(RuntimeError("boom")), *args)
+                self.assertIn(word, " ".join(e.get("msg", "") for e in events))

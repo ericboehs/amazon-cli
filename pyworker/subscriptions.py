@@ -989,6 +989,27 @@ def skip_delivery_item(
     return result
 
 
+def _warn_unverifiable(what: str, error: Exception) -> None:
+    """Say why a check could not be made.
+
+    `None` from a verify_* is deliberately not `False`, and the commands print
+    it as "couldn't re-read". But the tri-state only says *that* we could not
+    check, never why — and the two likely whys need opposite responses from
+    the user. A session that expired wants `amazon login`; a captcha wants a
+    person in a browser. Neither is discoverable from the exit code, and
+    `-v` did not help because nothing was recorded.
+    """
+    hint = ""
+    if isinstance(error, NotLoggedIn):
+        hint = " — the session expired mid-run; `amazon login` and check by hand"
+    elif isinstance(error, Blocked):
+        hint = " — Amazon interrupted with a challenge; check by hand in a browser"
+    warn(
+        f"{what} was submitted, but re-reading to confirm it failed "
+        f"({type(error).__name__}){hint}"
+    )
+
+
 def verify_skipped(page: Any, sub_id: str | None) -> bool | None:
     """Re-read the next delivery and check the item really left it.
 
@@ -1011,7 +1032,8 @@ def verify_skipped(page: Any, sub_id: str | None) -> bool | None:
             f"{DELIVERY_SUBSCRIPTION_CARD}[data-subscription-id={json.dumps(sub_id)}]"
         ).count()
         return still_there == 0
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _warn_unverifiable("the skip", e)
         return None
 
 
@@ -1225,7 +1247,8 @@ def verify_schedule(page: Any, sub_id: str, wanted: dict[str, Any]) -> bool | No
             ) != opt["value"]:
                 return False
         return True
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _warn_unverifiable("the schedule change", e)
         return None
 
 
@@ -1337,7 +1360,8 @@ def verify_cancelled(page: Any, sub_id: str) -> bool | None:
         open_subscription_list(page)
         load_all_pages(page)
         return _card_by_id(page, sub_id) is None
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _warn_unverifiable("the cancellation", e)
         return None
 
 

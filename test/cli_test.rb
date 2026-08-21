@@ -6015,6 +6015,44 @@ end
 # A degraded scrape is cached like any other. The warnings that explain it are
 # said once, on the run that scraped — and then the same partial answer is
 # served for thirty minutes looking exactly like a whole one.
+# Colour codes occupy no space on screen and several characters in a string,
+# and the table padded by the second. The bug only appeared with colour on —
+# i.e. only when a human was looking, since piping to a file turns colour off
+# and produces a perfectly aligned table.
+class TableAlignmentTest < Minitest::Test
+  def rows
+    [
+      { 'next_delivery_label' => 'September 2', 'interval_count' => 2, 'interval_unit' => 'month',
+        'quantity' => 1, 'price' => 14.22, 'subscription_id' => 'SNSD0_AAA', 'title' => 'Gain' },
+      { 'next_delivery_label' => 'September 30', 'interval_count' => 3, 'interval_unit' => 'month',
+        'quantity' => 1, 'discount' => 'Saving 15%', 'subscription_id' => 'SNST0_BBB', 'title' => 'Care' }
+    ]
+  end
+
+  def render(color)
+    out, = capture_io_streams do
+      Amazon::Formatter.new(color: color).subscriptions(rows, total: 2, loaded_all: true, thumbnails: nil)
+    end
+    out.lines.first(3).map { |l| l.gsub(/\e\[[0-9;]*m/, '').chomp }
+  end
+
+  # `subscribe list` renders a discount dim whenever Amazon has not priced the
+  # delivery yet, which is most rows on most accounts.
+  def test_a_coloured_cell_does_not_shift_the_columns_after_it
+    starts = render(true).map { |l| l.index(/SNS|subscription_id/) }
+    assert_equal 1, starts.uniq.size, "the id column lands at #{starts.inspect}"
+  end
+
+  def test_colour_and_no_colour_agree_on_the_layout
+    assert_equal render(false).map { |l| l.index(/SNS|subscription_id/) },
+                 render(true).map { |l| l.index(/SNS|subscription_id/) }
+  end
+
+  def test_the_visible_text_is_the_same_either_way
+    assert_equal render(false).map(&:rstrip), render(true).map(&:rstrip)
+  end
+end
+
 class SubscribeDegradationReplayTest < Minitest::Test
   PARTIAL = "only 30 of 59 subscriptions loaded and no usable 'show more' trigger".freeze
 
