@@ -78,6 +78,18 @@ module Amazon
       path.exist? ? (Time.now - path.mtime).to_i : nil
     end
 
+    # Drop every entry in this namespace.
+    #
+    # Per-key invalidation is the wrong grain for anything that shares a
+    # subject. `amazon subscribe list` and `subscribe upcoming` are two
+    # renderings of one account state, so refreshing one while the other still
+    # serves a 25-minute-old copy of the same subscriptions reproduces exactly
+    # the staleness the TTL exists to bound. The same goes for a write: a
+    # cancellation changes both views, and only one of them knows it happened.
+    def clear
+      FileUtils.rm_rf(@dir)
+    end
+
     private
 
     def empty_collection?(value)

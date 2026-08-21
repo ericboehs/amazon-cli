@@ -146,6 +146,30 @@ module Amazon
       cards
     end
 
+    # One subscription in full, found by id or by a search over the titles.
+    # Returns nil when nothing matched: that is a question with an answer
+    # ("you have no such subscription"), not a failure to reach Amazon, and the
+    # two want different exit codes.
+    def subscription(id_or_query)
+      detail = nil
+      key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
+      run({ action: "subscription", key => id_or_query }, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "detail" then detail = event["data"]
+        when "log"    then log_event(event)
+        when "error"
+          raise Error, live_error(event) unless event["kind"] == "not_found"
+          @not_found = event["msg"]
+        end
+      end
+      detail
+    end
+
+    # Amazon's own words for why nothing matched — "no active subscription
+    # matching …" or the list of things that matched too many. Worth passing
+    # through verbatim rather than restating from the Ruby side.
+    attr_reader :not_found
+
     class Progress
       BAR_WIDTH = 20
 

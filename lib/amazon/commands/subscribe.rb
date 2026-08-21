@@ -9,7 +9,7 @@ module Amazon
     # that mutates a subscription and can't prove it worked is worse than one
     # that doesn't exist.
     class SubscribeNamespace
-      SUBCOMMANDS = %w[list upcoming].freeze
+      SUBCOMMANDS = %w[list upcoming show].freeze
 
       def initialize(global)
         @global = global
@@ -23,6 +23,7 @@ module Amazon
           sub.nil? ? 2 : 0
         when "list"     then Subscribe::List.new(@global).run(argv)
         when "upcoming" then Subscribe::Upcoming.new(@global).run(argv)
+        when "show"     then Subscribe::Show.new(@global).run(argv)
         else
           warn "unknown subscribe subcommand: #{sub}"
           warn help_text
@@ -40,9 +41,10 @@ module Amazon
             list      Your Subscribe & Save subscriptions and their schedules
             upcoming  Scheduled deliveries: what ships when, and by when you
                       can still change it
+            show      One subscription in full: ASIN, seller, savings to date
 
-          Both read Amazon live through the session `amazon login` saved.
-          Neither changes anything.
+          All three read Amazon live through the session `amazon login` saved,
+          and cache for 30 minutes. None of them changes anything.
 
           Run `amazon subscribe <subcommand> --help` for subcommand options.
         HELP

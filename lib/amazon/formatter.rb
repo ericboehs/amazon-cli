@@ -212,14 +212,17 @@ module Amazon
       return puts(JSON.pretty_generate(rows)) if @json
       return puts("(no Subscribe & Save subscriptions)") if rows.empty?
 
-      headers = %w[next every qty subscription_id item]
+      headers = %w[next every qty price subscription_id item]
       # Everything but the title is fixed width; give the title the rest.
-      title_width = [term_width - 62, 24].max
+      title_width = [term_width - 74, 24].max
       data = rows.map do |r|
         [
           r["next_delivery_label"] || "?",
           interval_phrase(r),
           (r["quantity"] || "?").to_s,
+          # Blank, not $0.00, for a delivery Amazon hasn't priced yet. The
+          # discount is what it has committed to for those.
+          subscription_price(r),
           r["subscription_id"],
           truncate(r["title"], title_width)
         ]
@@ -229,11 +232,14 @@ module Amazon
       puts dim(note) if note
     end
 
-    def deliveries(cards)
+    # `limit` trims what prints, never what's returned: --json is a data
+    # interface and a caller piping to jq did not ask for Amazon's next three.
+    def deliveries(cards, limit: nil)
       return puts(JSON.pretty_generate(cards)) if @json
       return puts("(no scheduled Subscribe & Save deliveries)") if cards.empty?
 
-      cards.each_with_index do |card, i|
+      shown = limit ? cards.first(limit) : cards
+      shown.each_with_index do |card, i|
         puts if i.positive?
         puts delivery_heading(card)
         # Only ever set on the delivery that is next out the door, and it is
@@ -243,9 +249,55 @@ module Amazon
         puts dim("  #{card["tiering"]}") if card["tiering"]
         delivery_items(card)
       end
+      remaining = cards.size - shown.size
+      return unless remaining.positive?
+
+      puts dim("#{remaining} more #{remaining == 1 ? "delivery" : "deliveries"} scheduled — pass --all")
+    end
+
+    # One subscription, from the edit modal. Laid out as labelled lines rather
+    # than a table: it is one record with a dozen fields, half of which are
+    # sentences.
+    def subscription(detail)
+      return puts(JSON.pretty_generate(detail)) if @json
+
+      puts bold(detail["title"] || "(untitled subscription)")
+      puts dim(detail["variation"]) if detail["variation"]
+      puts
+      rows = subscription_detail_rows(detail)
+      width = rows.map { |label, _| label.length }.max || 0
+      rows.each { |label, value| puts "  #{dim(label.ljust(width))}  #{value}" }
     end
 
     private
+
+    def subscription_price(row)
+      return format_money(row["price"]) if row["price"]
+      row["discount"] ? dim(row["discount"].to_s.sub(/\ASaving /, "")) : ""
+    end
+
+    def subscription_detail_rows(detail)
+      rows = []
+      rows << ["next delivery", next_delivery_line(detail)] if detail["next_delivery_label"]
+      rows << ["schedule", detail["schedule_raw"]] if detail["schedule_raw"]
+      rows << ["discount", green(detail["discount_now"])] if detail["discount_now"]
+      rows << ["saved so far", format_money(detail["lifetime_savings"])] if detail["lifetime_savings"]
+      rows << ["sold by", detail["merchant"]] if detail["merchant"]
+      rows << ["asin", detail["asin"]] if detail["asin"]
+      # Amazon substitutes this if the subscribed item is out of stock, so its
+      # absence is worth stating rather than omitting — "none" is a setting.
+      rows << ["backup item", detail["backup_item"] || dim("none")]
+      rows << ["subscription id", detail["subscription_id"]] if detail["subscription_id"]
+      rows
+    end
+
+    # The modal prints "Next delivery will arrive by" above the date; keeping
+    # its wording distinguishes an arrival estimate from a ship date.
+    def next_delivery_line(detail)
+      label = detail["next_delivery_label"]
+      prefix = detail["next_delivery_prefix"].to_s[/arrive by/i]
+      prefix ? "#{label} #{dim("(arrives by)")}" : label
+    end
 
     # Amazon's own label for a value, when it gave one. Its wording is more
     # precise than anything invented here ("Estimated savings for this

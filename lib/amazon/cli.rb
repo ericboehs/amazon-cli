@@ -85,6 +85,7 @@ module Amazon
         Subscribe & Save (queries Amazon now):
           subscribe list      Your subscriptions and their schedules
           subscribe upcoming  Scheduled deliveries, prices, and edit deadlines
+          subscribe show      One subscription in full
 
         Other:
           login    Open a browser so you can sign in (handles captcha/2FA)

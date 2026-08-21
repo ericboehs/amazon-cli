@@ -103,9 +103,10 @@ date        order_id             total    status
   archive, so anything you've bought before shows the date and price you
   paid, plus the delta.
 - **Subscribe & Save** — `amazon subscribe list` shows every subscription
-  with its schedule and next delivery date; `amazon subscribe upcoming`
-  shows the scheduled deliveries themselves, with the prices Amazon has
-  committed to and the last day you can still change each one. Read-only.
+  sorted by what ships next, with its cadence, discount, and price;
+  `amazon subscribe upcoming` shows the deliveries themselves and the last
+  day you can still change each one; `amazon subscribe show` opens one
+  subscription in full. Read-only, cached for 30 minutes.
 - **Incremental sync** — only fetches orders not already on disk. A `--full`
   flag re-fetches everything.
 - **Parallel detail fetches** — `ThreadPoolExecutor` with a tunable worker
@@ -130,7 +131,7 @@ lib/amazon/
     order.rb            `amazon order …` dispatcher
     order/              sync, list, show, search over the local archive
     subscribe.rb        `amazon subscribe …` dispatcher
-    subscribe/          list, upcoming (Subscribe & Save, read-only)
+    subscribe/          list, upcoming, show (Subscribe & Save, read-only)
     login.rb, config.rb, buy.rb
   config.rb             XDG paths, config load
   store.rb              JSON read/write, index, ASIN purchase history
@@ -338,10 +339,22 @@ estimate that excludes tax (and, from a subtotal, shipping too).
 ### Subscribe & Save
 
 ```bash
-amazon subscribe list                 # every subscription: next date, cadence, quantity
+amazon subscribe list                 # every subscription, soonest delivery first
 amazon subscribe list --all           # click past the first 30
-amazon subscribe upcoming             # the deliveries themselves, with prices
+amazon subscribe upcoming             # the next 3 deliveries, with prices
+amazon subscribe upcoming --all       # every scheduled delivery
+amazon subscribe show dishwasher      # one subscription in full, by id or by title
+amazon subscribe list --fresh         # ignore the 30-minute cache
 amazon subscribe upcoming --json | jq '.[0].subtotal'
+```
+
+```
+$ amazon subscribe list
+next              every     qty  price   subscription_id             item
+September 2       2 months  1    $14.22  SNSD0_CPWMW84DZS0X826Y8P77  Gain Liquid Laundry Deterge…
+September 30      6 months  1    15%     SNST0_3DDC5AB24AB74C1087BE  Amazon Basic Care All Day A…
+October 28        3 months  1    15%     SNST0_FA2F200C1C3C40AE9F9B  Clorox Clean-Up Multi-Surfa…
+showing 30 of 59 — pass --all for the rest
 ```
 
 ```
@@ -363,20 +376,59 @@ Two views of the same account, because Amazon keeps them on separate pages
 and each knows something the other doesn't. `list` is per-subscription:
 everything you're subscribed to and how often it ships. `upcoming` is
 per-shipment: those subscriptions regrouped into the boxes Amazon will
-actually send and charge for.
+actually send and charge for. `show` is the third page — one subscription's
+edit modal, which is the only place the ASIN, the seller, the backup item,
+and the running savings total live.
 
-**Prices exist only in `upcoming`.** The subscription list renders no price
-at all — the price isn't settled until the delivery is assembled and the
-tier discount (5% → 15%, by item count in that one box) is known. Only the
-next delivery is priced; later ones show the discount rate but no amount,
-which is why the price column above goes blank after the first block. A
-`$0.00` in that space would be a lie, so nothing is printed there.
+```
+$ amazon subscribe show dishwasher
+Cascade Free & Clear Dishwasher Detergent Liquid Gel, Lemon, 75oz
+
+  next delivery    Wednesday, September 30 (arrives by)
+  schedule         1 unit every 1 month
+  discount         Get it now with 5% off
+  saved so far     $16.92
+  sold by          Amazon.com and top rated sellers
+  asin             B08R7FB5JS
+  backup item      none
+  subscription id  SNSD0_JW5SC777SESY1WWWNZPK
+```
+
+A subscription id is 26 characters nobody types twice, so `show` also takes
+words from the product title. A search matching more than one prints the
+matches and stops rather than picking for you — `show` is what you run before
+deciding what to cancel.
+
+**Prices come from the deliveries view.** A subscription card renders none:
+the price isn't settled until the delivery is assembled and its tier discount
+(5% → 15%, by item count in that one box) is known. So `list` reads both
+pages and joins them on subscription id. Only the delivery shipping next is
+priced; the rest show the rate they'll get without an amount, which is why
+the price column holds `15%` rather than a number. A `$0.00` there would be a
+lie. If the deliveries view fails, the schedules still print and stderr says
+what's missing.
+
+`list` is sorted by next delivery date, soonest first. Amazon's own order
+interleaves September, March, and December — there is nothing in it to
+preserve.
 
 The list page loads 30 subscriptions and hides the rest behind a "show more"
 button, so plain `list` says `showing 30 of 59 — pass --all for the rest`
 rather than pretending 30 is all of them. `--all` clicks through (a few
 seconds for 59). If pagination stalls, you get the partial list plus a
 warning on stderr — never a short list that looks complete.
+
+Amazon schedules deliveries months ahead — seven of them, 84 item lines, on
+the account this was built against — so `upcoming` prints the next three and
+says how many more there are. `--limit N` and `--all` override that. `--json`
+ignores both: a caller piping to `jq` asked for the data, not for Amazon's
+next three.
+
+All three cache for 30 minutes, and a cached read says its age on stderr
+(`[cached 12 minutes ago — --fresh to re-read]`) — a schedule you changed on
+the website twenty minutes ago and one that never changed look identical
+otherwise. `--fresh` on any of them drops all three, since they describe one
+account; when write commands land they will invalidate through the same door.
 
 Read-only for now: nothing here skips, reschedules, or cancels anything.
 
@@ -423,10 +475,12 @@ scrubbed HTML captured from the real pages (`pyworker/fixtures/`), so the
 selectors are checked against markup Amazon actually served rather than
 markup I remembered. The fixtures carry fake subscription ids, ship ids,
 CSRF tokens, product titles, and addresses; nothing in them identifies an
-account. Pagination is exercised against a fake page that reproduces one
-measured Amazon quirk: clicking "show more" grows the DOM but leaves the
-server-rendered `loadedItemCount` frozen at its original value. Believing
-that counter is an infinite loop, and the fake is built to fail that way.
+account, and the edit-modal test asserts that no address or payment method
+reaches the output at all. Pagination is exercised against a fake page that
+reproduces one measured Amazon quirk: clicking "show more" grows the DOM but
+leaves the server-rendered `loadedItemCount` frozen at its original value.
+Believing that counter is an infinite loop, and the fake is built to fail
+that way.
 
 `lib/amazon/reviews.rb` is pure and does no I/O, so it's tested directly
 against synthetic listings — a farmed one it should flag and a genuine one
@@ -476,7 +530,7 @@ identical to a pass. Two commands are honest about which suite you got:
 
 ```sh
 pyworker/.venv/bin/python -m unittest discover -s pyworker -p 'test_*.py'  # 0 skips
-/usr/bin/python3           -m unittest discover -s pyworker -p 'test_*.py'  # 63 skips
+/usr/bin/python3           -m unittest discover -s pyworker -p 'test_*.py'  # 84 skips
 ```
 
 The first is what `python-deps-test` runs; the second stands in for

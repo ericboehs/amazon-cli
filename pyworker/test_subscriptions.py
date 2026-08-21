@@ -13,7 +13,9 @@ selector-keyed dict is not good enough here.
 
 from __future__ import annotations
 
+import json
 import unittest
+from datetime import date
 
 from browser import text
 from subscriptions import (
@@ -26,17 +28,28 @@ from subscriptions import (
     PAGINATION_KEY,
     SCHEDULE_SELECTOR,
     SUBSCRIPTION_CARD,
+    NoSuchSubscription,
     _cards,
+    _card_by_query,
     _clickable,
     _copa_links,
     _has,
+    _percent,
     _warn_selector_rot,
+    available_actions,
+    delivery_index,
+    edit_modal_url,
+    first_money,
+    join_delivery_facts,
     load_all_pages,
     page_state,
     parse_epoch_date,
+    parse_label_date,
     parse_schedule,
     scrape_delivery_card,
     scrape_subscription_card,
+    scrape_subscription_detail,
+    sort_by_next_delivery,
 )
 from test_live import HAVE_BS4, NO_DEPS, DomPage, emitted
 
@@ -361,14 +374,15 @@ class FakeTrigger:
 
 
 class FakeCardList:
-    def __init__(self, n):
+    def __init__(self, n, node=None):
         self._n = n
+        self._node = node
 
     def count(self):
         return self._n
 
     def nth(self, i):
-        return i
+        return self._node if self._node is not None else i
 
 
 class FakePaginatingPage:
@@ -554,3 +568,290 @@ class PageStateFailureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParseLabelDateTest(unittest.TestCase):
+    TODAY = date(2026, 8, 21)
+
+    def test_a_bare_month_and_day_infer_the_year(self):
+        self.assertEqual(parse_label_date("September 30", self.TODAY), "2026-09-30")
+
+    def test_a_month_already_past_rolls_into_next_year(self):
+        self.assertEqual(parse_label_date("January 5", self.TODAY), "2027-01-05")
+
+    # The reason this function exists rather than calling live's parser
+    # directly: inference caps out at twelve months, and the list prints a year
+    # exactly when the date is further out than that.
+    def test_an_explicit_year_beats_inference(self):
+        self.assertEqual(parse_label_date("March 3, 2029", self.TODAY), "2029-03-03")
+
+    def test_an_explicit_year_that_agrees_with_inference_still_parses(self):
+        self.assertEqual(parse_label_date("March 3, 2027", self.TODAY), "2027-03-03")
+
+    def test_a_weekday_prefix_is_ignored(self):
+        self.assertEqual(parse_label_date("Wednesday, September 30", self.TODAY), "2026-09-30")
+
+    def test_an_impossible_date_is_none_not_a_crash(self):
+        self.assertIsNone(parse_label_date("February 31, 2027", self.TODAY))
+
+    def test_nothing_in_nothing_out(self):
+        self.assertIsNone(parse_label_date(None, self.TODAY))
+        self.assertIsNone(parse_label_date("sometime soon", self.TODAY))
+
+
+class FirstMoneyTest(unittest.TestCase):
+    # Amazon renders the amount twice inside `.a-price` — once for screen
+    # readers — so the element's text is "$12.34$12.34" and a straight
+    # parse_money returns None.
+    def test_a_doubled_amount_yields_one_number(self):
+        self.assertEqual(first_money("You have saved $12.34$12.34 on this!"), 12.34)
+
+    def test_thousands_separators_survive(self):
+        self.assertEqual(first_money("$1,234.56"), 1234.56)
+
+    def test_no_money_is_none(self):
+        self.assertIsNone(first_money("free"))
+        self.assertIsNone(first_money(None))
+
+
+class PercentTest(unittest.TestCase):
+    def test_it_reads_the_discount_out_of_the_sentence(self):
+        self.assertEqual(_percent("Get it now with 15% off"), 15)
+
+    def test_no_percent_is_none(self):
+        self.assertIsNone(_percent("Get it now"))
+        self.assertIsNone(_percent(None))
+
+
+class DeliveryJoinTest(unittest.TestCase):
+    def cards(self):
+        return [
+            {
+                "date": "2026-09-02",
+                "items": [
+                    {"subscription_id": "A", "price": 14.22, "price_raw": "$14.22",
+                     "discount": "Saving 5%"},
+                ],
+            },
+            {
+                "date": "2026-09-30",
+                "items": [
+                    # A recurs later; the earlier card is the one that answers
+                    # "what happens next".
+                    {"subscription_id": "A", "price": None, "price_raw": None,
+                     "discount": "Saving 15%"},
+                    {"subscription_id": "B", "price": None, "price_raw": None,
+                     "discount": "Saving 10%"},
+                ],
+            },
+        ]
+
+    def test_the_index_keeps_the_earliest_delivery_for_each_subscription(self):
+        index = delivery_index(self.cards())
+        self.assertEqual(index["A"]["next_delivery_date"], "2026-09-02")
+        self.assertEqual(index["A"]["price"], 14.22)
+        self.assertEqual(index["B"]["next_delivery_date"], "2026-09-30")
+
+    def test_items_without_an_id_are_skipped(self):
+        index = delivery_index([{"date": "2026-09-02", "items": [{"price": 1.0}]}])
+        self.assertEqual(index, {})
+
+    def test_a_card_with_no_items_key_does_not_explode(self):
+        self.assertEqual(delivery_index([{"date": "2026-09-02"}]), {})
+
+    def test_the_join_attaches_price_discount_and_a_real_date(self):
+        rows = [{"subscription_id": "A", "next_delivery_label": "September 2"}]
+        join_delivery_facts(rows, self.cards())
+        self.assertEqual(rows[0]["price"], 14.22)
+        self.assertEqual(rows[0]["discount"], "Saving 5%")
+        self.assertEqual(rows[0]["next_delivery_date"], "2026-09-02")
+
+    # The card's own label has no year. Preferring the delivery's timestamp is
+    # what makes "September 30" sortable against "March 3, 2027".
+    def test_the_delivery_date_wins_over_the_parsed_label(self):
+        rows = [{"subscription_id": "A", "next_delivery_label": "September 30"}]
+        join_delivery_facts(rows, self.cards())
+        self.assertEqual(rows[0]["next_delivery_date"], "2026-09-02")
+
+    # A subscription that is not in any upcoming delivery still has to sort.
+    def test_an_unmatched_row_falls_back_to_its_label(self):
+        rows = [{"subscription_id": "ZZZ", "next_delivery_label": "March 3, 2029"}]
+        join_delivery_facts(rows, self.cards())
+        self.assertIsNone(rows[0]["price"])
+        self.assertIsNone(rows[0]["discount"])
+        self.assertEqual(rows[0]["next_delivery_date"], "2029-03-03")
+
+    def test_an_unmatched_row_with_an_unreadable_label_gets_no_date(self):
+        rows = [{"subscription_id": "ZZZ", "next_delivery_label": None}]
+        join_delivery_facts(rows, [])
+        self.assertIsNone(rows[0]["next_delivery_date"])
+
+
+class SortByNextDeliveryTest(unittest.TestCase):
+    def test_soonest_first(self):
+        rows = [
+            {"next_delivery_date": "2027-03-03", "title": "c"},
+            {"next_delivery_date": "2026-09-02", "title": "a"},
+            {"next_delivery_date": "2026-09-30", "title": "b"},
+        ]
+        sort_by_next_delivery(rows)
+        self.assertEqual([r["title"] for r in rows], ["a", "b", "c"])
+
+    def test_same_day_ties_break_on_title(self):
+        rows = [
+            {"next_delivery_date": "2026-09-02", "title": "Zinc"},
+            {"next_delivery_date": "2026-09-02", "title": "apples"},
+        ]
+        sort_by_next_delivery(rows)
+        self.assertEqual([r["title"] for r in rows], ["apples", "Zinc"])
+
+    # An unreadable date is a scraping failure, not a delivery in 1970.
+    def test_undated_rows_sort_last(self):
+        rows = [
+            {"next_delivery_date": None, "title": "unknown"},
+            {"next_delivery_date": "2027-03-03", "title": "later"},
+        ]
+        sort_by_next_delivery(rows)
+        self.assertEqual([r["title"] for r in rows], ["later", "unknown"])
+
+    def test_a_row_with_no_title_still_sorts(self):
+        rows = [{"next_delivery_date": "2026-09-02"}, {"next_delivery_date": "2026-09-01"}]
+        sort_by_next_delivery(rows)
+        self.assertEqual(rows[0]["next_delivery_date"], "2026-09-01")
+
+
+@unittest.skipUnless(HAVE_BS4, NO_DEPS.format(pkg="beautifulsoup4"))
+class SubscriptionDetailFixtureTest(unittest.TestCase):
+    """The edit modal, against markup captured from a real one."""
+
+    def setUp(self):
+        self.page = DomPage.from_fixture("subscription_detail.html")
+        self.detail = scrape_subscription_detail(self.page)
+
+    def test_the_product_and_its_asin(self):
+        self.assertEqual(self.detail["title"], "Example Dishwasher Detergent Gel, Lemon, 75oz")
+        self.assertEqual(self.detail["asin"], "B000FIXTUR")
+        self.assertIn("00FIXTUREIMG", self.detail["image"])
+
+    # The href is `/dp/…` in lower case. Upper-casing the URL before matching
+    # breaks the needle, not just the ASIN, and the pattern still looks right.
+    def test_the_asin_survives_a_lower_case_dp_path(self):
+        self.assertEqual(self.detail["asin"], "B000FIXTUR")
+
+    def test_the_seller_drops_amazons_own_label(self):
+        self.assertEqual(self.detail["merchant"], "Amazon.com and top rated sellers")
+
+    def test_the_next_delivery_keeps_its_weekday_and_gains_a_date(self):
+        self.assertEqual(self.detail["next_delivery_label"], "Wednesday, September 30")
+        self.assertEqual(self.detail["next_delivery_date"][5:], "09-30")
+        self.assertIn("arrive by", self.detail["next_delivery_prefix"])
+
+    def test_the_discount_is_kept_as_words_and_as_a_number(self):
+        self.assertEqual(self.detail["discount_now"], "Get it now with 5% off")
+        self.assertEqual(self.detail["discount_percent"], 5)
+
+    def test_the_schedule_parses(self):
+        self.assertEqual(self.detail["schedule_raw"], "1 unit every 1 month")
+        self.assertEqual(self.detail["quantity"], 1)
+        self.assertEqual(self.detail["interval_count"], 1)
+        self.assertEqual(self.detail["interval_unit"], "month")
+
+    # "$12.34" here is what the subscription has saved since it started. The
+    # modal has no price at all, and this is the number most likely to be
+    # mistaken for one.
+    def test_the_dollar_figure_is_lifetime_savings(self):
+        self.assertEqual(self.detail["lifetime_savings"], 12.34)
+        self.assertIn("You have saved", self.detail["lifetime_savings_text"])
+
+    # Amazon prints its placeholder in the same slot as a real backup product.
+    def test_no_backup_item_reports_none_not_the_placeholder(self):
+        self.assertIsNone(self.detail["backup_item"])
+
+    def test_the_offered_actions_are_recorded(self):
+        self.assertIn("CANCEL", self.detail["actions"])
+        self.assertIn("CHANGE_QUANTITY_FREQUENCY", self.detail["actions"])
+
+    def test_the_tier_level_comes_through(self):
+        self.assertEqual(self.detail["tier_level"], "BASE")
+
+    # Both render in this modal. Neither belongs in the output.
+    def test_no_address_or_payment_method_leaks_into_the_record(self):
+        blob = json.dumps(self.detail).lower()
+        for leak in ("example st", "exampletown", "store card", "ending in"):
+            self.assertNotIn(leak, blob)
+
+
+@unittest.skipUnless(HAVE_BS4, NO_DEPS.format(pkg="beautifulsoup4"))
+class EditModalUrlTest(unittest.TestCase):
+    def card(self):
+        page = DomPage.from_fixture("subscriptions_list.html")
+        return _cards(page, SUBSCRIPTION_CARD)[0]
+
+    def test_it_reads_the_url_the_card_publishes(self):
+        url = edit_modal_url(self.card())
+        self.assertIn("ajax/subscription?", url)
+        self.assertIn("subscriptionId=", url)
+
+    # The same card publishes a consumptionPattern modal too; picking by
+    # position instead of by name opens the schedule editor.
+    def test_it_picks_the_edit_modal_and_not_the_first_modal_on_the_card(self):
+        self.assertNotIn("consumptionPattern", edit_modal_url(self.card()))
+
+    def test_a_card_with_no_modal_payload_yields_none(self):
+        page = DomPage('<div class="subscription-card" data-subscription-id="A"></div>')
+        self.assertIsNone(edit_modal_url(page))
+
+    def test_junk_in_the_payload_is_skipped_not_raised(self):
+        page = DomPage("<div data-a-modal='not json'></div>")
+        self.assertIsNone(edit_modal_url(page))
+
+
+@unittest.skipUnless(HAVE_BS4, NO_DEPS.format(pkg="beautifulsoup4"))
+class FindByQueryTest(unittest.TestCase):
+    def page(self):
+        return DomPage.from_fixture("subscriptions_list.html")
+
+    def test_a_unique_word_finds_one_card(self):
+        card = _card_by_query(self.page(), "dishwasher")
+        self.assertEqual(card.get_attribute("data-subscription-id"), "SNSD0_FIXTURESUB0000000001")
+
+    def test_matching_is_case_insensitive(self):
+        self.assertIsNotNone(_card_by_query(self.page(), "DISHWASHER"))
+
+    def test_nothing_matching_is_none(self):
+        self.assertIsNone(_card_by_query(self.page(), "helicopter"))
+
+    def test_an_empty_query_matches_nothing_rather_than_everything(self):
+        self.assertIsNone(_card_by_query(self.page(), "   "))
+
+    # Picking the first of several is the failure that survives longest: you
+    # read one subscription's details and cancel a different one.
+    def test_an_ambiguous_query_raises_and_names_the_candidates(self):
+        with self.assertRaises(NoSuchSubscription) as ctx:
+            _card_by_query(self.page(), "example")
+        msg = str(ctx.exception)
+        self.assertIn("subscriptions match", msg)
+        self.assertIn("pass the subscription id", msg)
+
+
+class AvailableActionsTest(unittest.TestCase):
+    def test_action_types_are_read_off_the_class_names(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        page = DomPage(
+            '<a class="actionLink t-action-type-CANCEL"></a>'
+            '<a class="actionLink t-action-type-SWITCH_PRODUCT"></a>'
+            '<a class="actionLink t-action-type-CANCEL"></a>'
+        )
+        self.assertEqual(available_actions(page), ["CANCEL", "SWITCH_PRODUCT"])
+
+    def test_a_node_that_cannot_be_read_is_skipped(self):
+        class Exploding:
+            def get_attribute(self, _name):
+                raise RuntimeError("detached")
+
+        class Page:
+            def locator(self, _sel):
+                return FakeCardList(1, node=Exploding())
+
+        self.assertEqual(available_actions(Page()), [])

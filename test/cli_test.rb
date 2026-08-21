@@ -65,7 +65,9 @@ require 'amazon/commands/order/list'
 require 'amazon/commands/order/show'
 require 'amazon/commands/order/search'
 require 'amazon/commands/subscribe'
+require 'amazon/commands/subscribe/cached'
 require 'amazon/commands/subscribe/list'
+require 'amazon/commands/subscribe/show'
 require 'amazon/commands/subscribe/upcoming'
 
 require 'minitest/autorun'
@@ -3513,6 +3515,7 @@ class EmptyResultsSayWhatWasSearchedTest < Minitest::Test
   end
 end
 
+
 # --- subscribe & save --------------------------------------------------
 
 SAMPLE_SUBSCRIPTION = {
@@ -3520,7 +3523,34 @@ SAMPLE_SUBSCRIPTION = {
   'title' => 'Example Dishwasher Detergent Gel, Lemon, 75oz',
   'variation' => nil,
   'next_delivery_label' => 'September 30',
+  'next_delivery_date' => '2026-09-30',
   'image' => 'https://m.media-amazon.com/images/I/00FIXTUREIMG.jpg',
+  'schedule_raw' => '1 unit every 1 month',
+  'quantity' => 1,
+  'interval_count' => 1,
+  'interval_unit' => 'month',
+  'price' => 14.22,
+  'price_raw' => '$14.22',
+  'discount' => 'Saving 5%'
+}.freeze
+
+SAMPLE_DETAIL = {
+  'subscription_id' => 'SNSD0_FIXTURESUB0000000001',
+  'title' => 'Example Dishwasher Detergent Gel, Lemon, 75oz',
+  'variation' => nil,
+  'asin' => 'B000FIXTUR',
+  'image' => 'https://m.media-amazon.com/images/I/00FIXTUREIMG.jpg',
+  'merchant' => 'Amazon.com and top rated sellers',
+  'next_delivery_label' => 'Wednesday, September 30',
+  'next_delivery_date' => '2026-09-30',
+  'next_delivery_prefix' => 'Next delivery will arrive by',
+  'discount_now' => 'Get it now with 5% off',
+  'discount_percent' => 5,
+  'backup_item' => nil,
+  'lifetime_savings' => 12.34,
+  'lifetime_savings_text' => 'You have saved $12.34 on this subscription!',
+  'tier_level' => 'BASE',
+  'actions' => %w[CANCEL CHANGE_QUANTITY_FREQUENCY],
   'schedule_raw' => '1 unit every 1 month',
   'quantity' => 1,
   'interval_count' => 1,
@@ -3556,23 +3586,45 @@ FUTURE_DELIVERY = {
   'subtotal' => nil
 }.freeze
 
-# Records what it was asked for, so the flags can be checked at the seam rather
-# than by inspecting output that would look the same either way.
-class FakeSubscribeWorker
-  attr_reader :asked_all, :subscription_total
+# The subscribe commands cache to a shared XDG root, so one test's rows are the
+# next test's cache hit unless this runs first.
+def reset_subscribe_cache!
+  Amazon::Commands::Subscribe::Cached.invalidate!
+end
 
-  def initialize(rows: [SAMPLE_SUBSCRIPTION], cards: [SAMPLE_DELIVERY], total: nil)
+# Records what it was asked for, so the flags and the cache can be checked at
+# the seam rather than by inspecting output that would look the same either way.
+class FakeSubscribeWorker
+  attr_reader :asked_all, :calls, :subscription_total, :not_found
+
+  def initialize(rows: [SAMPLE_SUBSCRIPTION], cards: [SAMPLE_DELIVERY], detail: SAMPLE_DETAIL,
+                 total: nil, not_found: nil)
     @rows = rows
     @cards = cards
+    @detail = detail
     @subscription_total = total
+    @not_found = not_found
+    @calls = 0
   end
 
   def subscriptions(all: false)
+    @calls += 1
     @asked_all = all
     @rows
   end
 
-  def deliveries = @cards
+  def deliveries
+    @calls += 1
+    @cards
+  end
+
+  def subscription(target)
+    @calls += 1
+    @asked_for = target
+    @detail
+  end
+
+  attr_reader :asked_for
 end
 
 class SubscribeDispatchTest < Minitest::Test
@@ -3582,6 +3634,7 @@ class SubscribeDispatchTest < Minitest::Test
     out, = capture_io_streams { Amazon::CLI.run(['help']) }
     assert_includes out, 'subscribe list'
     assert_includes out, 'subscribe upcoming'
+    assert_includes out, 'subscribe show'
   end
 
   def test_bare_namespace_prints_usage_and_exits_2
@@ -3602,17 +3655,21 @@ class SubscribeDispatchTest < Minitest::Test
   end
 
   def test_subcommands_route_through_the_namespace
-    with_command(Amazon::Commands::Subscribe, :List, result: 7) do
-      capture_io_streams { assert_equal 7, Amazon::CLI.run(%w[subscribe list]) }
-    end
-    with_command(Amazon::Commands::Subscribe, :Upcoming, result: 8) do
-      capture_io_streams { assert_equal 8, Amazon::CLI.run(%w[subscribe upcoming]) }
+    { List: 7, Upcoming: 8, Show: 9 }.each do |klass, code|
+      with_command(Amazon::Commands::Subscribe, klass, result: code) do
+        capture_io_streams do
+          assert_equal code, Amazon::CLI.run(['subscribe', klass.to_s.downcase])
+        end
+      end
     end
   end
 end
 
 class SubscribeListCommandTest < Minitest::Test
-  def setup = write_config!
+  def setup
+    write_config!
+    reset_subscribe_cache!
+  end
 
   def test_it_lists_what_the_worker_returned
     out, = with_worker(->(*) { FakeSubscribeWorker.new }) do
@@ -3623,6 +3680,33 @@ class SubscribeListCommandTest < Minitest::Test
     assert_includes out, '1 month'
   end
 
+  # The price column is the whole reason `list` reads the deliveries view too.
+  def test_the_price_column_carries_the_committed_price
+    out, = with_worker(->(*) { FakeSubscribeWorker.new }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    assert_includes out, '$14.22'
+  end
+
+  # A future delivery has no price, only a rate. Printing $0.00 there would say
+  # it is free.
+  def test_an_unpriced_row_shows_its_discount_rate_instead
+    row = SAMPLE_SUBSCRIPTION.merge('price' => nil, 'price_raw' => nil, 'discount' => 'Saving 15%')
+    out, = with_worker(->(*) { FakeSubscribeWorker.new(rows: [row]) }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    assert_includes out, '15%'
+    refute_includes out, '$0.00'
+  end
+
+  def test_a_row_with_neither_price_nor_discount_leaves_the_column_blank
+    row = SAMPLE_SUBSCRIPTION.merge('price' => nil, 'discount' => nil)
+    out, = with_worker(->(*) { FakeSubscribeWorker.new(rows: [row]) }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    refute_includes out, '$'
+  end
+
   def test_all_is_passed_through_to_the_worker
     fake = FakeSubscribeWorker.new
     with_worker(->(*) { fake }) do
@@ -3630,11 +3714,24 @@ class SubscribeListCommandTest < Minitest::Test
     end
     assert_equal true, fake.asked_all
 
+    reset_subscribe_cache!
     fake = FakeSubscribeWorker.new
     with_worker(->(*) { fake }) do
       capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
     end
     assert_equal false, fake.asked_all
+  end
+
+  # --all and the first page are different answers to the same question, so
+  # they cannot share a cache entry: otherwise `list` warms the cache with 30
+  # rows and `list --all` serves those 30 back as though they were all 59.
+  def test_all_and_the_first_page_are_cached_separately
+    fake = FakeSubscribeWorker.new(rows: [SAMPLE_SUBSCRIPTION], total: 59)
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list --all]) }
+    end
+    assert_equal 2, fake.calls
   end
 
   def test_json_output_is_the_worker_records_verbatim
@@ -3653,30 +3750,327 @@ class SubscribeListCommandTest < Minitest::Test
   end
 end
 
+class SubscribeCacheTest < Minitest::Test
+  def setup
+    write_config!
+    reset_subscribe_cache!
+  end
+
+  def test_a_second_run_inside_the_ttl_does_not_touch_amazon
+    fake = FakeSubscribeWorker.new
+    out = nil
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      out, = capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    assert_equal 1, fake.calls
+    assert_includes out, 'SNSD0_FIXTURESUB0000000001'
+  end
+
+  # A cached read is indistinguishable from a live one, and a schedule that
+  # changed twenty minutes ago looks current either way. The age is the only
+  # thing that explains the surprise.
+  def test_a_cached_read_says_so_on_stderr
+    fake = FakeSubscribeWorker.new
+    err = nil
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      _, err = capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    assert_match(/cached .* ago/, err)
+    assert_includes err, '--fresh'
+  end
+
+  # JSON is a data interface; a chatty stderr line is fine, but it must not be
+  # the thing that makes `--json | jq` print a warning into someone's pipeline
+  # output. (It goes to stderr either way — this pins the intent.)
+  def test_the_cache_note_is_suppressed_for_json
+    fake = FakeSubscribeWorker.new
+    err = nil
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[--json subscribe list]) }
+      _, err = capture_io_streams { Amazon::CLI.run(%w[--json subscribe list]) }
+    end
+    refute_includes err, 'cached'
+  end
+
+  def test_fresh_re_reads_amazon
+    fake = FakeSubscribeWorker.new
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list --fresh]) }
+    end
+    assert_equal 2, fake.calls
+  end
+
+  # The three views describe one account. Refreshing the list while `upcoming`
+  # still serves a 25-minute-old copy of the same subscriptions reproduces the
+  # staleness --fresh was reached for.
+  def test_fresh_on_one_subcommand_drops_the_others_too
+    fake = FakeSubscribeWorker.new
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe upcoming]) }
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list --fresh]) }
+      capture_io_streams { Amazon::CLI.run(%w[subscribe upcoming]) }
+    end
+    assert_equal 3, fake.calls, 'upcoming should have been re-read after list --fresh'
+  end
+
+  # The hook Phase 2 needs: anything that changes a subscription invalidates
+  # every view, not just the one that issued the change.
+  def test_invalidate_empties_the_namespace
+    fake = FakeSubscribeWorker.new
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      Amazon::Commands::Subscribe::Cached.invalidate!
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    assert_equal 2, fake.calls
+  end
+
+  def test_clearing_a_namespace_that_was_never_written_is_not_an_error
+    Amazon::Cache.new('never-used-namespace').clear
+  end
+
+  # Backdating the cache file is the only way to exercise the wording that a
+  # real user sees most often — a read minutes old, not seconds.
+  def backdate_cache!(seconds)
+    dir = Amazon::Config.cache_dir.join('live', Amazon::Commands::Subscribe::Cached::NAMESPACE)
+    Dir.glob(dir.join('*.json')).each do |f|
+      t = Time.now - seconds
+      File.utime(t, t, f)
+    end
+  end
+
+  def test_a_read_minutes_old_says_minutes
+    fake = FakeSubscribeWorker.new
+    err = nil
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      backdate_cache!(300)
+      _, err = capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    assert_includes err, 'cached 5 minutes ago'
+    assert_equal 1, fake.calls
+  end
+
+  def test_the_minute_boundary_is_singular
+    fake = FakeSubscribeWorker.new
+    err = nil
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      backdate_cache!(75)
+      _, err = capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    assert_includes err, 'cached 1 minute ago'
+  end
+
+  # Half an hour is the TTL, so a read older than that is a miss, not a very
+  # old hit.
+  def test_a_read_past_the_ttl_is_re_read
+    fake = FakeSubscribeWorker.new
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      backdate_cache!(Amazon::Commands::Subscribe::Cached::TTL + 60)
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    assert_equal 2, fake.calls
+  end
+
+  def test_a_fresh_read_seconds_old_reports_seconds
+    fake = FakeSubscribeWorker.new
+    err = nil
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      _, err = capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    assert_match(/cached \d+s ago/, err)
+  end
+end
+
 class SubscribeUpcomingCommandTest < Minitest::Test
-  def setup = write_config!
+  def setup
+    write_config!
+    reset_subscribe_cache!
+  end
+
+  def run_upcoming(argv, cards:)
+    out, = with_worker(->(*) { FakeSubscribeWorker.new(cards: cards) }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(argv) }
+    end
+    out
+  end
+
+  def many_deliveries(n)
+    (1..n).map { |i| FUTURE_DELIVERY.merge('date_label' => "Delivery #{i}") }
+  end
 
   def test_it_prints_each_delivery
-    out, = with_worker(->(*) { FakeSubscribeWorker.new(cards: [SAMPLE_DELIVERY, FUTURE_DELIVERY]) }) do
-      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[subscribe upcoming]) }
-    end
+    out = run_upcoming(%w[subscribe upcoming], cards: [SAMPLE_DELIVERY, FUTURE_DELIVERY])
     assert_includes out, 'Sep 2'
     assert_includes out, 'September 30'
   end
 
-  def test_json_output
-    out, = with_worker(->(*) { FakeSubscribeWorker.new }) do
+  # Seven deliveries and 84 item lines is not an answer to "what's coming".
+  def test_only_the_next_few_print_by_default
+    out = run_upcoming(%w[subscribe upcoming], cards: many_deliveries(7))
+    assert_includes out, 'Delivery 3'
+    refute_includes out, 'Delivery 4'
+    assert_includes out, '4 more deliveries scheduled'
+  end
+
+  def test_all_prints_every_delivery
+    out = run_upcoming(%w[subscribe upcoming --all], cards: many_deliveries(7))
+    assert_includes out, 'Delivery 7'
+    refute_includes out, 'more deliveries scheduled'
+  end
+
+  def test_limit_takes_a_count
+    out = run_upcoming(%w[subscribe upcoming --limit 5], cards: many_deliveries(7))
+    assert_includes out, 'Delivery 5'
+    refute_includes out, 'Delivery 6'
+    assert_includes out, '2 more deliveries scheduled'
+  end
+
+  def test_the_note_is_singular_for_one_remaining
+    out = run_upcoming(%w[subscribe upcoming], cards: many_deliveries(4))
+    assert_includes out, '1 more delivery scheduled'
+  end
+
+  def test_a_limit_larger_than_the_list_adds_no_note
+    out = run_upcoming(%w[subscribe upcoming --limit 50], cards: many_deliveries(2))
+    refute_includes out, 'more deliveries'
+  end
+
+  # `--limit 0` and `--limit -1` are not smaller requests, they are nonsense,
+  # and Integer()'s exceptions are not RuntimeErrors — unguarded they escape
+  # the CLI's rescue as a backtrace.
+  def test_a_junk_limit_is_a_usage_error_not_a_backtrace
+    ['--limit 0', '--limit -1', '--limit abc', '--limit'].each do |flags|
+      _, err = capture_io_streams do
+        assert_equal 2, Amazon::CLI.run(['subscribe', 'upcoming', *flags.split])
+      end
+      assert_includes err, '--limit'
+    end
+  end
+
+  # --limit is a display choice. A caller piping to jq asked for the data.
+  def test_json_ignores_the_limit_and_returns_everything
+    out, = with_worker(->(*) { FakeSubscribeWorker.new(cards: many_deliveries(7)) }) do
       capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[--json subscribe upcoming]) }
     end
-    assert_equal [SAMPLE_DELIVERY], JSON.parse(out)
+    assert_equal 7, JSON.parse(out).size
+  end
+
+  def test_fresh_re_reads_amazon
+    fake = FakeSubscribeWorker.new
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe upcoming]) }
+      capture_io_streams { Amazon::CLI.run(%w[subscribe upcoming --fresh]) }
+    end
+    assert_equal 2, fake.calls
   end
 
   def test_help_and_unknown_option
     out, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[subscribe upcoming --help]) }
-    assert_includes out, '--json'
+    assert_includes out, '--limit'
 
     _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[subscribe upcoming --nope]) }
     assert_includes err, 'unknown upcoming option: --nope'
+  end
+end
+
+class SubscribeShowCommandTest < Minitest::Test
+  def setup
+    write_config!
+    reset_subscribe_cache!
+  end
+
+  def test_it_prints_the_whole_record
+    out, = with_worker(->(*) { FakeSubscribeWorker.new }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[subscribe show dishwasher]) }
+    end
+    assert_includes out, 'Example Dishwasher Detergent'
+    assert_includes out, 'B000FIXTUR'
+    assert_includes out, '$12.34'
+    assert_includes out, 'Amazon.com and top rated sellers'
+  end
+
+  def test_a_search_term_of_several_words_reaches_the_worker_intact
+    fake = FakeSubscribeWorker.new
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(['subscribe', 'show', 'paper', 'towels']) }
+    end
+    assert_equal 'paper towels', fake.asked_for
+  end
+
+  def test_json_output
+    out, = with_worker(->(*) { FakeSubscribeWorker.new }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[--json subscribe show dishwasher]) }
+    end
+    assert_equal SAMPLE_DETAIL, JSON.parse(out)
+  end
+
+  def test_a_missing_target_is_a_usage_error
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[subscribe show]) }
+    assert_includes err, 'subscription id or search term is required'
+  end
+
+  # Nothing matched is a question with an answer, not a failure to reach
+  # Amazon — and the worker's own wording names the candidates.
+  def test_no_match_exits_2_with_the_workers_explanation
+    fake = FakeSubscribeWorker.new(detail: nil, not_found: "no active subscription matching 'zzz'.")
+    _, err = with_worker(->(*) { fake }) do
+      capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[subscribe show zzz]) }
+    end
+    assert_includes err, "no active subscription matching 'zzz'"
+  end
+
+  # Caching a miss would mean fixing the typo, re-running, and being told no a
+  # second time by a file rather than by Amazon.
+  def test_a_miss_is_not_cached
+    fake = FakeSubscribeWorker.new(detail: nil, not_found: 'no active subscription')
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe show zzz]) }
+      capture_io_streams { Amazon::CLI.run(%w[subscribe show zzz]) }
+    end
+    assert_equal 2, fake.calls
+  end
+
+  def test_a_hit_is_cached
+    fake = FakeSubscribeWorker.new
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe show dishwasher]) }
+      capture_io_streams { Amazon::CLI.run(%w[subscribe show dishwasher]) }
+    end
+    assert_equal 1, fake.calls
+  end
+
+  def test_fresh_re_reads_amazon
+    fake = FakeSubscribeWorker.new
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe show dishwasher]) }
+      capture_io_streams { Amazon::CLI.run(%w[subscribe show dishwasher --fresh]) }
+    end
+    assert_equal 2, fake.calls
+  end
+
+  # A worker that returns nothing and explains nothing still has to say
+  # something; exiting 2 in silence looks like the command crashed.
+  def test_an_unexplained_miss_still_gets_a_message
+    fake = FakeSubscribeWorker.new(detail: nil, not_found: nil)
+    _, err = with_worker(->(*) { fake }) do
+      capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[subscribe show zzz]) }
+    end
+    assert_includes err, 'nothing matched "zzz"'
+  end
+
+  def test_help_and_unknown_option
+    out, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[subscribe show --help]) }
+    assert_includes out, 'id-or-search'
+
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[subscribe show --nope]) }
+    assert_includes err, 'unknown option: --nope'
   end
 end
 
@@ -3744,8 +4138,8 @@ end
 class DeliveriesFormatterTest < Minitest::Test
   def fmt(json: false) = Amazon::Formatter.new(json: json, color: false)
 
-  def render(cards)
-    out, = capture_io_streams { fmt.deliveries(cards) }
+  def render(cards, **kw)
+    out, = capture_io_streams { fmt.deliveries(cards, **kw) }
     out
   end
 
@@ -3797,6 +4191,71 @@ class DeliveriesFormatterTest < Minitest::Test
   def test_items_are_optional
     out = render([FUTURE_DELIVERY.merge('items' => nil)])
     assert_includes out, '0 items'
+  end
+
+  def test_a_limit_of_nil_shows_everything
+    out = render([SAMPLE_DELIVERY, FUTURE_DELIVERY], limit: nil)
+    assert_includes out, 'September 30'
+  end
+end
+
+class SubscriptionDetailFormatterTest < Minitest::Test
+  def fmt(json: false) = Amazon::Formatter.new(json: json, color: false)
+
+  def render(detail)
+    out, = capture_io_streams { fmt.subscription(detail) }
+    out
+  end
+
+  def test_it_labels_every_field_it_prints
+    out = render(SAMPLE_DETAIL)
+    assert_includes out, 'next delivery'
+    assert_includes out, 'Wednesday, September 30'
+    assert_includes out, 'schedule         1 unit every 1 month'
+    assert_includes out, 'saved so far     $12.34'
+    assert_includes out, 'asin             B000FIXTUR'
+  end
+
+  # "Next delivery will arrive by" is an arrival estimate, not a ship date, and
+  # Amazon's wording is the only thing that says so.
+  def test_an_arrival_estimate_is_marked_as_one
+    assert_includes render(SAMPLE_DETAIL), '(arrives by)'
+  end
+
+  def test_a_bare_date_is_not_marked_as_an_arrival
+    refute_includes render(SAMPLE_DETAIL.merge('next_delivery_prefix' => 'Next delivery')), 'arrives by'
+  end
+
+  # "none" is a setting, not a missing field: Amazon ships the backup when the
+  # subscribed item is out of stock, so having none is worth stating.
+  def test_no_backup_item_is_reported_rather_than_omitted
+    assert_includes render(SAMPLE_DETAIL), 'backup item      none'
+  end
+
+  def test_a_backup_item_is_named
+    assert_includes render(SAMPLE_DETAIL.merge('backup_item' => 'Example Alternative')), 'Example Alternative'
+  end
+
+  def test_json_is_the_record_verbatim
+    out, = capture_io_streams { fmt(json: true).subscription(SAMPLE_DETAIL) }
+    assert_equal SAMPLE_DETAIL, JSON.parse(out)
+  end
+
+  def test_a_variation_prints_under_the_title
+    assert_includes render(SAMPLE_DETAIL.merge('variation' => 'Size: 75oz')), 'Size: 75oz'
+  end
+
+  # Every optional field absent at once: a rotted modal should print a short
+  # record, not raise.
+  def test_a_record_with_almost_nothing_in_it_still_renders
+    out = render({ 'subscription_id' => 'SNSD0_X' })
+    assert_includes out, '(untitled subscription)'
+    assert_includes out, 'SNSD0_X'
+  end
+
+  def test_a_record_with_no_id_omits_the_id_line_rather_than_printing_a_blank
+    out = render({ 'title' => 'Example' })
+    refute_includes out, 'subscription id'
   end
 end
 
@@ -3897,6 +4356,54 @@ class SubscribeWorkerProtocolTest < Minitest::Test
     with_python_cmd(body) do
       err = assert_raises(Amazon::Worker::Error) { capture_io_streams { worker.deliveries } }
       assert_includes err.message, 'live lookup failed'
+    end
+  end
+
+  # An id and a search term go to different request keys, because a title
+  # search for "SNSD0_…" would match nothing and a lookup of "dishwasher" is
+  # not an id.
+  def test_an_id_and_a_search_term_reach_the_worker_differently
+    body = <<~'SCRIPT'
+      req = JSON.parse(STDIN.gets)
+      puts({event: 'log', level: 'warn', msg: 'the modal rendered no seller'}.to_json)
+      puts({event: 'detail', data: { 'keys' => req.keys.sort }}.to_json)
+      puts({event: 'done', count: 1}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      detail = nil
+      _, err = capture_io_streams { detail = worker.subscription('SNSD0_ABC') }
+      assert_includes detail['keys'], 'subscription_id'
+      assert_includes err, '[worker:warn] the modal rendered no seller'
+
+      capture_io_streams { detail = worker.subscription('dishwasher') }
+      assert_includes detail['keys'], 'query'
+    end
+  end
+
+  # "Nothing matched" is a user error with an explanation attached; raising
+  # Worker::Error would turn it into "live lookup failed", which is a different
+  # and untrue statement.
+  def test_a_not_found_is_reported_not_raised
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: "no active subscription matching 'zzz'.", kind: 'not_found'}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      w = worker
+      detail = nil
+      capture_io_streams { detail = w.subscription('zzz') }
+      assert_nil detail
+      assert_includes w.not_found, "no active subscription matching 'zzz'"
+    end
+  end
+
+  def test_a_real_failure_during_show_still_raises
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: 'Timeout: navigating to the modal'}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      assert_raises(Amazon::Worker::Error) { capture_io_streams { worker.subscription('zzz') } }
     end
   end
 end

@@ -10,25 +10,33 @@ Two views, because Amazon splits the data across two and neither is a superset:
     subscriptions  what you subscribe to: title, schedule, next delivery date
     deliveries     what actually ships on a date: prices, discounts, the
                    last day you can still edit it
+    subscription   one subscription's edit modal: ASIN, seller, backup item,
+                   lifetime savings
 
-Prices live only in the deliveries view. A subscription card doesn't carry one
-(the price is whatever it is when the delivery is placed), so `subscriptions`
-deliberately reports none rather than inventing one from the product page.
+Prices live only in the deliveries view — a subscription card carries none,
+because the price is whatever it is when the delivery is placed. So
+`subscriptions` reads both views and joins them on subscription id, rather
+than inventing a price from the product page or reporting none at all.
 
 Protocol (NDJSON over stdout):
     {"event":"log","level":"info","msg":"..."}
     {"event":"subscription","data":{...}}     # one per subscription
     {"event":"delivery","data":{...}}         # one per scheduled delivery
+    {"event":"detail","data":{...}}           # one subscription, in full
     {"event":"done","count":N,"total":N}
     {"event":"error","msg":"...","kind":"not_logged_in"|"blocked"|null}
 
 Stdin (one-shot request):
     {"action":"subscriptions"}
     {"action":"subscriptions","all":true}
+    {"action":"subscriptions","prices":false}
     {"action":"deliveries"}
+    {"action":"subscription","subscription_id":"SNSD0_…"}
+    {"action":"subscription","query":"dishwasher"}
 
 Read-only. Nothing here clicks skip, cancel, or a schedule change; the only
-click is "Show more subscriptions", which is pagination.
+clicks are "Show more subscriptions" (pagination) and opening an edit modal to
+read it.
 """
 
 from __future__ import annotations
@@ -37,7 +45,7 @@ import json
 import re
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from browser import (
@@ -52,6 +60,7 @@ from browser import (
     parse_money,
     text,
 )
+from live import MONTHS, parse_delivery_date
 
 SUBSCRIPTION_LIST_URL = "https://www.amazon.com/auto-deliveries/subscriptionList"
 
@@ -109,6 +118,52 @@ PAGINATION_KEY = "subscription-list-pagination"
 NAVIGATION_KEY = "navigation-page-state"
 FUTURE_DELIVERIES_KEY = "future-delivery-list"
 
+# The edit modal, whose URL each card publishes in a `data-a-modal` payload.
+# Following Amazon's own URL rather than assembling one from a scraped shipId:
+# the payload carries listFilter and sourcePage too, and a hand-built URL that
+# drops them renders a different modal.
+EDIT_MODAL_NAME = "editSubscriptionModal"
+# `data-cypress` hooks again — Amazon's QA handles, not a contract, so each has
+# a structural fallback.
+DETAIL_NEXT_DELIVERY = (
+    "[data-cypress='next-delivery-date']",
+    ".productInformation .a-text-bold",
+)
+DETAIL_NEXT_DELIVERY_LABEL = ("[data-cypress='next-delivery-date-text']",)
+DETAIL_DISCOUNT_NOW = ("a[data-cypress='need-this-item-right-now']",)
+DETAIL_TITLE = (".productInformation h2", ".productInformation a")
+DETAIL_MERCHANT = (".t-action-type-MERCHANT_INFORMATION",)
+DETAIL_SCHEDULE = (".t-action-type-CHANGE_QUANTITY_FREQUENCY .actionDetail",)
+DETAIL_BACKUP = (".t-action-type-ADD_BACKUP_ITEM .actionDetail",)
+# A stable id on a box whose own class name is content-hashed
+# (`_sns-subscription-savings-desktop_style_...`), so the id is the only part
+# of it worth depending on.
+DETAIL_SAVINGS_BOX = "#subscription-savings-banner"
+ACTION_TYPE_RE = re.compile(r"t-action-type-([A-Z_]+)")
+# Case-insensitive and applied to the href as-is: upper-casing the URL first
+# would break the `/dp/` needle itself, which is a bug that hides because the
+# ASIN half of the pattern still looks right.
+ASIN_RE = re.compile(r"/dp/([A-Z0-9]{10})", re.IGNORECASE)
+# "You have saved $12.34$12.34 on this subscription!" — Amazon renders the
+# amount twice, once for screen readers, and `.a-price`'s text is both copies
+# run together. Taking the first token is what makes that parse.
+MONEY_RE = re.compile(r"\$\s*\d[\d,]*(?:\.\d{2})?")
+# "Sold by Amazon.com and top rated sellers" — the label is part of the link.
+SOLD_BY_RE = re.compile(r"^\s*sold by\s*:?\s*", re.IGNORECASE)
+# "Get it now with 5% off"
+PERCENT_RE = re.compile(r"(\d{1,2})\s*%")
+# "Select a backup" is Amazon's placeholder for "none set", not a product.
+NO_BACKUP_RE = re.compile(r"^\s*select a backup\s*$", re.IGNORECASE)
+
+# "March 3, 2027" — an explicit year, which the list renders once a date is far
+# enough out. Without this the year would be inferred, and inference is only
+# right for the next twelve months.
+LABEL_DATE_WITH_YEAR_RE = re.compile(
+    r"(?P<month>" + "|".join(m.capitalize() for m in MONTHS) + r")[a-z]*\s+"
+    r"(?P<day>\d{1,2}),?\s+(?P<year>\d{4})",
+    re.IGNORECASE,
+)
+
 # Pagination stops when the cards on the page reach the total Amazon claims.
 # This is the backstop for the case where it doesn't — a click that adds
 # nothing would otherwise spin forever against Amazon.
@@ -161,6 +216,29 @@ def parse_epoch_date(raw: str | None) -> str | None:
         return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).date().isoformat()
     except (OverflowError, OSError, ValueError):
         return None
+
+
+def parse_label_date(raw: str | None, today: Any = None) -> str | None:
+    """"September 30" / "March 3, 2027" -> ISO, for sorting the list by date.
+
+    Two shapes, because Amazon prints the year only once the date is far
+    enough out. The bare shape is `live.parse_delivery_date`'s problem — it
+    already infers the year and rolls December into January — but that
+    inference caps out at twelve months, so an explicit year has to win before
+    it runs. "March 3, 2027" inferred from an August 2026 today happens to come
+    out right; "March 3, 2029" does not.
+    """
+    if not raw:
+        return None
+    m = LABEL_DATE_WITH_YEAR_RE.search(raw)
+    if m:
+        try:
+            return date(
+                int(m.group("year")), MONTHS[m.group("month")[:3].lower()], int(m.group("day"))
+            ).isoformat()
+        except ValueError:
+            return None
+    return parse_delivery_date(raw, today=today)
 
 
 def page_state(scope: Any, key: str) -> dict[str, Any] | None:
@@ -428,7 +506,9 @@ def open_subscription_list(page: Any) -> None:
     guard(page)
 
 
-def scrape_subscriptions(page: Any, load_all: bool = False) -> tuple[list[dict[str, Any]], int | None]:
+def scrape_subscriptions(
+    page: Any, load_all: bool = False, with_prices: bool = True
+) -> tuple[list[dict[str, Any]], int | None]:
     open_subscription_list(page)
     if load_all:
         load_all_pages(page)
@@ -442,7 +522,92 @@ def scrape_subscriptions(page: Any, load_all: bool = False) -> tuple[list[dict[s
     state = page_state(page, PAGINATION_KEY) or {}
     total = state.get("totalItemCount")
     _warn_selector_rot(rows)
+
+    # Read the navigation state *before* leaving the list page; it is the only
+    # place the deliveries-tab URL is published, and the join below navigates
+    # away from it.
+    nav = page_state(page, NAVIGATION_KEY) or {} if with_prices and rows else {}
+    if with_prices and rows:
+        join_delivery_facts(rows, _delivery_cards_or_warn(page, nav))
+
+    sort_by_next_delivery(rows)
     return rows, (int(total) if isinstance(total, int) else None)
+
+
+def _delivery_cards_or_warn(page: Any, nav: dict[str, Any]) -> list[dict[str, Any]]:
+    """The deliveries view, or an empty list and a warning saying so.
+
+    The prices are an enrichment of the subscription list, not the point of it.
+    A deliveries page that fails should cost you the price column, not the
+    schedules you asked for — but silently, it would cost you the price column
+    and look exactly like an account with no upcoming deliveries.
+    """
+    try:
+        return fetch_delivery_cards(page, nav)
+    except Exception as e:  # noqa: BLE001
+        emit(
+            "log",
+            level="warn",
+            msg=f"could not read the deliveries view ({type(e).__name__}), so prices "
+            "and discounts are missing below — the schedules are still real",
+        )
+        return []
+
+
+def delivery_index(cards: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """subscription id -> facts from the *earliest* delivery containing it.
+
+    A subscription recurs across several future deliveries, and only the
+    earliest one is the answer to "what happens next". Cards arrive sorted, so
+    first write wins.
+    """
+    index: dict[str, dict[str, Any]] = {}
+    for card in cards:
+        for item in card.get("items") or []:
+            sub_id = item.get("subscription_id")
+            if not sub_id or sub_id in index:
+                continue
+            index[sub_id] = {
+                "next_delivery_date": card.get("date"),
+                "price": item.get("price"),
+                "price_raw": item.get("price_raw"),
+                "discount": item.get("discount"),
+            }
+    return index
+
+
+def join_delivery_facts(rows: list[dict[str, Any]], cards: list[dict[str, Any]]) -> None:
+    """Attach price, discount, and a real date to each subscription, in place.
+
+    `next_delivery_date` prefers the delivery card's timestamp over the label
+    on the subscription card: the card says "September 30" and the delivery
+    knows which September 30.
+    """
+    index = delivery_index(cards)
+    for row in rows:
+        facts = index.get(row["subscription_id"]) or {}
+        row["price"] = facts.get("price")
+        row["price_raw"] = facts.get("price_raw")
+        row["discount"] = facts.get("discount")
+        row["next_delivery_date"] = facts.get("next_delivery_date") or parse_label_date(
+            row.get("next_delivery_label")
+        )
+
+
+def sort_by_next_delivery(rows: list[dict[str, Any]]) -> None:
+    """Soonest first; undated last.
+
+    Amazon's own order is neither date nor alphabetical — it interleaves
+    September, March, and December — so preserving it preserves nothing. A row
+    whose date could not be read sorts to the end rather than to 1970.
+    """
+    rows.sort(
+        key=lambda r: (
+            r.get("next_delivery_date") is None,
+            r.get("next_delivery_date") or "",
+            (r.get("title") or "").lower(),
+        )
+    )
 
 
 # Fields every subscription card renders. Each one degrades to null on its own,
@@ -466,16 +631,22 @@ def _warn_selector_rot(rows: list[dict[str, Any]]) -> None:
 
 
 def scrape_deliveries(page: Any) -> list[dict[str, Any]]:
-    """The current delivery, then every future one Amazon has scheduled.
+    """The current delivery, then every future one Amazon has scheduled."""
+    open_subscription_list(page)
+    return fetch_delivery_cards(page, page_state(page, NAVIGATION_KEY) or {})
+
+
+def fetch_delivery_cards(page: Any, nav: dict[str, Any]) -> list[dict[str, Any]]:
+    """Follow the deliveries-tab URL out of `nav`, then the future one.
 
     Both arrive as HTML fragments from URLs the subscription list publishes in
     page state. Navigating straight to a fragment is unusual but it is what the
     tab does; the alternative is clicking through a React hub whose class names
     are content-hashed and change on deploy.
-    """
-    open_subscription_list(page)
 
-    nav = page_state(page, NAVIGATION_KEY) or {}
+    Takes the state rather than reading it, because the caller may already have
+    navigated away from the page that carries it.
+    """
     myd_url = ((nav.get("mydTabUpdateAjaxData") or {}).get("ajaxUrl")) or None
     if not myd_url:
         raise RuntimeError(
@@ -509,6 +680,176 @@ def scrape_deliveries(page: Any) -> list[dict[str, Any]]:
     return cards
 
 
+class NoSuchSubscription(Exception):
+    """The id or search term matched nothing, or matched too much."""
+
+
+def find_subscription_card(page: Any, wanted: str | None, query: str | None) -> Any:
+    """The card for an id, or the single card whose title matches a query.
+
+    Ids are 26 characters of Amazon's alphabet, which nobody types twice, so a
+    query is the humane way in. Ambiguity raises rather than picking the first
+    match: `show` is what you run before deciding what to cancel, and quietly
+    showing a different subscription than the one you meant is the failure that
+    survives longest.
+
+    Pages through the list when the first page doesn't have it — the id may
+    well have come from `list --all`.
+    """
+    open_subscription_list(page)
+    card = _card_by_id(page, wanted) if wanted else None
+    if card is None:
+        load_all_pages(page)
+        card = _card_by_id(page, wanted) if wanted else _card_by_query(page, query or "")
+    if card is None:
+        raise NoSuchSubscription(
+            f"no active subscription matching {(wanted or query)!r}. "
+            "`amazon subscribe list --all` shows every one you have."
+        )
+    return card
+
+
+def _card_by_id(page: Any, sub_id: str) -> Any:
+    try:
+        nodes = page.locator(f"{SUBSCRIPTION_CARD}[data-subscription-id={json.dumps(sub_id)}]")
+        return nodes.first if nodes.count() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _card_by_query(page: Any, query: str) -> Any:
+    needle = query.strip().lower()
+    if not needle:
+        return None
+    matches = [
+        (card, title)
+        for card in _cards(page, SUBSCRIPTION_CARD)
+        for title in [text(card, *TITLE_SELECTORS) or ""]
+        if needle in title.lower()
+    ]
+    if len(matches) > 1:
+        # One per line: four product titles run together with semicolons is a
+        # wall, and this message exists to be read and chosen from.
+        listed = "".join(f"\n  - {t[:70]}" for _, t in matches[:6])
+        more = "" if len(matches) <= 6 else f"\n  …and {len(matches) - 6} more"
+        raise NoSuchSubscription(
+            f"{len(matches)} subscriptions match {query!r}:{listed}{more}\n"
+            "Narrow the search, or pass the subscription id."
+        )
+    return matches[0][0] if matches else None
+
+
+def edit_modal_url(card: Any) -> str | None:
+    """The modal URL the card publishes for itself, if it still does."""
+    for node in _cards(card, "[data-a-modal]"):
+        try:
+            payload = json.loads(node.get_attribute("data-a-modal") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if payload.get("name") == EDIT_MODAL_NAME and payload.get("url"):
+            return str(payload["url"])
+    return None
+
+
+def scrape_subscription_detail(page: Any) -> dict[str, Any]:
+    """The edit modal: what neither list view carries.
+
+    No price, deliberately — the modal has none. Its "$16.92" is lifetime
+    savings on this subscription, which is a different number and a much more
+    tempting one to mislabel as a price.
+
+    No shipping address or payment method either. Both render here; neither is
+    something this command needs to put on a terminal or into JSON.
+    """
+    merchant = text(page, *DETAIL_MERCHANT)
+    backup = text(page, *DETAIL_BACKUP)
+    next_label = text(page, *DETAIL_NEXT_DELIVERY)
+    discount_now = text(page, *DETAIL_DISCOUNT_NOW)
+    href = attr(page, 'a[href*="/dp/"]', "href") or ""
+    asin = ASIN_RE.search(href)
+
+    detail: dict[str, Any] = {
+        "title": text(page, *DETAIL_TITLE),
+        "asin": asin.group(1).upper() if asin else None,
+        "image": attr(page, ".productImage img", "src") or attr(page, "img", "src"),
+        "merchant": SOLD_BY_RE.sub("", merchant) if merchant else None,
+        "next_delivery_label": next_label,
+        "next_delivery_date": parse_label_date(next_label),
+        "next_delivery_prefix": text(page, *DETAIL_NEXT_DELIVERY_LABEL),
+        "discount_now": discount_now,
+        "discount_percent": _percent(discount_now),
+        # Amazon shows "Select a backup" when there isn't one. Reporting that
+        # string as the backup item's name would be a lie with a straight face.
+        "backup_item": None if not backup or NO_BACKUP_RE.match(backup) else backup,
+        "lifetime_savings": first_money(
+            text(
+                page,
+                f"{DETAIL_SAVINGS_BOX} .a-price .a-offscreen",
+                f"{DETAIL_SAVINGS_BOX} .a-price",
+            )
+        ),
+        "lifetime_savings_text": text(page, DETAIL_SAVINGS_BOX),
+        "tier_level": attr(page, "[data-tiered-level]", "data-tiered-level"),
+        # Which actions Amazon is offering on this subscription. Read-only
+        # today, but it is the difference between "you can cancel this" and
+        # "this one is managed somewhere else", and it costs nothing to record.
+        "actions": available_actions(page),
+    }
+    detail.update(parse_schedule(text(page, *DETAIL_SCHEDULE)))
+    return detail
+
+
+def _percent(raw: str | None) -> int | None:
+    m = PERCENT_RE.search(raw or "")
+    return int(m.group(1)) if m else None
+
+
+def first_money(raw: str | None) -> float | None:
+    """The first `$n` in a string, as a number. See MONEY_RE."""
+    m = MONEY_RE.search(raw or "")
+    return parse_money(m.group(0)) if m else None
+
+
+def available_actions(page: Any) -> list[str]:
+    """CANCEL, CHANGE_QUANTITY_FREQUENCY, … from the `t-action-type-*` classes."""
+    found: set[str] = set()
+    for node in _cards(page, "[class*='t-action-type-']"):
+        try:
+            classes = node.get_attribute("class") or ""
+        except Exception:  # noqa: BLE001
+            continue
+        found.update(ACTION_TYPE_RE.findall(classes))
+    return sorted(found)
+
+
+def scrape_subscription(page: Any, sub_id: str | None, query: str | None) -> dict[str, Any]:
+    card = find_subscription_card(page, sub_id, query)
+    resolved = None
+    try:
+        resolved = card.get_attribute("data-subscription-id")
+    except Exception:  # noqa: BLE001
+        pass
+    url = edit_modal_url(card)
+    if not url:
+        raise RuntimeError(
+            "that subscription's card no longer publishes an edit-modal URL — "
+            "Amazon's markup has changed shape"
+        )
+    # Fall back to the card's own fields for anything the modal doesn't render,
+    # so a half-rotted modal degrades to the list view rather than to nulls.
+    from_card = scrape_subscription_card(card) or {}
+
+    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(1200)
+    guard(page)
+
+    detail = scrape_subscription_detail(page)
+    merged = {k: (detail.get(k) if detail.get(k) is not None else v) for k, v in from_card.items()}
+    merged.update({k: v for k, v in detail.items() if v is not None or k not in merged})
+    merged["subscription_id"] = resolved or sub_id
+    return merged
+
+
 def main() -> int:
     raw = sys.stdin.readline()
     if not raw.strip():
@@ -532,8 +873,11 @@ def main() -> int:
 
                 if action == "subscriptions":
                     load_all = bool(req.get("all"))
+                    with_prices = req.get("prices") is not False
                     emit("log", level="info", msg="reading your subscriptions")
-                    rows, total = scrape_subscriptions(page, load_all=load_all)
+                    rows, total = scrape_subscriptions(
+                        page, load_all=load_all, with_prices=with_prices
+                    )
                     for row in rows:
                         emit("subscription", data=row)
                     emit("done", count=len(rows), total=total)
@@ -544,6 +888,16 @@ def main() -> int:
                     for card in cards:
                         emit("delivery", data=card)
                     emit("done", count=len(cards))
+
+                elif action == "subscription":
+                    sub_id = req.get("subscription_id")
+                    query = req.get("query")
+                    if not sub_id and not query:
+                        emit("error", msg="subscription requires subscription_id or query")
+                        return 2
+                    emit("log", level="info", msg=f"looking up {sub_id or query}")
+                    emit("detail", data=scrape_subscription(page, sub_id, query))
+                    emit("done", count=1)
 
                 else:
                     emit("error", msg=f"unknown action: {action!r}")
@@ -556,6 +910,11 @@ def main() -> int:
     except Blocked as e:
         emit("error", msg=str(e), kind="blocked")
         return 1
+    except NoSuchSubscription as e:
+        # A search that matched nothing is a user error, not a scraper failure,
+        # so it exits like one and skips the traceback.
+        emit("error", msg=str(e), kind="not_found")
+        return 2
     except Exception as e:  # noqa: BLE001
         print(traceback.format_exc(), file=sys.stderr)
         emit("error", msg=f"{type(e).__name__}: {e}")

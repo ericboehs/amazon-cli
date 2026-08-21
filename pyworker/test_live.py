@@ -1707,7 +1707,16 @@ class DomLocator:
         return [_text_of(n) for n in self._nodes]
 
     def get_attribute(self, name):
-        return self._nodes[0].get(name) if self._nodes else None
+        if not self._nodes:
+            return None
+        value = self._nodes[0].get(name)
+        # bs4 hands back a list for space-separated attributes (class, rel);
+        # Playwright hands back the raw string. Code that regexes `class` to
+        # find `t-action-type-CANCEL` works against Chrome and blows up against
+        # a list, so the fake has to return what the browser returns.
+        if isinstance(value, list):
+            return " ".join(value)
+        return value
 
 
 class DomPage:
