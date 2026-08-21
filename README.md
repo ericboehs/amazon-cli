@@ -351,6 +351,7 @@ amazon subscribe upcoming             # the next 3 deliveries, with prices
 amazon subscribe upcoming --all       # every scheduled delivery
 amazon subscribe show dishwasher      # one subscription in full, by id or by title
 amazon subscribe list --image         # with the product photos (needs chafa)
+amazon subscribe upcoming --image     # …and in the delivery view too
 amazon subscribe list --fresh         # ignore the 30-minute cache
 amazon subscribe upcoming --json | jq '.[0].subtotal'
 ```
@@ -437,7 +438,8 @@ the website twenty minutes ago and one that never changed look identical
 otherwise. `--fresh` on any of them drops all three, since they describe one
 account; when write commands land they will invalidate through the same door.
 
-`--image` on `list` and `show` draws the product photo beside each entry.
+`--image` on `list`, `upcoming`, and `show` draws the product photo beside
+each entry.
 Rendering is chafa's job, not this CLI's: it negotiates with the terminal and
 emits kitty graphics, sixel, or unicode half-blocks depending on what
 answered, which is a thing to shell out to rather than reimplement worse. The
@@ -449,7 +451,19 @@ $ amazon subscribe list --image
 ┌────────┐  Gain Liquid Laundry Detergent, Freshness, Odor Defense, 154 fl oz
 │ (photo)│  September 2 · every 2 months · $14.22
 └────────┘  SNSD0_CPWMW84DZS0X826Y8P77
+
+$ amazon subscribe upcoming --image
+Sep 2  3 items  $48.95  · next
+  Last day to edit delivery: Thursday, August 27
+┌────┐  Gain Liquid Laundry Detergent, Freshness, Odor Defense
+│    │  Scent Original, Size 132 Fl Oz (Pack of 1)
+└────┘  $14.22  Saving 5%
 ```
+
+The photos in `upcoming` are smaller, because those items are already nested
+under a delivery heading and one delivery can hold eighteen of them. The price
+moves off the front of the line and onto its own: a price column indented past
+a photograph is a column of one.
 
 Images are skipped, with one line on stderr, when stdout isn't a terminal or
 chafa isn't installed — a pipe gets the table, not megabytes of escape codes.

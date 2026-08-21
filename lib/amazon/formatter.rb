@@ -219,11 +219,14 @@ module Amazon
 
     # `limit` trims what prints, never what's returned: --json is a data
     # interface and a caller piping to jq did not ask for Amazon's next three.
-    def deliveries(cards, limit: nil)
+    def deliveries(cards, limit: nil, thumbnails: nil)
       return puts(JSON.pretty_generate(cards)) if @json
       return puts("(no scheduled Subscribe & Save deliveries)") if cards.empty?
 
       shown = limit ? cards.first(limit) : cards
+      # One warm-up for the whole screen rather than one per delivery: the
+      # downloads are the slow part and they don't depend on each other.
+      thumbnails&.prefetch(shown.flat_map { |c| Array(c["items"]).map { |i| i["image"] } })
       shown.each_with_index do |card, i|
         puts if i.positive?
         puts delivery_heading(card)
@@ -232,7 +235,7 @@ module Amazon
         puts "  #{bold(labelled(card, "editable_until", "Last day to edit:"))}" if card["editable_until"]
         puts dim("  #{labelled(card, "savings", "Savings:")}") if card["savings"]
         puts dim("  #{card["tiering"]}") if card["tiering"]
-        delivery_items(card)
+        thumbnails ? delivery_item_cards(card, thumbnails) : delivery_items(card)
       end
       remaining = cards.size - shown.size
       return unless remaining.positive?
@@ -402,6 +405,30 @@ module Amazon
         line += green("  #{item["discount"]}") if item["discount"]
         puts line
       end
+    end
+
+    # The same block layout as `list`, one step further in: these items sit
+    # under a delivery heading, so the price moves off the front of the line —
+    # a price column indented past a photograph is a column of one.
+    def delivery_item_cards(card, thumbnails)
+      width = [term_width - thumbnails.cols - 4, 24].max
+      Array(card["items"]).each do |item|
+        lines = [truncate(item["title"], width)]
+        lines << dim(truncate(item["variation"], width)) if item["variation"]
+        lines << delivery_item_price(item)
+        beside_image(thumbnails.block(item["image"]), lines.compact, thumbnails)
+      end
+    end
+
+    def delivery_item_price(item)
+      # A future delivery has no prices at all, so this is the discount alone
+      # rather than $0.00 — the difference between "free" and "not priced yet".
+      # With neither, the line is dropped rather than left blank.
+      return nil if item["price"].nil? && item["discount"].nil?
+      return green(item["discount"].to_s) unless item["price"]
+
+      line = bold(format_money(item["price"]))
+      item["discount"] ? "#{line}  #{green(item["discount"])}" : line
     end
 
     # "1 month", "2 weeks" — or whatever Amazon said, if it didn't parse.

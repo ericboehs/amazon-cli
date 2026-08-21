@@ -376,6 +376,7 @@ def scrape_delivery_item(card: Any) -> dict[str, Any] | None:
         "subscription_id": sub_id,
         "title": text(card, *TITLE_SELECTORS),
         "variation": text(card, *VARIATION_SELECTORS),
+        "image": product_image(card, "img.sns-product-image", "img"),
         "price": parse_money(price_raw),
         "price_raw": price_raw,
         "discount": text(card, *DISCOUNT_SELECTORS),

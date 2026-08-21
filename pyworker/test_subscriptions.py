@@ -49,6 +49,7 @@ from subscriptions import (
     parse_schedule,
     product_image,
     scrape_delivery_card,
+    scrape_delivery_item,
     scrape_subscription_card,
     scrape_subscription_detail,
     sort_by_next_delivery,
@@ -870,12 +871,12 @@ class ProductImageTest(FixtureTest):
 
     def test_a_lazy_loaded_card_yields_the_photo_not_the_grey_pixel(self):
         page = DomPage.from_fixture("deliveries.html")
-        item = _cards(page, DELIVERY_CARD)[0].locator(DELIVERY_SUBSCRIPTION_CARD).nth(0)
+        node = _cards(page, DELIVERY_CARD)[0].locator(DELIVERY_SUBSCRIPTION_CARD).nth(0)
         # The captured markup has to still contain the trap, or this test
         # passes by describing markup Amazon no longer serves.
-        self.assertIn("grey-pixel", item.locator("img.sns-product-image").get_attribute("src"))
+        self.assertIn("grey-pixel", node.locator("img.sns-product-image").get_attribute("src"))
 
-        url = product_image(item, "img.sns-product-image", "img")
+        url = scrape_delivery_item(node)["image"]
         self.assertIsNotNone(url)
         self.assertNotIn("grey-pixel", url)
         self.assertIn("media-amazon.com/images/", url)

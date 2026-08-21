@@ -5,11 +5,16 @@ module Amazon
       class Upcoming
         include Args
         include Cached
+        include Images
 
         # Amazon schedules deliveries months out; the real account had seven,
         # 84 items between them. Everything is available with --all, but the
         # question "what's coming" has a short answer and this is it.
         DEFAULT_LIMIT = 3
+
+        # Smaller than `list`: these are already nested under a delivery
+        # heading, and a delivery can hold eighteen of them.
+        IMAGE_ROWS = 4
 
         def initialize(global)
           @global = global
@@ -18,10 +23,12 @@ module Amazon
         def run(argv)
           limit = DEFAULT_LIMIT
           fresh = false
+          images = false
           while (a = argv.shift)
             case a
             when "--all" then limit = nil
             when "--fresh" then fresh = true
+            when "--image", "--images" then images = true
             when "--limit"
               limit = positive_arg!("--limit", argv.shift)
             when "-h", "--help"
@@ -34,10 +41,14 @@ module Amazon
           end
 
           Amazon::Config.load
-          cards = cached("deliveries", fresh: fresh) do
+          # v2: the cached shape gained a product image per item. Serving a v1
+          # payload to --image would draw a screen of blank margins for half an
+          # hour, with nothing on it to say why.
+          cards = cached("deliveries:v2", fresh: fresh) do
             Amazon::Worker.new(verbose: @global.verbose).deliveries
           end
-          Amazon::Formatter.new(json: @global.json).deliveries(cards, limit: limit)
+          Amazon::Formatter.new(json: @global.json)
+            .deliveries(cards, limit: limit, thumbnails: thumbnails(images, IMAGE_ROWS))
           0
         end
 
@@ -64,6 +75,7 @@ module Amazon
             Options:
               --limit N  Show N deliveries (default #{DEFAULT_LIMIT})
               --all      Show every scheduled delivery
+              --image    Draw the product photo beside each item (needs chafa)
               --fresh    Ignore the cache and re-read Amazon
               --json     JSON output (always every delivery, unaffected by --limit)
           HELP

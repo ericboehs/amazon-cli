@@ -3570,7 +3570,8 @@ SAMPLE_DELIVERY = {
   'tiering' => 'Add 2 more subscriptions to this delivery and unlock extra savings up to 15%.',
   'items' => [
     { 'subscription_id' => 'SNSD0_FIXTURESUB0000000004', 'title' => 'Example Laundry Detergent',
-      'variation' => nil, 'price' => 14.22, 'price_raw' => '$14.22',
+      'variation' => nil, 'image' => 'https://m.media-amazon.com/images/I/00FIXTUREIMG._SS145_.jpg',
+      'price' => 14.22, 'price_raw' => '$14.22',
       'discount' => 'Saving 5%', 'skippable' => true }
   ],
   'subtotal' => 14.22
@@ -3582,7 +3583,8 @@ FUTURE_DELIVERY = {
   'savings' => nil, 'savings_label' => nil, 'tiering' => nil,
   'items' => [
     { 'subscription_id' => 'SNSD0_FIXTURESUB0000000005', 'title' => 'Example Paper Towels',
-      'variation' => nil, 'price' => nil, 'price_raw' => nil,
+      'variation' => nil, 'image' => 'https://m.media-amazon.com/images/I/00FIXTUREIMG2._SS145_.jpg',
+      'price' => nil, 'price_raw' => nil,
       'discount' => nil, 'skippable' => false }
   ],
   'subtotal' => nil
@@ -4845,17 +4847,15 @@ class SubscribeImageFlagTest < Minitest::Test
   end
 
   def test_the_flag_is_documented_where_it_works
-    %w[list show].each do |sub|
+    %w[list show upcoming].each do |sub|
       out, = capture_io_streams { Amazon::CLI.run(["subscribe", sub, "--help"]) }
       assert_includes out, "--image"
     end
   end
 
-  # `subscribe upcoming` has no photos yet, and a flag that silently does
-  # nothing is worse than one that isn't there.
-  def test_upcoming_does_not_pretend_to_support_it
-    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[subscribe upcoming --image]) }
-    assert_includes err, "unknown upcoming option: --image"
+  def test_upcoming_takes_it_too
+    _, err = run_cli(%w[subscribe upcoming --image])
+    assert_includes err, "images need a terminal"
   end
 
   # The renderer is handed to the formatter only when it can actually draw —
@@ -4978,5 +4978,98 @@ class ThumbnailFetchTest < Minitest::Test
     when "/missing.jpg" then ["404 Not Found", {}, "no"]
     else ["200 OK", { "Content-Type" => "image/jpeg" }, "IMAGEBYTES"]
     end
+  end
+end
+
+class DeliveryThumbnailLayoutTest < Minitest::Test
+  def fmt = Amazon::Formatter.new(json: false, color: false)
+
+  def render(cards, thumbs, **kw)
+    out, = capture_io_streams { fmt.deliveries(cards, thumbnails: thumbs, **kw) }
+    out
+  end
+
+  def test_each_item_becomes_a_block_under_its_delivery_heading
+    out = render([SAMPLE_DELIVERY], StubThumbnails.new(rows: 4, cols: 8))
+    assert_includes out, "Sep 2"
+    assert_includes out, "Last day to edit delivery:"
+    assert_includes out, "Example Laundry Detergent"
+    assert_includes out, "<IMG>"
+  end
+
+  # A price column indented past a photograph is a column of one, so the price
+  # moves off the front of the line and onto its own.
+  def test_the_price_moves_onto_its_own_line
+    out = render([SAMPLE_DELIVERY], StubThumbnails.new(rows: 4, cols: 8))
+    # The heading carries the delivery subtotal, which is the same number; the
+    # item's copy is the indented one.
+    priced = out.lines.select { |l| l.include?("$14.22") && l.start_with?(" " * 10) }
+    assert_equal 1, priced.size, out.inspect
+    refute_includes priced.first, "Example Laundry Detergent"
+    assert_includes priced.first, "Saving 5%"
+  end
+
+  # Not everything in a box is discounted — a subscription can sit at 0% and
+  # still ship in the delivery.
+  def test_a_priced_item_with_no_discount_prints_just_the_price
+    card = SAMPLE_DELIVERY.dup
+    card["items"] = [SAMPLE_DELIVERY["items"].first.merge("discount" => nil, "price" => 11.99)]
+    out = render([card], StubThumbnails.new(rows: 4, cols: 8))
+    assert_includes out, "$11.99"
+    refute_includes out, "Saving"
+  end
+
+  # A future delivery is unpriced. Its rate is the only number Amazon has
+  # committed to, and $0.00 would say the box is free.
+  def test_an_unpriced_item_shows_its_rate_alone
+    card = FUTURE_DELIVERY.dup
+    card["items"] = [FUTURE_DELIVERY["items"].first.merge("discount" => "Saving 15%")]
+    out = render([card], StubThumbnails.new(rows: 4, cols: 8))
+    assert_includes out, "Saving 15%"
+    refute_includes out, "$"
+  end
+
+  # Neither a price nor a rate is a blank line in the middle of a block, so the
+  # line is dropped instead.
+  def test_an_item_with_no_money_at_all_drops_the_line
+    out = render([FUTURE_DELIVERY], StubThumbnails.new(rows: 4, cols: 8))
+    assert_includes out, "Example Paper Towels"
+    refute_match(/^\s+$\n\s+$\n\s+$\n\s+$/, out)
+  end
+
+  def test_a_variation_prints_under_the_title
+    card = SAMPLE_DELIVERY.dup
+    card["items"] = [SAMPLE_DELIVERY["items"].first.merge("variation" => "Size: 132 Fl Oz")]
+    out = render([card], StubThumbnails.new(rows: 4, cols: 8))
+    assert_includes out, "Size: 132 Fl Oz"
+  end
+
+  # One warm-up for the whole screen: the downloads are the slow part and they
+  # don't depend on each other. Two deliveries must not mean two round trips.
+  def test_every_photo_on_screen_is_fetched_in_one_go
+    thumbs = StubThumbnails.new(rows: 4, cols: 8)
+    render([SAMPLE_DELIVERY, FUTURE_DELIVERY], thumbs)
+    assert_equal 2, thumbs.prefetched.compact.size
+  end
+
+  # --limit is what makes this bearable with photos; it must also stop the
+  # downloads, not just the drawing.
+  def test_a_hidden_delivery_costs_no_downloads
+    thumbs = StubThumbnails.new(rows: 4, cols: 8)
+    render([SAMPLE_DELIVERY, FUTURE_DELIVERY], thumbs, limit: 1)
+    assert_equal 1, thumbs.prefetched.compact.size
+    assert_includes render([SAMPLE_DELIVERY, FUTURE_DELIVERY], thumbs, limit: 1), "1 more delivery"
+  end
+
+  def test_a_card_with_no_items_still_prints_its_heading
+    out = render([SAMPLE_DELIVERY.merge("items" => nil)], StubThumbnails.new(rows: 4, cols: 8))
+    assert_includes out, "Sep 2"
+    assert_includes out, "0 items"
+  end
+
+  def test_without_thumbnails_the_item_lines_are_unchanged
+    out, = capture_io_streams { fmt.deliveries([SAMPLE_DELIVERY]) }
+    assert_match(/^\s+\$14\.22\s+Example Laundry Detergent/, out)
+    refute_includes out, "\e7"
   end
 end
