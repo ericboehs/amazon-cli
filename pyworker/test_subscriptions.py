@@ -28,8 +28,11 @@ from subscriptions import (
     NEXT_DELIVERY_SELECTOR,
     PAGINATION_KEY,
     SCHEDULE_SELECTOR,
+    SKIP_BUTTON,
     SUBSCRIPTION_CARD,
+    SUBSCRIPTION_LIST_URL,
     NoSuchSubscription,
+    NotSkippable,
     _cards,
     _card_by_query,
     _clickable,
@@ -48,13 +51,16 @@ from subscriptions import (
     parse_label_date,
     parse_schedule,
     product_image,
+    open_deliveries_tab,
+    skip_delivery_item,
+    verify_skipped,
     scrape_delivery_card,
     scrape_delivery_item,
     scrape_subscription_card,
     scrape_subscription_detail,
     sort_by_next_delivery,
 )
-from test_live import HAVE_BS4, NO_DEPS, DomPage, emitted
+from test_live import FIXTURES, HAVE_BS4, NO_DEPS, DomLocator, DomPage, emitted
 
 
 class ParseScheduleTest(unittest.TestCase):
@@ -935,3 +941,258 @@ class ProductImageFallbackTest(unittest.TestCase):
     def test_the_no_image_graphic_is_passed_through(self):
         url = self.image({"src": "https://m.media-amazon.com/images/G/01/sns/no-img._CB44_.png"})
         self.assertIn("no-img", url)
+
+
+if HAVE_BS4:  # pragma: no branch - mirrors test_live's own import guard
+    from bs4 import BeautifulSoup
+
+
+class SkipLocator(DomLocator):
+    """A DomLocator that can be clicked, wired to a page that reacts.
+
+    Subclassing rather than hand-writing a selector-keyed dict, for the reason
+    the module docstring gives: the skip flow's whole risk is *which node sits
+    inside which* — the Skip button belongs to one item card out of three, and
+    a dict keyed by selector would answer the same node for all of them and
+    prove nothing. Here the click lands on a node from the captured markup, and
+    the page decides what that means.
+    """
+
+    def __init__(self, nodes, page=None):
+        super().__init__(nodes)
+        self._page = page
+
+    @property
+    def first(self):
+        return SkipLocator(self._nodes[:1], self._page)
+
+    def nth(self, i):
+        return SkipLocator(self._nodes[i : i + 1], self._page)
+
+    def locator(self, sel):
+        return SkipLocator([m for n in self._nodes for m in n.select(sel)], self._page)
+
+    def is_visible(self):
+        return bool(self._nodes)
+
+    def click(self, timeout=None):
+        if not self._nodes:
+            raise AssertionError("clicked an empty locator")
+        self._page.clicked(self._nodes[0], timeout)
+
+
+class SkipPage(DomPage):
+    """The deliveries view, as a page that can be clicked through.
+
+    Models three transitions and nothing else: the deliveries tab loads the
+    delivery cards, a Skip button opens Amazon's confirmation markup, and
+    approving it removes the item from the delivery. The last one is the
+    important one — it is what `verify_skipped` re-reads, so a bug that reports
+    success without checking has somewhere to show up.
+    """
+
+    TAB_HTML = '<a href="/auto-deliveries/?ref_=myd_nav_op_D">DELIVERIES</a>'
+
+    def __init__(self, *, approve_removes=True, tab=True, deliveries=None):
+        html = self.TAB_HTML if tab else ""
+        super().__init__(f'<div id="root">{html}</div>')
+        self._deliveries = deliveries
+        self._approve_removes = approve_removes
+        self.clicks = []
+        self.gotos = []
+        self.waits = []
+        self.skipped_ids = set()
+
+    # -- page surface -------------------------------------------------
+    def locator(self, sel):
+        return SkipLocator(self._soup.select(sel), self)
+
+    def goto(self, url, **_kw):
+        self.gotos.append(url)
+
+    def wait_for_selector(self, sel, timeout=None):
+        self.waits.append(sel)
+        if not self._soup.select(sel):
+            raise TimeoutError(f"no {sel}")
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+    # -- transitions --------------------------------------------------
+    def load_deliveries(self):
+        html = self._deliveries
+        if html is None:
+            html = (FIXTURES / "deliveries.html").read_text(encoding="utf-8")
+        for card in BeautifulSoup(html, "html.parser").select(DELIVERY_CARD):
+            self._soup.select_one("#root").append(card)
+
+    def clicked(self, node, timeout):
+        classes = " ".join(node.get("class") or [])
+        # Id first: Amazon hangs #confirmSkipApprove on a span that also
+        # carries three a-button classes, and recording the classes would make
+        # "did we press approve?" unanswerable from the log.
+        self.clicks.append((node.name, node.get("id") or classes, timeout))
+        if node.name == "a":
+            self.load_deliveries()
+        elif "skip-subscription-button" in classes:
+            self._open_modal(node)
+        elif node.get("id") == "confirmSkipApprove":
+            self._approve()
+
+    def _open_modal(self, button):
+        card = button.find_parent(class_="subscription-card")
+        self._pending = card.get("data-subscription-id") if card else None
+        modal = (FIXTURES / "confirm_skip.html").read_text(encoding="utf-8")
+        self._soup.select_one("#root").append(
+            BeautifulSoup(modal, "html.parser").select_one(".confirm-skip-container")
+        )
+
+    def _approve(self):
+        self._soup.select_one(".confirm-skip-container").decompose()
+        self.skipped_ids.add(self._pending)
+        if not self._approve_removes:
+            return
+        for card in self._soup.select(
+            f'{DELIVERY_SUBSCRIPTION_CARD}[data-subscription-id="{self._pending}"]'
+        ):
+            card.decompose()
+
+
+class OpenDeliveriesTabTest(unittest.TestCase):
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+
+    def test_it_clicks_the_tab_rather_than_following_its_href(self):
+        # Measured on the live account: navigating to that href renders the
+        # React hub, which contains zero delivery cards. Clicking loads all
+        # seven of them; the fixture carries two.
+        page = SkipPage()
+        open_deliveries_tab(page)
+        self.assertEqual(page.locator(DELIVERY_CARD).count(), 2)
+        self.assertEqual(page.gotos, [SUBSCRIPTION_LIST_URL])
+        self.assertEqual([c[0] for c in page.clicks], ["a"])
+
+    def test_a_missing_tab_is_an_error_and_not_an_empty_list(self):
+        with self.assertRaises(RuntimeError) as e:
+            open_deliveries_tab(SkipPage(tab=False))
+        self.assertIn("deliveries tab", str(e.exception))
+
+    def test_a_tab_that_renders_nothing_is_an_error_too(self):
+        page = SkipPage(deliveries="")
+        with self.assertRaises(RuntimeError) as e:
+            open_deliveries_tab(page)
+        self.assertIn("never rendered", str(e.exception))
+
+
+class SkipDeliveryItemTest(unittest.TestCase):
+    """The whole flow, against the captured deliveries and modal markup."""
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        self.page = SkipPage()
+
+    def skip(self, target=None, sub_id=None, confirm=False):
+        return skip_delivery_item(self.page, sub_id, target, confirm)
+
+    def test_a_dry_run_opens_the_dialog_and_agrees_to_nothing(self):
+        result = self.skip("Dishwasher")
+        self.assertFalse(result["confirmed"])
+        self.assertIsNone(result["verified"])
+        self.assertEqual(result["heading"], "Skip your September 2 delivery")
+        # Amazon's warning, carried through verbatim: "skip" sounds free and
+        # this is the sentence that says it might not be.
+        self.assertIn("lose applied coupons", result["warning"])
+        self.assertNotIn("confirmSkipApprove", [c[1] for c in self.page.clicks])
+        self.assertEqual(self.page.skipped_ids, set())
+
+    def test_the_dialog_reports_whether_amazon_rendered_the_form_we_know(self):
+        self.assertTrue(self.skip("Dishwasher")["has_csrf"])
+
+    def test_confirming_clicks_approve_and_verifies_by_re_reading(self):
+        result = self.skip("Dishwasher", confirm=True)
+        self.assertTrue(result["confirmed"])
+        self.assertTrue(result["verified"])
+        self.assertIn("confirmSkipApprove", [c[1] for c in self.page.clicks])
+        # Re-read, not remembered: the list was loaded a second time.
+        self.assertEqual(self.page.gotos.count(SUBSCRIPTION_LIST_URL), 2)
+
+    def test_an_item_still_in_the_delivery_afterwards_is_reported_as_such(self):
+        # Amazon's dialog closes on failure exactly as it does on success, so
+        # this is the only signal there is, and it must not read as success.
+        self.page = SkipPage(approve_removes=False)
+        result = self.skip("Dishwasher", confirm=True)
+        self.assertTrue(result["confirmed"])
+        self.assertIs(result["verified"], False)
+
+    def test_a_verification_that_cannot_be_made_is_none_and_not_false(self):
+        page = SkipPage()
+        open_deliveries_tab(page)
+        page.load_deliveries = lambda: (_ for _ in ()).throw(RuntimeError("network"))
+        self.assertIsNone(verify_skipped(page, "SNSD0_FIXTURESUB0000000001"))
+
+    def test_it_reports_which_delivery_and_which_item(self):
+        result = self.skip("Dishwasher")
+        self.assertTrue(result["subscription_id"].startswith("SNS"))
+        self.assertEqual(result["delivery_date"], "2026-09-02")
+        self.assertEqual(result["delivery_label"], "Sep 2")
+
+    def test_an_id_that_is_not_in_the_next_delivery_says_so(self):
+        with self.assertRaises(NoSuchSubscription) as e:
+            self.skip(sub_id="SNSD0_NOTINTHISBOX00000000")
+        self.assertIn("not in the next delivery", str(e.exception))
+
+    def test_an_ambiguous_search_refuses_to_pick_one(self):
+        # The stakes here are why: `show` guessing wrong wastes a glance,
+        # skipping the wrong item means something you needed doesn't arrive.
+        with self.assertRaises(NoSuchSubscription) as e:
+            self.skip("Example")
+        self.assertIn("match", str(e.exception))
+        self.assertEqual(self.page.skipped_ids, set())
+
+    # "Laundry" is a real subscription on this fixture — in the *future*
+    # delivery, where there is nothing to skip yet. The nearest miss there is,
+    # and the reason the message lists the box's contents rather than saying
+    # no such thing exists.
+    def test_a_search_that_matches_a_later_delivery_lists_what_is_in_this_one(self):
+        with self.assertRaises(NoSuchSubscription) as e:
+            self.skip("Laundry")
+        self.assertIn("It holds:", str(e.exception))
+        self.assertIn("Dishwasher", str(e.exception))
+
+    def test_a_delivery_with_nothing_skippable_is_not_a_failure_of_ours(self):
+        html = (FIXTURES / "deliveries.html").read_text(encoding="utf-8")
+        soup = BeautifulSoup(html, "html.parser")
+        for btn in soup.select(SKIP_BUTTON):
+            btn.decompose()
+        with self.assertRaises(NotSkippable) as e:
+            skip_delivery_item(SkipPage(deliveries=str(soup)), None, "Dishwasher", False)
+        self.assertIn("last day to edit", str(e.exception))
+
+    def test_no_current_delivery_at_all_is_the_same_kind_of_refusal(self):
+        html = (FIXTURES / "deliveries.html").read_text(encoding="utf-8")
+        soup = BeautifulSoup(html, "html.parser")
+        for card in soup.select(f"{DELIVERY_CARD}[data-delivery-type='current']"):
+            card.decompose()
+        with self.assertRaises(NotSkippable) as e:
+            skip_delivery_item(SkipPage(deliveries=str(soup)), None, "Dishwasher", False)
+        self.assertIn("nothing to skip", str(e.exception))
+
+    def test_an_empty_search_is_refused_before_anything_is_clicked(self):
+        with self.assertRaises(NoSuchSubscription):
+            self.skip("   ")
+        self.assertEqual(self.page.skipped_ids, set())
+
+    def test_only_the_current_delivery_offers_anything_to_skip(self):
+        # Future deliveries have no Skip button in the markup Amazon serves —
+        # there is nothing to skip until a box is being assembled. Asserted so
+        # that a future scraper change that starts finding them is noticed.
+        page = SkipPage()
+        open_deliveries_tab(page)
+        for card in page.locator(DELIVERY_CARD)._nodes:
+            buttons = card.select(SKIP_BUTTON)
+            if card.get("data-delivery-type") == "current":
+                self.assertTrue(buttons)
+            else:
+                self.assertEqual(buttons, [])

@@ -106,7 +106,9 @@ date        order_id             total    status
   sorted by what ships next, with its cadence, discount, and price;
   `amazon subscribe upcoming` shows the deliveries themselves and the last
   day you can still change each one; `amazon subscribe show` opens one
-  subscription in full. Read-only, cached for 30 minutes.
+  subscription in full. Reads cache for 30 minutes. `amazon subscribe skip`
+  drops one item from the next delivery — the only write here, and it needs
+  `--yes` and proves it worked.
 - **Incremental sync** — only fetches orders not already on disk. A `--full`
   flag re-fetches everything.
 - **Parallel detail fetches** — `ThreadPoolExecutor` with a tunable worker
@@ -133,7 +135,7 @@ lib/amazon/
     secrets.rb          1Password reads, for sync and login
     thumbnail.rb        product photos in the terminal, via chafa
     subscribe.rb        `amazon subscribe …` dispatcher
-    subscribe/          list, upcoming, show (Subscribe & Save, read-only)
+    subscribe/          list, upcoming, show, skip (Subscribe & Save)
     login.rb, config.rb, buy.rb
   config.rb             XDG paths, config load
   store.rb              JSON read/write, index, ASIN purchase history
@@ -363,6 +365,8 @@ amazon subscribe list --all           # click past the first 30
 amazon subscribe upcoming             # the next delivery, with prices
 amazon subscribe upcoming --all       # every scheduled delivery
 amazon subscribe show dishwasher      # one subscription in full, by id or by title
+amazon subscribe skip bodymed         # what skipping it would do — changes nothing
+amazon subscribe skip bodymed --yes   # actually drop it from the next delivery
 amazon subscribe list --no-image      # plain table, no product photos
 amazon subscribe list --fresh         # ignore the 30-minute cache
 amazon subscribe upcoming --json | jq '.[0].subtotal'
@@ -453,7 +457,46 @@ rate that changes with whatever else lands in the box. `--limit N` and
 `--all` override it. `--json` ignores both: a caller piping to `jq` asked for
 the data, not for the next box.
 
-All three cache for 30 minutes, and a cached read says its age on stderr
+#### Skipping a delivery
+
+`skip` is the only subcommand here that changes anything, and it won't
+without `--yes`:
+
+```
+$ amazon subscribe skip bodymed
+would skip BodyMed Adjustable Heel Lift for Men and Woman, Small (1-Pack)
+  from the Sep 2 delivery
+  This will cancel your order. You may lose applied coupons.
+  nothing changed — pass --yes to skip it
+```
+
+That warning is Amazon's sentence, not ours. The dry run is not a simulation:
+it drives the real flow up to the last click and reads back the confirmation
+dialog Amazon rendered, which is the only description of what skipping means
+that can't go stale. It exits 2, because a script that forgot `--yes` should
+be able to tell that nothing happened.
+
+With `--yes` the skip is confirmed and then **verified by re-reading the
+delivery**. A click that returns without error is not evidence — Amazon's
+dialog closes the same way whether the skip took or not — so the three
+outcomes stay three: it left the box, it's still there (say so loudly), or
+the re-read failed and we can't say. "We couldn't confirm" and "it didn't
+work" are different things to tell someone about their account.
+
+Only the next delivery can be skipped, and only until its last-edit date;
+`upcoming` shows both. Later deliveries have no Skip button in Amazon's
+markup at all, because there's nothing to skip until a box is being
+assembled. A search that matches something in a *later* delivery gets told
+what's in this one instead of "no such thing". Ambiguous searches refuse to
+pick: skipping the wrong item means something you needed doesn't arrive.
+
+One subscription per invocation. Two bare words is far more likely to be a
+two-word search that lost its quotes than a request to skip two things.
+
+A confirmed skip drops all three cached views, since the delivery it just
+changed is in every one of them.
+
+All three read-only views cache for 30 minutes, and a cached read says its age on stderr
 (`[cached 12 minutes ago — --fresh to re-read]`) — a schedule you changed on
 the website twenty minutes ago and one that never changed look identical
 otherwise. `--fresh` on any of them drops all three, since they describe one
@@ -488,8 +531,8 @@ a photograph is a column of one.
 
 Images are skipped when stdout isn't a terminal or chafa isn't installed — a
 pipe gets the table, not megabytes of escape codes. That happens silently
-unless you typed `--image`, because a default that can't run shouldn't make
-every `| grep` apologise for a feature nobody asked for.
+unless you typed `--image` explicitly, because a default that can't run
+shouldn't make every `| grep` apologise for a feature nobody asked for.
 Photos are cached on disk by URL and size, so the second run draws instantly.
 
 Two things about that layout were measured rather than assumed, and both were

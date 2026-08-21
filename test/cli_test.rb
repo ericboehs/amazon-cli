@@ -71,6 +71,7 @@ require 'amazon/commands/subscribe/cached'
 require 'amazon/commands/subscribe/images'
 require 'amazon/commands/subscribe/list'
 require 'amazon/commands/subscribe/show'
+require 'amazon/commands/subscribe/skip'
 require 'amazon/commands/subscribe/upcoming'
 
 require 'minitest/autorun'
@@ -3645,8 +3646,35 @@ class FakeSubscribeWorker
     @detail
   end
 
-  attr_reader :asked_for
+  def skip(target, confirm:)
+    @calls += 1
+    @asked_for = target
+    @asked_confirm = confirm
+    return nil unless @skip_result
+
+    @skip_result.merge('confirmed' => confirm)
+  end
+
+  attr_reader :asked_for, :asked_confirm
+
+  def with_skip(result)
+    @skip_result = result
+    self
+  end
 end
+
+SAMPLE_SKIP = {
+  'subscription_id' => 'SNSD0_FIXTURESUB0000000001',
+  'title' => 'Example Dishwasher Detergent Gel, Lemon, 75oz',
+  'delivery_date' => '2026-09-02',
+  'delivery_label' => 'Sep 2',
+  'heading' => 'Skip your September 2 delivery',
+  'product' => 'Example Dishwasher Detergent Gel, Lemon, 75oz',
+  'warning' => 'This will cancel your order. You may lose applied coupons.',
+  'has_csrf' => true,
+  'confirmed' => false,
+  'verified' => nil
+}.freeze
 
 class SubscribeDispatchTest < Minitest::Test
   def setup = write_config!
@@ -4426,6 +4454,58 @@ class SubscribeWorkerProtocolTest < Minitest::Test
     SCRIPT
     with_python_cmd(body) do
       assert_raises(Amazon::Worker::Error) { capture_io_streams { worker.subscription('zzz') } }
+    end
+  end
+
+  # The confirm flag has to survive the trip, because it is the entire
+  # difference between reading a dialog and agreeing to it.
+  def test_skip_sends_the_target_and_whether_to_confirm
+    body = <<~'SCRIPT'
+      req = JSON.parse(STDIN.gets)
+      puts({event: 'log', level: 'warn', msg: 'the dialog rendered no warning'}.to_json)
+      puts({event: 'skip', data: req}.to_json)
+      puts({event: 'done', count: 1}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      result = nil
+      _, err = capture_io_streams { result = worker.skip('SNSD0_ABC', confirm: true) }
+      assert_equal 'SNSD0_ABC', result['subscription_id']
+      assert result['confirm']
+      assert_includes err, '[worker:warn] the dialog rendered no warning'
+
+      capture_io_streams { result = worker.skip('dishwasher', confirm: false) }
+      assert_equal 'dishwasher', result['query']
+      refute result['confirm']
+    end
+  end
+
+  # "Nothing in that delivery can be skipped" is a fact about the account, not
+  # a scraper failure — it reads back to the user in Amazon's terms and exits
+  # like a refusal rather than a crash.
+  def test_a_delivery_with_nothing_skippable_is_reported_not_raised
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: 'nothing in the next delivery can be skipped', kind: 'not_skippable'}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      w = worker
+      result = nil
+      capture_io_streams { result = w.skip('dishwasher', confirm: true) }
+      assert_nil result
+      assert_includes w.not_found, 'nothing in the next delivery can be skipped'
+    end
+  end
+
+  def test_a_real_failure_during_skip_still_raises
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: 'Timeout: the confirmation never appeared'}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      err = assert_raises(Amazon::Worker::Error) do
+        capture_io_streams { worker.skip('dishwasher', confirm: true) }
+      end
+      assert_includes err.message, 'live lookup failed'
     end
   end
 end
@@ -5344,5 +5424,150 @@ class LoginPipeTest < Minitest::Test
     assert_equal 'python3', login.send(:python_cmd).first
   ensure
     File.define_singleton_method(:executable?, original)
+  end
+end
+
+# `subscribe skip` is the first subcommand in this namespace that changes
+# anything, so most of what is graded here is what it refuses to do.
+class SubscribeSkipCommandTest < Minitest::Test
+  def setup
+    write_config!
+    reset_subscribe_cache!
+  end
+
+  def worker(result = SAMPLE_SKIP)
+    FakeSubscribeWorker.new.with_skip(result)
+  end
+
+  def run_skip(argv, worker = worker())
+    out = err = nil
+    code = with_worker(->(*) { worker }) do
+      out, err = capture_io_streams { @code = Amazon::CLI.run(argv) }
+      @code
+    end
+    [out, err, code]
+  end
+
+  def test_without_yes_it_describes_the_skip_and_does_not_do_it
+    out, _err, code = run_skip(%w[subscribe skip dishwasher])
+    assert_equal 2, code, 'a dry run must not look like success to a script'
+    assert_includes out, 'would skip'
+    assert_includes out, 'Example Dishwasher Detergent'
+    assert_includes out, 'pass --yes'
+  end
+
+  # Amazon's sentence, not a paraphrase of it. "Skip" sounds free; the dialog
+  # is the only thing that mentions the coupon.
+  def test_the_dry_run_repeats_amazons_own_warning
+    out, = run_skip(%w[subscribe skip dishwasher])
+    assert_includes out, 'You may lose applied coupons'
+  end
+
+  def test_the_worker_is_told_not_to_confirm
+    w = worker
+    run_skip(%w[subscribe skip dishwasher], w)
+    refute w.asked_confirm
+  end
+
+  def test_yes_confirms_and_reports_the_verification
+    w = worker(SAMPLE_SKIP.merge('verified' => true))
+    out, _err, code = run_skip(%w[subscribe skip dishwasher --yes], w)
+    assert_equal 0, code
+    assert w.asked_confirm
+    assert_includes out, 'skipped'
+    assert_includes out, "no longer in that delivery"
+  end
+
+  def test_short_yes_works_too
+    w = worker(SAMPLE_SKIP.merge('verified' => true))
+    _out, _err, code = run_skip(%w[subscribe skip dishwasher -y], w)
+    assert_equal 0, code
+    assert w.asked_confirm
+  end
+
+  # The one that matters: Amazon accepted the click and the item is still
+  # there. Reporting that as a skip would be the worst bug this command can
+  # have, because the box ships anyway and nobody looks again.
+  def test_an_unverified_skip_says_so_loudly
+    out, = run_skip(%w[subscribe skip dishwasher --yes], worker(SAMPLE_SKIP.merge('verified' => false)))
+    assert_includes out, 'still in that delivery'
+    refute_includes out, 'confirmed —'
+  end
+
+  def test_a_check_that_could_not_be_made_is_not_reported_as_failure
+    out, = run_skip(%w[subscribe skip dishwasher --yes], worker(SAMPLE_SKIP.merge('verified' => nil)))
+    assert_includes out, "couldn't re-read"
+    refute_includes out, 'still in that delivery'
+  end
+
+  # Counted at the worker rather than in the cache directory: what matters is
+  # that the next read goes back to Amazon, not which files exist.
+  def reads_after(skip_argv)
+    w = worker(SAMPLE_SKIP.merge('verified' => true))
+    with_worker(->(*) { w }) do
+      capture_io_streams do
+        Amazon::CLI.run(%w[subscribe list])
+        before = w.calls
+        Amazon::CLI.run(skip_argv)
+        Amazon::CLI.run(%w[subscribe list])
+        return w.calls - before - 1
+      end
+    end
+  end
+
+  def test_a_confirmed_skip_clears_the_cache
+    assert_equal 1, reads_after(%w[subscribe skip dishwasher --yes]),
+                 'the list would still show a delivery date that just moved'
+  end
+
+  # A dry run changed nothing, so a cache built before it is still true.
+  def test_a_dry_run_leaves_the_cache_alone
+    assert_equal 0, reads_after(%w[subscribe skip dishwasher])
+  end
+
+  def test_json_is_the_whole_record
+    out, = run_skip(%w[--json subscribe skip dishwasher --yes], worker(SAMPLE_SKIP.merge('verified' => true)))
+    parsed = JSON.parse(out)
+    assert_equal 'SNSD0_FIXTURESUB0000000001', parsed['subscription_id']
+    assert parsed['confirmed']
+  end
+
+  def test_a_miss_passes_amazons_wording_through
+    w = FakeSubscribeWorker.new(not_found: 'nothing in the next delivery matches "zzz"')
+    _out, err, code = run_skip(%w[subscribe skip zzz], w)
+    assert_equal 2, code
+    assert_includes err, 'nothing in the next delivery'
+  end
+
+  def test_it_needs_something_to_skip
+    _out, err, code = run_skip(%w[subscribe skip])
+    assert_equal 2, code
+    assert_includes err, 'usage:'
+  end
+
+  # Bulk skipping is a different command with a different confirmation. Two
+  # bare words here is far more likely to be a two-word search that forgot its
+  # quotes, and skipping the first match would be a wrong guess with a cost.
+  def test_it_takes_one_subscription_at_a_time
+    _out, err, code = run_skip(['subscribe', 'skip', 'dish', 'mop'])
+    assert_equal 2, code
+    assert_includes err, 'one subscription at a time'
+  end
+
+  def test_unknown_options_are_refused
+    _out, err, code = run_skip(%w[subscribe skip dishwasher --force])
+    assert_equal 2, code
+    assert_includes err, 'unknown skip option'
+  end
+
+  def test_the_help_says_what_yes_is_for
+    out, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[subscribe skip --help]) }
+    assert_includes out, '--yes'
+    assert_includes out, 'nothing is changed'
+  end
+
+  def test_the_namespace_lists_it
+    out, = capture_io_streams { Amazon::CLI.run(%w[subscribe]) }
+    assert_includes out, 'skip'
   end
 end

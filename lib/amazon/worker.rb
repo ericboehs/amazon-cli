@@ -170,6 +170,27 @@ module Amazon
     # through verbatim rather than restating from the Ruby side.
     attr_reader :not_found
 
+    # Skip one item out of the next delivery, or — with confirm: false — open
+    # Amazon's confirmation dialog, read it, and walk away without agreeing to
+    # it. The dry run is the same code path up to the last click, which is the
+    # only kind of dry run worth having for a mutation.
+    def skip(id_or_query, confirm:)
+      result = nil
+      key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
+      request = { action: "skip", key => id_or_query, confirm: confirm }
+      run(request, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "skip" then result = event["data"]
+        when "log"  then log_event(event)
+        when "error"
+          raise Error, live_error(event) unless %w[not_found not_skippable].include?(event["kind"])
+
+          @not_found = event["msg"]
+        end
+      end
+      result
+    end
+
     class Progress
       BAR_WIDTH = 20
 

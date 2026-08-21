@@ -7,6 +7,7 @@ module Amazon
     DIM   = "\e[2m"
     GREEN = "\e[32m"
     RED   = "\e[31m"
+    YELLOW = "\e[33m"
     RST   = "\e[0m"
 
     def initialize(json: false, color: $stdout.tty?)
@@ -265,7 +266,39 @@ module Amazon
       beside_image(thumbnails.block(detail["image"]), head + [""] + fields, thumbnails)
     end
 
+    # The result of a skip, confirmed or merely contemplated.
+    def skip(result)
+      return puts(JSON.pretty_generate(result)) if @json
+
+      title = result["title"] || result["product"] || "(untitled subscription)"
+      when_ = result["delivery_label"] || result["delivery_date"]
+      if result["confirmed"]
+        puts "#{green("skipped")} #{bold(title)}"
+        puts dim("  from the #{when_} delivery") if when_
+        puts skip_verdict(result["verified"])
+      else
+        puts "#{bold("would skip")} #{bold(title)}"
+        puts dim("  from the #{when_} delivery") if when_
+        # Amazon's warning, not ours. "Skip" sounds harmless; their own dialog
+        # is the thing that says it may cost you a coupon.
+        puts "  #{yellow(result["warning"])}" if result["warning"]
+        puts dim("  nothing changed — pass --yes to skip it")
+      end
+    end
+
     private
+
+    # A click that returned without error is not evidence, so the three
+    # outcomes stay three: it left the delivery, it didn't, or we couldn't
+    # look. The middle one is the only failure, and it must not be reported in
+    # the same words as the third.
+    def skip_verdict(verified)
+      case verified
+      when true  then dim("  confirmed — it's no longer in that delivery")
+      when false then red("  but it is still in that delivery — check Amazon")
+      else dim("  Amazon accepted it; couldn't re-read the delivery to confirm")
+      end
+    end
 
     def subscription_table(rows)
       headers = %w[next every qty price subscription_id item]
@@ -668,5 +701,6 @@ module Amazon
     def dim(s)   = @color ? "#{DIM}#{s}#{RST}"   : s
     def green(s) = @color ? "#{GREEN}#{s}#{RST}" : s
     def red(s)   = @color ? "#{RED}#{s}#{RST}"   : s
+    def yellow(s) = @color ? "#{YELLOW}#{s}#{RST}" : s
   end
 end

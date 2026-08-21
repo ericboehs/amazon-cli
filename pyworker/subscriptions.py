@@ -46,6 +46,7 @@ import re
 import sys
 import traceback
 from datetime import date, datetime, timezone
+from collections.abc import Sequence
 from typing import Any
 
 from browser import (
@@ -75,6 +76,23 @@ SUBSCRIPTION_CARD = ".subscription-list-container .subscription-card[data-subscr
 DELIVERY_SUBSCRIPTION_CARD = ".subscription-card[data-subscription-id]"
 
 DELIVERY_CARD = ".delivery-card"
+
+# Skipping is a click, and a click needs the page's JavaScript. The deliveries
+# *fragment* we scrape for reading has none — `window.P` is undefined there and
+# the Skip button is inert markup, which is a fine thing to read and a useless
+# thing to press. The tab control on the subscription list loads the same
+# markup into a page that has AUI attached, so mutations go through there.
+DELIVERIES_TAB = "a[href*='ref_=myd_nav_op']"
+SKIP_BUTTON = ".skip-subscription-button"
+SKIP_MODAL = ".confirm-skip-container"
+SKIP_APPROVE = "#confirmSkipApprove"
+SKIP_TITLE = "#skip-title"
+SKIP_WARNING = ".skip-discount-warning"
+SKIP_CSRF = "input[name='skip-workflow-csrf']"
+DELIVERY_HEADER = ".delivery-header-message"
+# Amazon animates the modal in and the tab content is an XHR away.
+MODAL_WAIT_MS = 15000
+TAB_WAIT_MS = 20000
 
 # `.a-truncate-full` is the untruncated copy Amazon keeps for screen readers;
 # `.a-truncate-cut` next to it is the visible one, ellipsised mid-word. Reading
@@ -418,7 +436,7 @@ def scrape_delivery_card(card: Any) -> dict[str, Any]:
     priced = [i["price"] for i in items if isinstance(i["price"], (int, float))]
     return {
         "date": parse_epoch_date(epoch),
-        "date_label": text(card, ".delivery-header-message"),
+        "date_label": text(card, DELIVERY_HEADER),
         "kind": kind,
         # "Last day to edit delivery" — the one date on this page with a
         # deadline attached, and the reason the deliveries view exists at all.
@@ -761,6 +779,182 @@ def _card_by_query(page: Any, query: str) -> Any:
     return matches[0][0] if matches else None
 
 
+class NotSkippable(RuntimeError):
+    """The subscription exists but nothing about it can be skipped right now."""
+
+
+def open_deliveries_tab(page: Any) -> None:
+    """Load the deliveries view into a page whose JavaScript is running.
+
+    Navigating to the tab's href does not work: that URL renders the React hub,
+    which comes back with no delivery cards at all. Clicking the tab does, and
+    the click is what a person would do.
+    """
+    open_subscription_list(page)
+    tab = page.locator(DELIVERIES_TAB).first
+    if not _clickable(tab):
+        raise RuntimeError(
+            "no deliveries tab on the subscriptions page — Amazon's layout has changed"
+        )
+    tab.click(timeout=CLICK_TIMEOUT_MS)
+    try:
+        page.wait_for_selector(DELIVERY_CARD, timeout=TAB_WAIT_MS)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"the deliveries tab never rendered a delivery: {e}") from e
+    page.wait_for_timeout(PAGE_SETTLE_MS)
+
+
+def current_delivery(page: Any) -> Any:
+    """The delivery about to ship — the only one with anything to skip."""
+    cards = page.locator(f"{DELIVERY_CARD}[data-delivery-type='current']")
+    if cards.count() == 0:
+        raise NotSkippable(
+            "no delivery is currently scheduled, so there is nothing to skip"
+        )
+    return cards.first
+
+
+def skippable_items(card: Any) -> list[tuple[Any, str]]:
+    """(node, title) for each item in this delivery that offers a Skip button."""
+    out = []
+    for item in _cards(card, DELIVERY_SUBSCRIPTION_CARD):
+        if item.locator(SKIP_BUTTON).count() > 0:
+            out.append((item, text(item, *TITLE_SELECTORS) or ""))
+    return out
+
+
+def match_delivery_item(items: Sequence[tuple[Any, str]], wanted: str | None, query: str | None) -> Any:
+    """Pick the one item the user meant, or refuse to guess.
+
+    Same rule as `show`: an id is exact, a query has to be unambiguous. The
+    stakes are higher here — `show` printing the wrong subscription wastes a
+    glance, skipping the wrong one means a product does not arrive.
+    """
+    if wanted:
+        for node, _title in items:
+            if node.get_attribute("data-subscription-id") == wanted:
+                return node
+        raise NoSuchSubscription(
+            f"{wanted} is not in the next delivery. `amazon subscribe upcoming` "
+            "shows what is."
+        )
+
+    needle = (query or "").strip().lower()
+    if not needle:
+        raise NoSuchSubscription("skip needs a subscription id or a search")
+    matches = [(node, title) for node, title in items if needle in title.lower()]
+    if len(matches) > 1:
+        listed = "".join(f"\n  - {t[:70]}" for _, t in matches[:6])
+        raise NoSuchSubscription(
+            f"{len(matches)} items in the next delivery match {query!r}:{listed}\n"
+            "Narrow the search, or pass the subscription id."
+        )
+    if not matches:
+        listed = "".join(f"\n  - {t[:70]}" for _, t in items[:8])
+        raise NoSuchSubscription(
+            f"nothing in the next delivery matches {query!r}. It holds:{listed}"
+        )
+    return matches[0][0]
+
+
+def read_skip_modal(page: Any) -> dict[str, Any]:
+    """What the confirmation dialog says, before anyone agrees to it.
+
+    The warning line is the point. Amazon says "This will cancel your order.
+    You may lose applied coupons." — which is not what "skip" sounds like, and
+    is worth putting in front of someone before they say yes.
+    """
+    return {
+        "heading": text(page, SKIP_TITLE),
+        "product": text(page, f"{SKIP_MODAL} .product-title", f"{SKIP_MODAL} .a-size-medium"),
+        "warning": text(page, SKIP_WARNING),
+        # Not the token itself — only whether the form Amazon rendered is the
+        # one we know how to submit.
+        "has_csrf": page.locator(SKIP_CSRF).count() > 0,
+    }
+
+
+def skip_delivery_item(
+    page: Any, wanted: str | None, query: str | None, confirm: bool
+) -> dict[str, Any]:
+    """Skip one item from the next delivery, or describe what that would do.
+
+    The dry run is not a simulation — it opens Amazon's own confirmation dialog
+    and reads it back. A hand-written summary of what skipping means would be a
+    guess that ages badly; the dialog is what Amazon will actually do, in
+    Amazon's words, including the part about losing coupons.
+    """
+    open_deliveries_tab(page)
+    card = current_delivery(page)
+    items = skippable_items(card)
+    if not items:
+        raise NotSkippable(
+            "nothing in the next delivery can be skipped — it may already be "
+            "too late to change it. `amazon subscribe upcoming` shows the "
+            "last day to edit."
+        )
+
+    node = match_delivery_item(items, wanted, query)
+    sub_id = node.get_attribute("data-subscription-id")
+    title = text(node, *TITLE_SELECTORS)
+    delivery_date = card.get_attribute("data-delivery-date")
+
+    node.locator(SKIP_BUTTON).first.click(timeout=CLICK_TIMEOUT_MS)
+    try:
+        page.wait_for_selector(SKIP_MODAL, timeout=MODAL_WAIT_MS)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"the skip confirmation never appeared: {e}") from e
+
+    result = {
+        "subscription_id": sub_id,
+        "title": title,
+        "delivery_date": parse_epoch_date(delivery_date),
+        "delivery_label": text(card, DELIVERY_HEADER),
+        "confirmed": False,
+        "verified": None,
+        **read_skip_modal(page),
+    }
+    if not confirm:
+        # Nothing has changed: the dialog is open and no one has agreed to it.
+        # Closing the browser is the same as walking away from it.
+        return result
+
+    approve = page.locator(SKIP_APPROVE).first
+    if not _clickable(approve):
+        raise RuntimeError("the confirmation dialog has no approve button")
+    approve.click(timeout=CLICK_TIMEOUT_MS)
+    page.wait_for_timeout(PAGE_SETTLE_MS)
+    result["confirmed"] = True
+    result["verified"] = verify_skipped(page, sub_id)
+    return result
+
+
+def verify_skipped(page: Any, sub_id: str | None) -> bool | None:
+    """Re-read the next delivery and check the item really left it.
+
+    A click that returns without error is not evidence. Amazon can answer with
+    a dialog that closes on failure just as readily as on success, and the only
+    thing that settles it is the delivery no longer containing the item — which
+    costs one more page load and is the difference between reporting what we
+    did and reporting what we asked for.
+
+    None, not False, when the check itself could not be made: "we could not
+    confirm" and "it did not work" are different things to tell someone about
+    a change to their account.
+    """
+    if not sub_id:
+        return None
+    try:
+        open_deliveries_tab(page)
+        card = current_delivery(page)
+        still_there = card.locator(
+            f"{DELIVERY_SUBSCRIPTION_CARD}[data-subscription-id={json.dumps(sub_id)}]"
+        ).count()
+        return still_there == 0
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def edit_modal_url(card: Any) -> str | None:
     """The modal URL the card publishes for itself, if it still does."""
     for node in _cards(card, "[data-a-modal]"):
@@ -921,6 +1115,22 @@ def main() -> int:
                     emit("detail", data=scrape_subscription(page, sub_id, query))
                     emit("done", count=1)
 
+                elif action == "skip":
+                    sub_id = req.get("subscription_id")
+                    query = req.get("query")
+                    if not sub_id and not query:
+                        emit("error", msg="skip requires subscription_id or query")
+                        return 2
+                    confirm = bool(req.get("confirm"))
+                    emit(
+                        "log",
+                        level="info",
+                        msg=("skipping " if confirm else "checking what skipping ")
+                        + f"{sub_id or query} would do",
+                    )
+                    emit("skip", data=skip_delivery_item(page, sub_id, query, confirm))
+                    emit("done", count=1)
+
                 else:
                     emit("error", msg=f"unknown action: {action!r}")
                     return 2
@@ -932,6 +1142,11 @@ def main() -> int:
     except Blocked as e:
         emit("error", msg=str(e), kind="blocked")
         return 1
+    except NotSkippable as e:
+        # Not a failure of ours and not a user typo either — the account is
+        # simply not in a state where this can happen.
+        emit("error", msg=str(e), kind="not_skippable")
+        return 2
     except NoSuchSubscription as e:
         # A search that matched nothing is a user error, not a scraper failure,
         # so it exits like one and skips the traceback.
