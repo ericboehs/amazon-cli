@@ -202,7 +202,100 @@ module Amazon
       end
     end
 
+    # --- subscribe & save ----------------------------------------------
+
+    # `total` is what Amazon says the account holds; `loaded_all` is whether we
+    # asked for all of it. Both are needed to say anything honest about a short
+    # list: 30 rows out of 59 is a page, 30 out of 30 is the whole thing, and
+    # the rows cannot tell the two apart.
+    def subscriptions(rows, total: nil, loaded_all: false)
+      return puts(JSON.pretty_generate(rows)) if @json
+      return puts("(no Subscribe & Save subscriptions)") if rows.empty?
+
+      headers = %w[next every qty subscription_id item]
+      # Everything but the title is fixed width; give the title the rest.
+      title_width = [term_width - 62, 24].max
+      data = rows.map do |r|
+        [
+          r["next_delivery_label"] || "?",
+          interval_phrase(r),
+          (r["quantity"] || "?").to_s,
+          r["subscription_id"],
+          truncate(r["title"], title_width)
+        ]
+      end
+      print_table(headers, data)
+      note = subscription_count_note(rows.size, total, loaded_all)
+      puts dim(note) if note
+    end
+
+    def deliveries(cards)
+      return puts(JSON.pretty_generate(cards)) if @json
+      return puts("(no scheduled Subscribe & Save deliveries)") if cards.empty?
+
+      cards.each_with_index do |card, i|
+        puts if i.positive?
+        puts delivery_heading(card)
+        # Only ever set on the delivery that is next out the door, and it is
+        # the one fact on this screen with a deadline attached.
+        puts "  #{bold(labelled(card, "editable_until", "Last day to edit:"))}" if card["editable_until"]
+        puts dim("  #{labelled(card, "savings", "Savings:")}") if card["savings"]
+        puts dim("  #{card["tiering"]}") if card["tiering"]
+        delivery_items(card)
+      end
+    end
+
     private
+
+    # Amazon's own label for a value, when it gave one. Its wording is more
+    # precise than anything invented here ("Estimated savings for this
+    # delivery:" vs "Savings:"), and on the savings line the label is doing
+    # load-bearing work: the value on its own is a bare "$1.95", which reads
+    # as a price.
+    def labelled(card, key, fallback)
+      label = card["#{key}_label"].to_s
+      "#{label.empty? ? fallback : label} #{card[key]}"
+    end
+
+    def delivery_heading(card)
+      when_ = card["date_label"] || card["date"] || "(undated)"
+      items = Array(card["items"]).size
+      head = "#{bold(when_)}  #{dim("#{plural(items, "item")}")}"
+      head += "  #{bold(format_money(card["subtotal"]))}" if card["subtotal"]
+      head += dim("  · next") if card["kind"] == "current"
+      head
+    end
+
+    def delivery_items(card)
+      title_width = [term_width - 30, 24].max
+      Array(card["items"]).each do |item|
+        # A future delivery has no prices at all, so the column is blank rather
+        # than $0.00 — the difference between "free" and "not priced yet".
+        price = item["price"] ? format_money(item["price"]).rjust(9) : " " * 9
+        line = "  #{price}  #{truncate(item["title"], title_width)}"
+        line += green("  #{item["discount"]}") if item["discount"]
+        puts line
+      end
+    end
+
+    # "1 month", "2 weeks" — or whatever Amazon said, if it didn't parse.
+    def interval_phrase(row)
+      count = row["interval_count"]
+      unit = row["interval_unit"]
+      return "#{count} #{unit}#{"s" unless count == 1}" if count && unit
+      row["schedule_raw"] || "?"
+    end
+
+    def subscription_count_note(shown, total, loaded_all)
+      return nil unless total
+      return nil if shown >= total
+      # Without --all a short list is expected and the note is an offer; with
+      # it, a short list means pagination gave up early and the worker has
+      # already said so on stderr. Saying "use --all" there would be advice to
+      # do the thing that just failed.
+      return "showing #{shown} of #{total} — pass --all for the rest" unless loaded_all
+      "showing #{shown} of the #{total} subscriptions Amazon reports"
+    end
 
     # Every empty result in this file goes through here, because a zero is not
     # self-explanatory: it can mean nothing was stored to look at, or that

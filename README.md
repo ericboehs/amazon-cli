@@ -102,6 +102,10 @@ date        order_id             total    status
 - **Price memory** — live results are cross-referenced against your order
   archive, so anything you've bought before shows the date and price you
   paid, plus the delta.
+- **Subscribe & Save** — `amazon subscribe list` shows every subscription
+  with its schedule and next delivery date; `amazon subscribe upcoming`
+  shows the scheduled deliveries themselves, with the prices Amazon has
+  committed to and the last day you can still change each one. Read-only.
 - **Incremental sync** — only fetches orders not already on disk. A `--full`
   flag re-fetches everything.
 - **Parallel detail fetches** — `ThreadPoolExecutor` with a tunable worker
@@ -125,6 +129,8 @@ lib/amazon/
     search.rb           live product search
     order.rb            `amazon order …` dispatcher
     order/              sync, list, show, search over the local archive
+    subscribe.rb        `amazon subscribe …` dispatcher
+    subscribe/          list, upcoming (Subscribe & Save, read-only)
     login.rb, config.rb, buy.rb
   config.rb             XDG paths, config load
   store.rb              JSON read/write, index, ASIN purchase history
@@ -135,9 +141,12 @@ lib/amazon/
 pyworker/
   fetch.py              order history: drives amazon-orders, emits NDJSON
   live.py               live product/search scraper
+  subscriptions.py      Subscribe & Save scraper (subscriptions + deliveries)
   browser.py            shared Playwright session + selector fallbacks
   login.py              Playwright headed login, persists cookies
   test_live.py          unittest for the parsing helpers (no browser needed)
+  test_subscriptions.py unittest for the S&S parsers, against captured markup
+  fixtures/             scrubbed HTML captured from real pages
   pyproject.toml        deps: amazon-orders, playwright
 web.rb                  single-file Sinatra browser
 test/web_test.rb        Minitest, 95% line + branch coverage gate
@@ -326,6 +335,51 @@ estimate that excludes tax (and, from a subtotal, shipping too).
 > (`amazon list`, `amazon sync`, …); they now require the `order` prefix,
 > and the old spellings print a pointer to the new one.
 
+### Subscribe & Save
+
+```bash
+amazon subscribe list                 # every subscription: next date, cadence, quantity
+amazon subscribe list --all           # click past the first 30
+amazon subscribe upcoming             # the deliveries themselves, with prices
+amazon subscribe upcoming --json | jq '.[0].subtotal'
+```
+
+```
+$ amazon subscribe upcoming
+Sep 2  3 items  $48.95  · next
+  Last day to edit delivery: Thursday, August 27
+  Estimated savings for this delivery: $1.95
+  Add 2 more subscriptions to this delivery and unlock extra savings up to 15%.
+     $14.22  Gain Liquid Laundry Detergent, Freshness, Odor De…  Saving 5%
+     $11.99  BodyMed Adjustable Heel Lift for Men and Woman, S…
+     $22.74  Viva Multi-Surface Cloth Paper Towels, 12 Super R…  Saving 5%
+
+September 30  16 items
+             Cascade Free & Clear Dishwasher Detergent Liquid …  Saving 15%
+             …
+```
+
+Two views of the same account, because Amazon keeps them on separate pages
+and each knows something the other doesn't. `list` is per-subscription:
+everything you're subscribed to and how often it ships. `upcoming` is
+per-shipment: those subscriptions regrouped into the boxes Amazon will
+actually send and charge for.
+
+**Prices exist only in `upcoming`.** The subscription list renders no price
+at all — the price isn't settled until the delivery is assembled and the
+tier discount (5% → 15%, by item count in that one box) is known. Only the
+next delivery is priced; later ones show the discount rate but no amount,
+which is why the price column above goes blank after the first block. A
+`$0.00` in that space would be a lie, so nothing is printed there.
+
+The list page loads 30 subscriptions and hides the rest behind a "show more"
+button, so plain `list` says `showing 30 of 59 — pass --all for the rest`
+rather than pretending 30 is all of them. `--all` clicks through (a few
+seconds for 59). If pagination stalls, you get the partial list plus a
+warning on stderr — never a short list that looks complete.
+
+Read-only for now: nothing here skips, reschedules, or cancels anything.
+
 ## Tuning sync speed
 
 The worker honors `rate_limit` keys in `config.json` plus the worker pool
@@ -363,6 +417,16 @@ from URL shapes, money parsing, the delivery-date parser (Amazon omits the
 year, so December→January has to roll forward), and the review-card parsers
 (day-first international dates, "One person found this helpful", histogram
 labels in either percent-first order).
+
+`pyworker/test_subscriptions.py` runs the Subscribe & Save parsers against
+scrubbed HTML captured from the real pages (`pyworker/fixtures/`), so the
+selectors are checked against markup Amazon actually served rather than
+markup I remembered. The fixtures carry fake subscription ids, ship ids,
+CSRF tokens, product titles, and addresses; nothing in them identifies an
+account. Pagination is exercised against a fake page that reproduces one
+measured Amazon quirk: clicking "show more" grows the DOM but leaves the
+server-rendered `loadedItemCount` frozen at its original value. Believing
+that counter is an infinite loop, and the fake is built to fail that way.
 
 `lib/amazon/reviews.rb` is pure and does no I/O, so it's tested directly
 against synthetic listings — a farmed one it should flag and a genuine one
@@ -412,7 +476,7 @@ identical to a pass. Two commands are honest about which suite you got:
 
 ```sh
 pyworker/.venv/bin/python -m unittest discover -s pyworker -p 'test_*.py'  # 0 skips
-/usr/bin/python3           -m unittest discover -s pyworker -p 'test_*.py'  # 27 skips
+/usr/bin/python3           -m unittest discover -s pyworker -p 'test_*.py'  # 63 skips
 ```
 
 The first is what `python-deps-test` runs; the second stands in for

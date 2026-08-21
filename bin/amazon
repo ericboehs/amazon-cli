@@ -25,5 +25,8 @@ require "amazon/commands/order/sync"
 require "amazon/commands/order/list"
 require "amazon/commands/order/show"
 require "amazon/commands/order/search"
+require "amazon/commands/subscribe"
+require "amazon/commands/subscribe/list"
+require "amazon/commands/subscribe/upcoming"
 
 exit(Amazon::CLI.run(ARGV))

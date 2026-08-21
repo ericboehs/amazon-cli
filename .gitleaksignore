@@ -1,0 +1,6 @@
+# Amazon names one of its page-state blocks `bulk-skip-pagination-<epoch-ms>`.
+# The generic-api-key rule reads the hyphens plus the 13-digit timestamp as a
+# high-entropy secret. It is a DOM element key in a scrubbed test fixture, and
+# `subscriptions.py` looks up page state by exactly these names, so renaming it
+# would make the fixture stop matching the markup it exists to pin.
+pyworker/fixtures/deliveries.html:generic-api-key:97

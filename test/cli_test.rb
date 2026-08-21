@@ -64,6 +64,9 @@ require 'amazon/commands/order/sync'
 require 'amazon/commands/order/list'
 require 'amazon/commands/order/show'
 require 'amazon/commands/order/search'
+require 'amazon/commands/subscribe'
+require 'amazon/commands/subscribe/list'
+require 'amazon/commands/subscribe/upcoming'
 
 require 'minitest/autorun'
 
@@ -3507,5 +3510,393 @@ class EmptyResultsSayWhatWasSearchedTest < Minitest::Test
       capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[--json item B0747R1M51 --fresh]) }
     end
     assert_equal 1, JSON.parse(out)['purchases_searched']
+  end
+end
+
+# --- subscribe & save --------------------------------------------------
+
+SAMPLE_SUBSCRIPTION = {
+  'subscription_id' => 'SNSD0_FIXTURESUB0000000001',
+  'title' => 'Example Dishwasher Detergent Gel, Lemon, 75oz',
+  'variation' => nil,
+  'next_delivery_label' => 'September 30',
+  'image' => 'https://m.media-amazon.com/images/I/00FIXTUREIMG.jpg',
+  'schedule_raw' => '1 unit every 1 month',
+  'quantity' => 1,
+  'interval_count' => 1,
+  'interval_unit' => 'month'
+}.freeze
+
+SAMPLE_DELIVERY = {
+  'date' => '2026-09-02',
+  'date_label' => 'Sep 2',
+  'kind' => 'current',
+  'editable_until' => 'Thursday, August 27',
+  'editable_until_label' => 'Last day to edit delivery:',
+  'savings' => '$1.95',
+  'savings_label' => 'Estimated savings for this delivery:',
+  'tiering' => 'Add 2 more subscriptions to this delivery and unlock extra savings up to 15%.',
+  'items' => [
+    { 'subscription_id' => 'SNSD0_FIXTURESUB0000000004', 'title' => 'Example Laundry Detergent',
+      'variation' => nil, 'price' => 14.22, 'price_raw' => '$14.22',
+      'discount' => 'Saving 5%', 'skippable' => true }
+  ],
+  'subtotal' => 14.22
+}.freeze
+
+FUTURE_DELIVERY = {
+  'date' => '2026-09-30', 'date_label' => 'September 30', 'kind' => 'future',
+  'editable_until' => nil, 'editable_until_label' => nil,
+  'savings' => nil, 'savings_label' => nil, 'tiering' => nil,
+  'items' => [
+    { 'subscription_id' => 'SNSD0_FIXTURESUB0000000005', 'title' => 'Example Paper Towels',
+      'variation' => nil, 'price' => nil, 'price_raw' => nil,
+      'discount' => nil, 'skippable' => false }
+  ],
+  'subtotal' => nil
+}.freeze
+
+# Records what it was asked for, so the flags can be checked at the seam rather
+# than by inspecting output that would look the same either way.
+class FakeSubscribeWorker
+  attr_reader :asked_all, :subscription_total
+
+  def initialize(rows: [SAMPLE_SUBSCRIPTION], cards: [SAMPLE_DELIVERY], total: nil)
+    @rows = rows
+    @cards = cards
+    @subscription_total = total
+  end
+
+  def subscriptions(all: false)
+    @asked_all = all
+    @rows
+  end
+
+  def deliveries = @cards
+end
+
+class SubscribeDispatchTest < Minitest::Test
+  def setup = write_config!
+
+  def test_help_mentions_the_namespace
+    out, = capture_io_streams { Amazon::CLI.run(['help']) }
+    assert_includes out, 'subscribe list'
+    assert_includes out, 'subscribe upcoming'
+  end
+
+  def test_bare_namespace_prints_usage_and_exits_2
+    out, = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[subscribe]) }
+    assert_includes out, 'Subcommands:'
+  end
+
+  def test_explicit_help_exits_0
+    %w[help -h --help].each do |flag|
+      out, = capture_io_streams { assert_equal 0, Amazon::CLI.run(['subscribe', flag]) }
+      assert_includes out, 'subscribe <subcommand>'
+    end
+  end
+
+  def test_unknown_subcommand
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[subscribe bogus]) }
+    assert_includes err, 'unknown subscribe subcommand: bogus'
+  end
+
+  def test_subcommands_route_through_the_namespace
+    with_command(Amazon::Commands::Subscribe, :List, result: 7) do
+      capture_io_streams { assert_equal 7, Amazon::CLI.run(%w[subscribe list]) }
+    end
+    with_command(Amazon::Commands::Subscribe, :Upcoming, result: 8) do
+      capture_io_streams { assert_equal 8, Amazon::CLI.run(%w[subscribe upcoming]) }
+    end
+  end
+end
+
+class SubscribeListCommandTest < Minitest::Test
+  def setup = write_config!
+
+  def test_it_lists_what_the_worker_returned
+    out, = with_worker(->(*) { FakeSubscribeWorker.new }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[subscribe list]) }
+    end
+    assert_includes out, 'SNSD0_FIXTURESUB0000000001'
+    assert_includes out, 'September 30'
+    assert_includes out, '1 month'
+  end
+
+  def test_all_is_passed_through_to_the_worker
+    fake = FakeSubscribeWorker.new
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list --all]) }
+    end
+    assert_equal true, fake.asked_all
+
+    fake = FakeSubscribeWorker.new
+    with_worker(->(*) { fake }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    assert_equal false, fake.asked_all
+  end
+
+  def test_json_output_is_the_worker_records_verbatim
+    out, = with_worker(->(*) { FakeSubscribeWorker.new }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[--json subscribe list]) }
+    end
+    assert_equal [SAMPLE_SUBSCRIPTION], JSON.parse(out)
+  end
+
+  def test_help_and_unknown_option
+    out, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[subscribe list --help]) }
+    assert_includes out, '--all'
+
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[subscribe list --nope]) }
+    assert_includes err, 'unknown list option: --nope'
+  end
+end
+
+class SubscribeUpcomingCommandTest < Minitest::Test
+  def setup = write_config!
+
+  def test_it_prints_each_delivery
+    out, = with_worker(->(*) { FakeSubscribeWorker.new(cards: [SAMPLE_DELIVERY, FUTURE_DELIVERY]) }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[subscribe upcoming]) }
+    end
+    assert_includes out, 'Sep 2'
+    assert_includes out, 'September 30'
+  end
+
+  def test_json_output
+    out, = with_worker(->(*) { FakeSubscribeWorker.new }) do
+      capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[--json subscribe upcoming]) }
+    end
+    assert_equal [SAMPLE_DELIVERY], JSON.parse(out)
+  end
+
+  def test_help_and_unknown_option
+    out, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[subscribe upcoming --help]) }
+    assert_includes out, '--json'
+
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[subscribe upcoming --nope]) }
+    assert_includes err, 'unknown upcoming option: --nope'
+  end
+end
+
+class SubscriptionFormatterTest < Minitest::Test
+  def fmt(json: false) = Amazon::Formatter.new(json: json, color: false)
+
+  def test_an_empty_list_says_so_rather_than_printing_a_bare_header
+    out, = capture_io_streams { fmt.subscriptions([], total: nil) }
+    assert_includes out, 'no Subscribe & Save subscriptions'
+  end
+
+  def test_an_empty_list_in_json_is_still_json
+    out, = capture_io_streams { fmt(json: true).subscriptions([], total: 0) }
+    assert_equal [], JSON.parse(out)
+  end
+
+  def test_a_partial_page_offers_the_flag_that_completes_it
+    out, = capture_io_streams { fmt.subscriptions([SAMPLE_SUBSCRIPTION], total: 59) }
+    assert_includes out, 'showing 1 of 59 — pass --all for the rest'
+  end
+
+  # After --all a short list means pagination gave up, and the worker has
+  # already said why on stderr. Repeating "pass --all" would be advice to retry
+  # the thing that just failed.
+  def test_a_partial_page_after_all_does_not_suggest_all_again
+    out, = capture_io_streams { fmt.subscriptions([SAMPLE_SUBSCRIPTION], total: 59, loaded_all: true) }
+    assert_includes out, 'showing 1 of the 59 subscriptions Amazon reports'
+    refute_includes out, 'pass --all'
+  end
+
+  def test_a_complete_list_says_nothing_about_counts
+    out, = capture_io_streams { fmt.subscriptions([SAMPLE_SUBSCRIPTION], total: 1) }
+    refute_includes out, 'showing'
+  end
+
+  def test_no_total_at_all_says_nothing_about_counts
+    out, = capture_io_streams { fmt.subscriptions([SAMPLE_SUBSCRIPTION], total: nil) }
+    refute_includes out, 'showing'
+  end
+
+  def test_a_multi_unit_interval_is_pluralised
+    row = SAMPLE_SUBSCRIPTION.merge('interval_count' => 6, 'interval_unit' => 'month')
+    out, = capture_io_streams { fmt.subscriptions([row], total: 1) }
+    assert_includes out, '6 months'
+  end
+
+  # An unparsed schedule still has to print the words Amazon showed the user,
+  # because that is the only copy of the schedule left.
+  def test_an_unparsed_schedule_falls_back_to_amazons_own_words
+    row = SAMPLE_SUBSCRIPTION.merge('interval_count' => nil, 'interval_unit' => nil,
+                                    'schedule_raw' => 'every so often')
+    out, = capture_io_streams { fmt.subscriptions([row], total: 1) }
+    assert_includes out, 'every so often'
+  end
+
+  def test_a_row_with_nothing_readable_prints_question_marks_not_blanks
+    row = SAMPLE_SUBSCRIPTION.merge('interval_count' => nil, 'interval_unit' => nil,
+                                    'schedule_raw' => nil, 'quantity' => nil,
+                                    'next_delivery_label' => nil)
+    out, = capture_io_streams { fmt.subscriptions([row], total: 1) }
+    assert_includes out, '?'
+  end
+end
+
+class DeliveriesFormatterTest < Minitest::Test
+  def fmt(json: false) = Amazon::Formatter.new(json: json, color: false)
+
+  def render(cards)
+    out, = capture_io_streams { fmt.deliveries(cards) }
+    out
+  end
+
+  def test_no_deliveries_says_so
+    assert_includes render([]), 'no scheduled Subscribe & Save deliveries'
+  end
+
+  def test_empty_in_json_is_still_json
+    out, = capture_io_streams { fmt(json: true).deliveries([]) }
+    assert_equal [], JSON.parse(out)
+  end
+
+  def test_the_next_delivery_shows_its_deadline_price_and_savings
+    out = render([SAMPLE_DELIVERY])
+    assert_includes out, 'Last day to edit delivery: Thursday, August 27'
+    assert_includes out, 'Estimated savings for this delivery: $1.95'
+    assert_includes out, '$14.22'
+    assert_includes out, 'Saving 5%'
+    assert_includes out, '· next'
+  end
+
+  # Amazon's savings value is a bare "$1.95". Without a label it reads as a
+  # price, so a missing label must still produce one.
+  def test_a_missing_label_falls_back_to_one_of_ours
+    out = render([SAMPLE_DELIVERY.merge('savings_label' => nil, 'editable_until_label' => '')])
+    assert_includes out, 'Savings: $1.95'
+    assert_includes out, 'Last day to edit: Thursday, August 27'
+  end
+
+  # A future delivery has no prices on Amazon's side. Printing $0.00 would say
+  # it is free; printing a subtotal of 0 would say the same thing louder.
+  def test_a_future_delivery_shows_no_prices_and_no_subtotal
+    out = render([FUTURE_DELIVERY])
+    refute_includes out, '$0.00'
+    assert_includes out, 'Example Paper Towels'
+    assert_includes out, '1 item'
+  end
+
+  def test_a_card_with_no_date_at_all_is_still_printed
+    out = render([FUTURE_DELIVERY.merge('date' => nil, 'date_label' => nil)])
+    assert_includes out, '(undated)'
+  end
+
+  def test_a_card_with_only_an_iso_date_uses_it
+    out = render([FUTURE_DELIVERY.merge('date_label' => nil)])
+    assert_includes out, '2026-09-30'
+  end
+
+  def test_items_are_optional
+    out = render([FUTURE_DELIVERY.merge('items' => nil)])
+    assert_includes out, '0 items'
+  end
+end
+
+class SubscribeWorkerProtocolTest < Minitest::Test
+  def worker(**kw) = Amazon::Worker.new(**kw)
+
+  def test_subscription_events_are_collected_with_the_total
+    # Single-quoted heredoc: `#{req['all']}` has to reach the child as source,
+    # not be interpolated here.
+    body = <<~'SCRIPT'
+      req = JSON.parse(STDIN.gets)
+      puts({event: 'log', level: 'info', msg: "all=#{req['all']}"}.to_json)
+      puts({event: 'subscription', data: { 'subscription_id' => 'SNSD0_1' }}.to_json)
+      puts({event: 'subscription', data: { 'subscription_id' => 'SNSD0_2' }}.to_json)
+      puts({event: 'done', count: 2, total: 59}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      w = worker(verbose: true)
+      rows = nil
+      _, err = capture_io_streams { rows = w.subscriptions(all: true) }
+      assert_equal %w[SNSD0_1 SNSD0_2], rows.map { |r| r['subscription_id'] }
+      # Two rows out of a claimed 59: the gap is the whole reason `done`
+      # carries a total the rows can't supply.
+      assert_equal 59, w.subscription_total
+      assert_includes err, 'all=true'
+    end
+  end
+
+  # The total is per-run state, and a second call that finds fewer must not
+  # inherit the first call's number — that is how "30 of 59" gets printed under
+  # a complete list of 12.
+  def test_the_total_is_reset_between_runs
+    with_python_cmd(<<~SCRIPT) do
+      STDIN.gets
+      puts({event: 'subscription', data: { 'subscription_id' => 'SNSD0_1' }}.to_json)
+      puts({event: 'done', count: 1, total: 59}.to_json)
+    SCRIPT
+      w = worker
+      capture_io_streams { w.subscriptions }
+      assert_equal 59, w.subscription_total
+    end
+
+    with_python_cmd(<<~SCRIPT) do
+      STDIN.gets
+      puts({event: 'done', count: 0}.to_json)
+    SCRIPT
+      w = worker
+      capture_io_streams { w.subscriptions }
+      capture_io_streams { w.subscriptions }
+      assert_nil w.subscription_total
+    end
+  end
+
+  def test_a_subscription_warning_reaches_stderr_without_verbose
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'log', level: 'warn', msg: 'every subscription came back with no title'}.to_json)
+      puts({event: 'done', count: 0}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      _, err = capture_io_streams { worker.subscriptions }
+      assert_includes err, '[worker:warn] every subscription came back with no title'
+    end
+  end
+
+  def test_an_expired_session_keeps_the_workers_own_wording
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: 'the saved session has expired. Run: amazon login', kind: 'not_logged_in'}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      err = assert_raises(Amazon::Worker::Error) { capture_io_streams { worker.subscriptions } }
+      assert_includes err.message, 'Run: amazon login'
+      refute_includes err.message, 'live lookup failed'
+    end
+  end
+
+  def test_delivery_events_are_collected
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'log', level: 'warn', msg: 'no future-deliveries URL'}.to_json)
+      puts({event: 'delivery', data: { 'date' => '2026-09-02' }}.to_json)
+      puts({event: 'done', count: 1}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      cards = nil
+      _, err = capture_io_streams { cards = worker.deliveries }
+      assert_equal ['2026-09-02'], cards.map { |c| c['date'] }
+      assert_includes err, 'no future-deliveries URL'
+    end
+  end
+
+  def test_a_delivery_failure_is_raised_with_the_prefix_that_names_it_as_ours
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: "RuntimeError: Amazon's page state has changed shape"}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      err = assert_raises(Amazon::Worker::Error) { capture_io_streams { worker.deliveries } }
+      assert_includes err.message, 'live lookup failed'
+    end
   end
 end

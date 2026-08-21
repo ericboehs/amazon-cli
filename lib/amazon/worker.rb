@@ -108,6 +108,44 @@ module Amazon
       results
     end
 
+    # Subscribe & Save. Same session and same failure modes as the live
+    # product lookups, so it shares `live_error` — an expired session is the
+    # single most likely way either ends, and it has one answer.
+    #
+    # `all:` pages through the whole list; without it Amazon's first page (~30)
+    # is what comes back. The count Amazon claims to hold is on the `done`
+    # event rather than in the rows, because "30 rows" and "30 of 59 rows" are
+    # different answers and the difference is invisible from the rows alone.
+    def subscriptions(all: false)
+      rows = []
+      @subscription_total = nil
+      run({ action: "subscriptions", all: all }, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "subscription" then rows << event["data"]
+        when "done"         then @subscription_total = event["total"]
+        when "log"          then log_event(event)
+        when "error"        then raise Error, live_error(event)
+        end
+      end
+      rows
+    end
+
+    # How many subscriptions Amazon says the account has, which is only the
+    # same as the number returned when the caller asked for all of them.
+    attr_reader :subscription_total
+
+    def deliveries
+      cards = []
+      run({ action: "deliveries" }, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "delivery" then cards << event["data"]
+        when "log"      then log_event(event)
+        when "error"    then raise Error, live_error(event)
+        end
+      end
+      cards
+    end
+
     class Progress
       BAR_WIDTH = 20
 
