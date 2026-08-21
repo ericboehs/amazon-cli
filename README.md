@@ -107,8 +107,9 @@ date        order_id             total    status
   `amazon subscribe upcoming` shows the deliveries themselves and the last
   day you can still change each one; `amazon subscribe show` opens one
   subscription in full. Reads cache for 30 minutes. `amazon subscribe skip`
-  drops one item from the next delivery and `amazon subscribe cancel` ends a
-  subscription for good — both need `--yes`, and both prove it worked before
+  drops one item from the next delivery, `amazon subscribe cancel` ends a
+  subscription for good, and `amazon subscribe schedule` changes quantity or
+  cadence — all three need `--yes`, and all three prove it worked before
   saying so.
 - **Incremental sync** — only fetches orders not already on disk. A `--full`
   flag re-fetches everything.
@@ -136,7 +137,7 @@ lib/amazon/
     secrets.rb          1Password reads, for sync and login
     thumbnail.rb        product photos in the terminal, via chafa
     subscribe.rb        `amazon subscribe …` dispatcher
-    subscribe/          list, upcoming, show, skip, cancel (Subscribe & Save)
+    subscribe/          list, upcoming, show, skip, cancel, schedule
     login.rb, config.rb, buy.rb
   config.rb             XDG paths, config load
   store.rb              JSON read/write, index, ASIN purchase history
@@ -370,6 +371,8 @@ amazon subscribe skip bodymed         # what skipping it would do — changes no
 amazon subscribe skip bodymed --yes   # actually drop it from the next delivery
 amazon subscribe cancel syringes      # what cancelling would cost — changes nothing
 amazon subscribe cancel syringes --yes --reason stopped_using
+amazon subscribe schedule cascade                     # current schedule + what it accepts
+amazon subscribe schedule cascade --qty 2 --every "2 months" --yes
 amazon subscribe list --no-image      # plain table, no product photos
 amazon subscribe list --fresh         # ignore the 30-minute cache
 amazon subscribe upcoming --json | jq '.[0].subtotal'
@@ -534,6 +537,42 @@ back.
 
 Cancelling is not reversible from this CLI. Amazon's page notes you can
 reactivate an item later on the website.
+
+#### Changing quantity and cadence
+
+```
+$ amazon subscribe schedule cascade --qty 2 --every "2 months"
+would change Cascade Free & Clear Dishwasher Detergent Liquid Gel, Lemon, 75oz
+  quantity       1 → 2
+  frequency      1 month → 2 months
+  next delivery  September 30 → October (Amazon's form sets this too)
+  Note: This will change how often you receive deliveries for this item, which
+  may also change discounts on some upcoming orders.
+  choices: quantity 1, 2, 3 · frequency 2 weeks…12 months (14) · next September…April (8)
+  nothing changed — pass --yes to apply
+```
+
+With no flags it just prints that — the current schedule and everything Amazon
+will accept for this item. Worth running first: quantity caps are per product,
+and they are not what you'd guess. Cascade allows 1–3; a box of syringes
+allows 1–30.
+
+**Read the `next delivery` line.** Amazon puts quantity, frequency and the
+next delivery date in one form behind one Apply button, and its date dropdown
+does not always hold the date your subscription currently shows — on this
+account it offered October 3 for a subscription arriving September 30. So
+applying a quantity change also moves the delivery. That row prints the move
+whether or not you asked for it, and stays quiet when the form already agrees.
+
+`--every` takes what you'd say out loud: `"2 months"`, `2mo`, `3 weeks`, `3w`.
+Amazon's own `2-m` works too. `--next` takes a month name. Anything Amazon
+doesn't offer for that item is refused *before* the form is touched, with the
+list of what it does — a form submitted with a bad value has already changed
+the schedule by the time you read the error.
+
+Unlike `skip` and `cancel`, this one is reversible: run it again. Verification
+re-reads your subscription list and compares the cadence the card now states
+against what you asked for.
 
 All three read-only views cache for 30 minutes, and a cached read says its age on stderr
 (`[cached 12 minutes ago — --fresh to re-read]`) — a schedule you changed on

@@ -106,6 +106,17 @@ CANCEL_REASON_SELECT = "#sns-cancellation-dropdown"
 CANCEL_CONFIRM = "#confirmCancelLink"
 CANCEL_FORM = "form[name=cancelForm]"
 
+# The change-schedule page. Quantity, frequency and the next delivery date are
+# three selects in one form behind a single Apply, which is the whole reason
+# this command reports the date it never asked to touch.
+SCHEDULE_LINK = "a.t-action-type-CHANGE_QUANTITY_FREQUENCY, .t-action-type-CHANGE_QUANTITY_FREQUENCY a"
+SCHEDULE_FORM = "form[action*=changeQtyFreqAction]"
+SCHEDULE_QTY = "select[name=changeQuantity]"
+SCHEDULE_FREQ = "select[name=changeFrequency]"
+SCHEDULE_DATE = "select[name=changeNextDeliveryDate]"
+SCHEDULE_APPLY = "#copaModalApplyButton"
+SCHEDULE_NOTE = ".consumption-pattern-container span"
+
 # `.a-truncate-full` is the untruncated copy Amazon keeps for screen readers;
 # `.a-truncate-cut` next to it is the visible one, ellipsised mid-word. Reading
 # the cut span would silently store "Cascade Free & Clear Dishwasher Detergent…"
@@ -791,6 +802,10 @@ def _card_by_query(page: Any, query: str) -> Any:
     return matches[0][0] if matches else None
 
 
+class ScheduleChoiceUnknown(RuntimeError):
+    """A quantity, frequency or date Amazon does not offer for this item."""
+
+
 class CancelReasonUnknown(RuntimeError):
     """The reason asked for is not one Amazon offers."""
 
@@ -801,6 +816,10 @@ class NotSkippable(RuntimeError):
 
 class NotCancellable(RuntimeError):
     """Amazon will not offer a cancellation for this subscription."""
+
+
+class NotSchedulable(RuntimeError):
+    """Amazon will not offer a schedule change for this subscription."""
 
 
 def open_deliveries_tab(page: Any) -> None:
@@ -986,6 +1005,207 @@ DOUBLED_MONEY_RE = re.compile(r"(\$[\d,]+(?:\.\d+)?)\s*\1")
 def savings_text(scope: Any, selector: str) -> str | None:
     raw = text(scope, selector)
     return DOUBLED_MONEY_RE.sub(r"\1", raw) if raw else raw
+
+
+def select_options(scope: Any, selector: str) -> list[dict[str, Any]]:
+    """Every <option> under `selector`, with which one is currently chosen."""
+    out = []
+    for opt in _cards(scope, f"{selector} option"):
+        try:
+            value = opt.get_attribute("value")
+            if not value:
+                continue
+            out.append(
+                {
+                    "value": value,
+                    "label": clean_text(opt.inner_text()) or value,
+                    "selected": opt.get_attribute("selected") is not None,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def selected_option(options: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    for opt in options:
+        if opt["selected"]:
+            return opt
+    return None
+
+
+# "2 months", "2 month", "2mo", "2m", and Amazon's own "2-m" all mean the same
+# thing to a person typing in a hurry, and none of them is the string in the
+# markup. Normalising to Amazon's value is the only comparison that works.
+FREQUENCY_RE = re.compile(r"^\s*(\d+)\s*[-\s]?\s*(w|wk|wks|week|weeks|m|mo|mos|month|months)\s*$", re.I)
+
+
+def normalize_frequency(wanted: str) -> str | None:
+    m = FREQUENCY_RE.match(wanted or "")
+    if not m:
+        return None
+    unit = "w" if m.group(2).lower().startswith("w") else "m"
+    return f"{m.group(1)}-{unit}"
+
+
+def choose_option(
+    options: Sequence[dict[str, Any]], wanted: str | None, what: str, normalize: Any = None
+) -> dict[str, Any] | None:
+    """The option a user meant, or a refusal naming everything on offer.
+
+    Refusing beats falling back to the current value: an unrecognised
+    `--every 6weeks` that quietly applied "1 month" would report success for a
+    change that never happened.
+    """
+    if wanted is None:
+        return None
+    needle = str(wanted).strip().lower()
+    candidates = {needle}
+    if normalize and (norm := normalize(needle)):
+        candidates.add(norm)
+    for opt in options:
+        if opt["value"].lower() in candidates or opt["label"].lower() in candidates:
+            return opt
+    offered = ", ".join(o["label"] for o in options)
+    raise ScheduleChoiceUnknown(f"Amazon does not offer {what} {wanted!r} for this item. It offers: {offered}")
+
+
+def open_schedule_page(page: Any, card: Any) -> None:
+    """Modal, then the schedule page the modal links to.
+
+    Built by following Amazon's own link rather than by assembling the URL:
+    it carries a shipId and a sourcePage this code would otherwise have to
+    guess, and a guessed one lands on a page that renders no form.
+    """
+    url = edit_modal_url(card)
+    if not url:
+        raise RuntimeError(
+            "that subscription's card no longer publishes an edit-modal URL — "
+            "Amazon's markup has changed shape"
+        )
+    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(1200)
+    link = page.locator(SCHEDULE_LINK).first
+    if not _clickable(link):
+        raise NotSchedulable(
+            "Amazon does not offer a schedule change for this subscription"
+        )
+    href = link.get_attribute("href")
+    page.goto(href, wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(PAGE_SETTLE_MS)
+    guard(page)
+    if page.locator(SCHEDULE_FORM).count() == 0:
+        raise NotSchedulable("Amazon's change-schedule page rendered no form")
+
+
+def change_schedule(
+    page: Any,
+    sub_id: str | None,
+    query: str | None,
+    confirm: bool,
+    quantity: str | None = None,
+    frequency: str | None = None,
+    next_date: str | None = None,
+) -> dict[str, Any]:
+    """Change how much and how often, or read back what changing would do."""
+    card = find_subscription_card(page, sub_id, query)
+    resolved = card.get_attribute("data-subscription-id")
+    from_card = scrape_subscription_card(card) or {}
+
+    open_schedule_page(page, card)
+    quantities = select_options(page, SCHEDULE_QTY)
+    frequencies = select_options(page, SCHEDULE_FREQ)
+    dates = select_options(page, SCHEDULE_DATE)
+
+    wanted = {
+        "quantity": choose_option(quantities, quantity, "a quantity of"),
+        "frequency": choose_option(frequencies, frequency, "a frequency of", normalize_frequency),
+        "next_date": choose_option(dates, next_date, "a next delivery in"),
+    }
+    current = {
+        "quantity": selected_option(quantities),
+        "frequency": selected_option(frequencies),
+        "next_date": selected_option(dates),
+    }
+
+    result = {
+        "subscription_id": resolved,
+        "title": from_card.get("title"),
+        # The card's date, which is the one the user has seen. The form's date
+        # dropdown is a separate claim and gets its own field below.
+        "next_delivery_label": from_card.get("next_delivery_label"),
+        "next_delivery_date": from_card.get("next_delivery_date"),
+        "current": {k: (v or {}).get("label") for k, v in current.items()},
+        "wanted": {k: (v or {}).get("label") for k, v in wanted.items()},
+        "choices": {
+            "quantity": [o["label"] for o in quantities],
+            "frequency": [o["label"] for o in frequencies],
+            "next_date": [o["label"] for o in dates],
+        },
+        "note": schedule_note(page),
+        "applied": False,
+        "verified": None,
+    }
+    if not confirm:
+        return result
+
+    if not any(wanted.values()):
+        raise ScheduleChoiceUnknown(
+            "nothing to change — pass --qty, --every, or --next"
+        )
+
+    for selector, key in ((SCHEDULE_QTY, "quantity"), (SCHEDULE_FREQ, "frequency"), (SCHEDULE_DATE, "next_date")):
+        if wanted[key]:
+            page.select_option(selector, wanted[key]["value"])
+
+    apply_button = page.locator(SCHEDULE_APPLY).first
+    if not _clickable(apply_button):
+        raise RuntimeError("the change-schedule page has no Apply button")
+    apply_button.click(timeout=CLICK_TIMEOUT_MS)
+    page.wait_for_timeout(PAGE_SETTLE_MS)
+    result["applied"] = True
+    result["verified"] = verify_schedule(page, resolved, wanted)
+    return result
+
+
+def schedule_note(page: Any) -> str | None:
+    """Amazon's warning that changing frequency can move discounts."""
+    for said in _texts(page, SCHEDULE_NOTE):
+        if said.startswith("Note:"):
+            return said
+    return None
+
+
+def verify_schedule(page: Any, sub_id: str, wanted: dict[str, Any]) -> bool | None:
+    """Re-read the card and check the schedule it now shows is the one asked for.
+
+    Only quantity and frequency are checked, because they are the two the card
+    states in words it parses ("2 units every 2 months"). The delivery date is
+    reported from the re-read rather than asserted — Amazon states it as a
+    month on the form and a full date on the card, and a mismatch between those
+    two is a difference in wording, not evidence of a failure.
+    """
+    try:
+        open_subscription_list(page)
+        load_all_pages(page)
+        card = _card_by_id(page, sub_id)
+        if card is None:
+            return None
+        after = scrape_subscription_card(card) or {}
+        for key, field in (("quantity", "quantity"), ("frequency", None)):
+            opt = wanted[key]
+            if not opt:
+                continue
+            if key == "quantity":
+                if str(after.get(field)) != opt["label"]:
+                    return False
+            elif normalize_frequency(
+                f"{after.get('interval_count')} {after.get('interval_unit') or ''}"
+            ) != opt["value"]:
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def cancel_reasons(page: Any) -> list[dict[str, str]]:
@@ -1307,6 +1527,33 @@ def main() -> int:
                     )
                     emit("done", count=1)
 
+                elif action == "schedule":
+                    sub_id = req.get("subscription_id")
+                    query = req.get("query")
+                    if not sub_id and not query:
+                        emit("error", msg="schedule requires subscription_id or query")
+                        return 2
+                    confirm = bool(req.get("confirm"))
+                    emit(
+                        "log",
+                        level="info",
+                        msg=("changing the schedule for " if confirm else "reading the schedule for ")
+                        + f"{sub_id or query}",
+                    )
+                    emit(
+                        "schedule",
+                        data=change_schedule(
+                            page,
+                            sub_id,
+                            query,
+                            confirm,
+                            req.get("quantity"),
+                            req.get("frequency"),
+                            req.get("next_date"),
+                        ),
+                    )
+                    emit("done", count=1)
+
                 else:
                     emit("error", msg=f"unknown action: {action!r}")
                     return 2
@@ -1320,6 +1567,9 @@ def main() -> int:
         return 1
     except (NotCancellable, CancelReasonUnknown) as e:
         emit("error", msg=str(e), kind="not_cancellable")
+        return 2
+    except (NotSchedulable, ScheduleChoiceUnknown) as e:
+        emit("error", msg=str(e), kind="not_schedulable")
         return 2
     except NotSkippable as e:
         # Not a failure of ours and not a user typo either — the account is

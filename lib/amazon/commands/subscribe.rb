@@ -9,7 +9,7 @@ module Amazon
     # that mutates a subscription and can't prove it worked is worse than one
     # that doesn't exist.
     class SubscribeNamespace
-      SUBCOMMANDS = %w[list upcoming show skip cancel].freeze
+      SUBCOMMANDS = %w[list upcoming show skip cancel schedule].freeze
 
       def initialize(global)
         @global = global
@@ -26,6 +26,7 @@ module Amazon
         when "show"     then Subscribe::Show.new(@global).run(argv)
         when "skip"     then Subscribe::Skip.new(@global).run(argv)
         when "cancel"   then Subscribe::Cancel.new(@global).run(argv)
+        when "schedule" then Subscribe::Schedule.new(@global).run(argv)
         else
           warn "unknown subscribe subcommand: #{sub}"
           warn help_text
@@ -46,11 +47,13 @@ module Amazon
             show      One subscription in full: ASIN, seller, savings to date
             skip      Drop one item from the next delivery (needs --yes)
             cancel    End a subscription for good (needs --yes)
+            schedule  Change quantity or how often it ships (needs --yes)
 
           The first three read Amazon live through the session `amazon login`
           saved, and cache for 30 minutes. `skip` and `cancel` change things,
-          and neither will without --yes. `skip` misses one delivery; `cancel`
-          ends the subscription and the pending order with it.
+          and none of them will without --yes. `skip` misses one delivery;
+          `cancel` ends the subscription and the pending order with it;
+          `schedule` changes quantity or interval and can be run again.
 
           Run `amazon subscribe <subcommand> --help` for subcommand options.
         HELP

@@ -165,6 +165,12 @@ module Amazon
       detail
     end
 
+    # Worker errors that are facts about the account rather than failures of
+    # ours: a search that matched nothing, a delivery with nothing to skip, a
+    # subscription Amazon won't cancel or reschedule. They read back in
+    # Amazon's words and exit like refusals instead of raising.
+    REFUSALS = %w[not_found not_skippable not_cancellable not_schedulable].freeze
+
     # Amazon's own words for why nothing matched — "no active subscription
     # matching …" or the list of things that matched too many. Worth passing
     # through verbatim rather than restating from the Ruby side.
@@ -183,7 +189,7 @@ module Amazon
         when "skip" then result = event["data"]
         when "log"  then log_event(event)
         when "error"
-          raise Error, live_error(event) unless %w[not_found not_skippable].include?(event["kind"])
+          raise Error, live_error(event) unless REFUSALS.include?(event["kind"])
 
           @not_found = event["msg"]
         end
@@ -202,9 +208,29 @@ module Amazon
         when "cancel" then result = event["data"]
         when "log"    then log_event(event)
         when "error"
-          unless %w[not_found not_skippable not_cancellable].include?(event["kind"])
-            raise Error, live_error(event)
-          end
+          raise Error, live_error(event) unless REFUSALS.include?(event["kind"])
+
+          @not_found = event["msg"]
+        end
+      end
+      result
+    end
+
+    # Change quantity/frequency/next date, or read back what changing would
+    # do. `confirm: false` stops at the page that describes it.
+    def schedule(id_or_query, confirm:, quantity: nil, frequency: nil, next_date: nil)
+      result = nil
+      key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
+      request = {
+        action: "schedule", key => id_or_query, confirm: confirm,
+        quantity: quantity, frequency: frequency, next_date: next_date
+      }
+      run(request, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "schedule" then result = event["data"]
+        when "log"      then log_event(event)
+        when "error"
+          raise Error, live_error(event) unless REFUSALS.include?(event["kind"])
 
           @not_found = event["msg"]
         end

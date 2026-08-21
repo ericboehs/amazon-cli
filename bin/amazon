@@ -34,6 +34,7 @@ require "amazon/commands/subscribe/list"
 require "amazon/commands/subscribe/show"
 require "amazon/commands/subscribe/skip"
 require "amazon/commands/subscribe/cancel"
+require "amazon/commands/subscribe/schedule"
 require "amazon/commands/subscribe/upcoming"
 
 exit(Amazon::CLI.run(ARGV))

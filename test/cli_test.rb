@@ -73,6 +73,7 @@ require 'amazon/commands/subscribe/list'
 require 'amazon/commands/subscribe/show'
 require 'amazon/commands/subscribe/skip'
 require 'amazon/commands/subscribe/cancel'
+require 'amazon/commands/subscribe/schedule'
 require 'amazon/commands/subscribe/upcoming'
 
 require 'minitest/autorun'
@@ -3666,7 +3667,17 @@ class FakeSubscribeWorker
     @cancel_result.merge('cancelled' => confirm)
   end
 
-  attr_reader :asked_for, :asked_confirm, :asked_reason
+  def schedule(target, confirm:, quantity: nil, frequency: nil, next_date: nil)
+    @calls += 1
+    @asked_for = target
+    @asked_confirm = confirm
+    @asked_schedule = { quantity: quantity, frequency: frequency, next_date: next_date }
+    return nil unless @schedule_result
+
+    @schedule_result.merge('applied' => confirm)
+  end
+
+  attr_reader :asked_for, :asked_confirm, :asked_reason, :asked_schedule
 
   def with_skip(result)
     @skip_result = result
@@ -3677,7 +3688,30 @@ class FakeSubscribeWorker
     @cancel_result = result
     self
   end
+
+  def with_schedule(result)
+    @schedule_result = result
+    self
+  end
 end
+
+SAMPLE_SCHEDULE = {
+  'subscription_id' => 'SNSD0_FIXTURESUB0000000001',
+  'title' => 'Example Dishwasher Detergent Gel, Lemon, 75oz',
+  'next_delivery_label' => 'Wednesday, September 30',
+  'next_delivery_date' => '2026-09-30',
+  'current' => { 'quantity' => '1', 'frequency' => '1 month', 'next_date' => 'October' },
+  'wanted' => { 'quantity' => nil, 'frequency' => nil, 'next_date' => nil },
+  'choices' => {
+    'quantity' => %w[1 2 3],
+    'frequency' => ['2 weeks', '3 weeks', '4 weeks', '1 month', '2 months', '3 months', '12 months'],
+    'next_date' => %w[September October November December]
+  },
+  'note' => 'Note: This will change how often you receive deliveries for this item, ' \
+            'which may also change discounts on some upcoming orders.',
+  'applied' => false,
+  'verified' => nil
+}.freeze
 
 SAMPLE_CANCEL = {
   'subscription_id' => 'SNSD0_FIXTURESUB0000000001',
@@ -4534,12 +4568,14 @@ class SubscribeWorkerProtocolTest < Minitest::Test
   def test_cancel_sends_the_target_the_confirm_flag_and_the_reason
     body = <<~'SCRIPT'
       req = JSON.parse(STDIN.gets)
+      puts({event: 'log', level: 'warn', msg: 'the cancel page rendered no savings banner'}.to_json)
       puts({event: 'cancel', data: req}.to_json)
       puts({event: 'done', count: 1}.to_json)
     SCRIPT
     with_python_cmd(body) do
       result = nil
-      capture_io_streams { result = worker.cancel('SNSD0_ABC', confirm: true, reason: 'accident') }
+      _, err = capture_io_streams { result = worker.cancel('SNSD0_ABC', confirm: true, reason: 'accident') }
+      assert_includes err, '[worker:warn] the cancel page rendered no savings banner'
       assert_equal 'SNSD0_ABC', result['subscription_id']
       assert_equal 'accident', result['reason']
       assert result['confirm']
@@ -4563,6 +4599,61 @@ class SubscribeWorkerProtocolTest < Minitest::Test
       capture_io_streams { result = w.cancel('dishwasher', confirm: true, reason: 'cats') }
       assert_nil result
       assert_includes w.not_found, 'unknown cancellation reason'
+    end
+  end
+
+  # Three fields go over the wire, and a nil among them has to stay nil: a
+  # schedule request that filled in the current quantity "helpfully" would be
+  # indistinguishable from one that asked to change it.
+  def test_schedule_sends_only_what_was_asked_for
+    body = <<~'SCRIPT'
+      req = JSON.parse(STDIN.gets)
+      puts({event: 'log', level: 'warn', msg: 'the form rendered no note'}.to_json)
+      puts({event: 'schedule', data: req}.to_json)
+      puts({event: 'done', count: 1}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      result = nil
+      _, err = capture_io_streams do
+        result = worker.schedule('dishwasher', confirm: true, frequency: '2 months')
+      end
+      assert_equal 'dishwasher', result['query']
+      assert_equal '2 months', result['frequency']
+      assert_nil result['quantity']
+      assert_nil result['next_date']
+      assert result['confirm']
+      assert_includes err, '[worker:warn] the form rendered no note'
+
+      capture_io_streams { result = worker.schedule('SNSD0_ABC', confirm: false, quantity: '2') }
+      assert_equal 'SNSD0_ABC', result['subscription_id']
+      assert_equal '2', result['quantity']
+    end
+  end
+
+  def test_a_schedule_amazon_will_not_accept_is_reported_not_raised
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: 'Amazon does not offer a quantity of 9', kind: 'not_schedulable'}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      w = worker
+      result = nil
+      capture_io_streams { result = w.schedule('dishwasher', confirm: true, quantity: '9') }
+      assert_nil result
+      assert_includes w.not_found, 'does not offer a quantity'
+    end
+  end
+
+  def test_a_real_failure_during_schedule_still_raises
+    body = <<~SCRIPT
+      STDIN.gets
+      puts({event: 'error', msg: 'Timeout: the schedule page never loaded'}.to_json)
+    SCRIPT
+    with_python_cmd(body) do
+      err = assert_raises(Amazon::Worker::Error) do
+        capture_io_streams { worker.schedule('dishwasher', confirm: true, quantity: '2') }
+      end
+      assert_includes err.message, 'live lookup failed'
     end
   end
 
@@ -5810,5 +5901,189 @@ class SubscribeCancelCommandTest < Minitest::Test
   def test_the_namespace_lists_it
     out, = capture_io_streams { Amazon::CLI.run(%w[subscribe]) }
     assert_includes out, 'cancel'
+  end
+end
+
+# `schedule` is the reversible mutation, so the grading leans on what it says
+# rather than on what it refuses — in particular on the delivery date it moves
+# without being asked to.
+class SubscribeScheduleCommandTest < Minitest::Test
+  def setup
+    write_config!
+    reset_subscribe_cache!
+  end
+
+  def worker(result = SAMPLE_SCHEDULE)
+    FakeSubscribeWorker.new.with_schedule(result)
+  end
+
+  def run_schedule(argv, worker = worker())
+    out = err = nil
+    code = with_worker(->(*) { worker }) do
+      out, err = capture_io_streams { @code = Amazon::CLI.run(argv) }
+      @code
+    end
+    [out, err, code]
+  end
+
+  def wanting(**pairs)
+    worker(SAMPLE_SCHEDULE.merge('wanted' => SAMPLE_SCHEDULE['wanted'].merge(pairs.transform_keys(&:to_s))))
+  end
+
+  # No flags at all is a legitimate question — "what will this item accept?" —
+  # and it exits 0 because it answered.
+  def test_with_no_flags_it_prints_the_current_schedule_and_the_choices
+    out, _err, code = run_schedule(%w[subscribe schedule dishwasher])
+    assert_equal 0, code
+    assert_includes out, 'quantity'
+    assert_includes out, '1 month'
+    assert_includes out, 'choices:'
+  end
+
+  # Fourteen frequencies is a paragraph nobody reads. The ends of the range
+  # carry the information.
+  def test_long_choice_lists_are_summarized_by_their_ends
+    out, = run_schedule(%w[subscribe schedule dishwasher])
+    assert_includes out, '2 weeks…12 months (7)'
+    assert_includes out, '1, 2, 3'
+  end
+
+  def test_a_dry_run_shows_the_change_as_an_arrow
+    out, = run_schedule(%w[subscribe schedule dishwasher --qty 2], wanting(quantity: '2'))
+    assert_includes out, 'would change'
+    assert_match(/1 .*→.* 2/, out)
+    assert_includes out, 'pass --yes'
+  end
+
+  # The trap: Amazon's form holds October while the subscription says
+  # September 30, and one Apply submits all three fields.
+  def test_it_warns_that_applying_moves_the_delivery_date_too
+    out, = run_schedule(%w[subscribe schedule dishwasher --qty 2], wanting(quantity: '2'))
+    assert_includes out, 'September 30'
+    assert_includes out, 'October'
+    assert_includes out, "Amazon's form sets this too"
+  end
+
+  # ...but only when it really would move. A form already showing the current
+  # date must not cry wolf.
+  def test_no_warning_when_the_form_agrees_with_the_subscription
+    agreed = SAMPLE_SCHEDULE.merge(
+      'current' => SAMPLE_SCHEDULE['current'].merge('next_date' => 'September')
+    )
+    out, = run_schedule(%w[subscribe schedule dishwasher], worker(agreed))
+    refute_includes out, "Amazon's form sets this too"
+  end
+
+  def test_an_asked_for_date_is_shown_as_the_change_it_is
+    out, = run_schedule(%w[subscribe schedule dishwasher --next November], wanting(next_date: 'November'))
+    assert_includes out, 'November'
+    refute_includes out, "Amazon's form sets this too"
+  end
+
+  def test_amazons_note_about_discounts_is_repeated
+    out, = run_schedule(%w[subscribe schedule dishwasher --every 2mo], wanting(frequency: '2 months'))
+    assert_includes out, 'may also change discounts'
+  end
+
+  def test_every_and_qty_reach_the_worker_in_both_spellings
+    w = worker
+    run_schedule(['subscribe', 'schedule', 'dishwasher', '--qty', '2', '--every', '2 months'], w)
+    assert_equal({ quantity: '2', frequency: '2 months', next_date: nil }, w.asked_schedule)
+    run_schedule(['subscribe', 'schedule', 'dishwasher', '--quantity=3', '--frequency=3 weeks',
+                  '--next=November'], w)
+    assert_equal({ quantity: '3', frequency: '3 weeks', next_date: 'November' }, w.asked_schedule)
+  end
+
+  def test_yes_applies_and_reports_the_verification
+    w = wanting(quantity: '2')
+    w.with_schedule(w.instance_variable_get(:@schedule_result).merge('verified' => true))
+    out, _err, code = run_schedule(%w[subscribe schedule dishwasher --qty 2 --yes], w)
+    assert_equal 0, code
+    assert w.asked_confirm
+    assert_includes out, 'changed'
+    assert_includes out, 'subscription list agrees'
+  end
+
+  def test_a_schedule_that_did_not_move_is_reported_loudly
+    w = wanting(quantity: '2')
+    w.with_schedule(w.instance_variable_get(:@schedule_result).merge('verified' => false))
+    out, = run_schedule(%w[subscribe schedule dishwasher --qty 2 --yes], w)
+    assert_includes out, 'still shows the old schedule'
+  end
+
+  def test_a_check_that_could_not_be_made_is_not_reported_as_failure
+    w = wanting(quantity: '2')
+    out, = run_schedule(%w[subscribe schedule dishwasher --qty 2 --yes], w)
+    assert_includes out, "couldn't re-read"
+    refute_includes out, 'still shows the old schedule'
+  end
+
+  # Caught before a browser opens: --yes with nothing to apply would submit
+  # Amazon's form with every field set to what it already said, which does
+  # nothing except move the delivery date.
+  def test_yes_with_nothing_to_change_is_refused_without_asking_amazon
+    w = worker
+    _out, err, code = run_schedule(%w[subscribe schedule dishwasher --yes], w)
+    assert_equal 2, code
+    assert_includes err, 'nothing to change'
+    assert_equal 0, w.calls
+  end
+
+  def test_a_confirmed_change_clears_the_cache
+    w = wanting(quantity: '2')
+    reads = nil
+    with_worker(->(*) { w }) do
+      capture_io_streams do
+        Amazon::CLI.run(%w[subscribe list])
+        before = w.calls
+        Amazon::CLI.run(%w[subscribe schedule dishwasher --qty 2 --yes])
+        Amazon::CLI.run(%w[subscribe list])
+        reads = w.calls - before - 1
+      end
+    end
+    assert_equal 1, reads, 'the list would still show the old cadence'
+  end
+
+  def test_json_is_the_whole_record
+    out, = run_schedule(%w[--json subscribe schedule dishwasher --qty 2 --yes], wanting(quantity: '2'))
+    parsed = JSON.parse(out)
+    assert parsed['applied']
+    assert_equal 3, parsed['choices']['quantity'].length
+  end
+
+  def test_a_choice_amazon_does_not_offer_comes_back_as_a_refusal
+    w = FakeSubscribeWorker.new(not_found: "Amazon does not offer a quantity of '9' for this item. It offers: 1, 2, 3")
+    _out, err, code = run_schedule(%w[subscribe schedule dishwasher --qty 9 --yes], w)
+    assert_equal 2, code
+    assert_includes err, 'It offers: 1, 2, 3'
+  end
+
+  def test_it_needs_something_to_reschedule
+    _out, err, code = run_schedule(%w[subscribe schedule])
+    assert_equal 2, code
+    assert_includes err, 'usage:'
+  end
+
+  def test_it_takes_one_subscription_at_a_time
+    _out, err, code = run_schedule(['subscribe', 'schedule', 'dish', 'mop'])
+    assert_equal 2, code
+    assert_includes err, 'one subscription at a time'
+  end
+
+  def test_unknown_options_are_refused
+    _out, err, code = run_schedule(%w[subscribe schedule dishwasher --often])
+    assert_equal 2, code
+    assert_includes err, 'unknown schedule option'
+  end
+
+  def test_the_help_says_the_change_is_reversible
+    out, = capture_io_streams { assert_equal 0, Amazon::CLI.run(%w[subscribe schedule --help]) }
+    assert_includes out, 'reversible'
+    assert_includes out, '--every'
+  end
+
+  def test_the_namespace_lists_it
+    out, = capture_io_streams { Amazon::CLI.run(%w[subscribe]) }
+    assert_includes out, 'schedule'
   end
 end

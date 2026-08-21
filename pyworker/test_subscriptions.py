@@ -33,6 +33,10 @@ from subscriptions import (
     CANCEL_HEADING,
     CANCEL_REASON_SELECT,
     CANCEL_SAVINGS,
+    SCHEDULE_APPLY,
+    SCHEDULE_DATE,
+    SCHEDULE_FREQ,
+    SCHEDULE_QTY,
     SCHEDULE_SELECTOR,
     SKIP_BUTTON,
     SUBSCRIPTION_CARD,
@@ -40,7 +44,9 @@ from subscriptions import (
     CancelReasonUnknown,
     NoSuchSubscription,
     NotCancellable,
+    NotSchedulable,
     NotSkippable,
+    ScheduleChoiceUnknown,
     _cards,
     _card_by_query,
     _clickable,
@@ -62,8 +68,15 @@ from subscriptions import (
     _texts,
     cancel_reasons,
     cancel_subscription,
+    choose_option,
     choose_reason,
+    change_schedule,
+    normalize_frequency,
     savings_text,
+    schedule_note,
+    select_options,
+    selected_option,
+    verify_schedule,
     open_deliveries_tab,
     skip_delivery_item,
     verify_cancelled,
@@ -1432,3 +1445,251 @@ class CancelSubscriptionTest(unittest.TestCase):
         with self.assertRaises(NoSuchSubscription):
             self.cancel(query="bicycle")
         self.assertFalse(any("cancelSubscription" in u for u in self.page.gotos))
+
+
+class NormalizeFrequencyTest(unittest.TestCase):
+    """Amazon's value is "2-m". Nobody types that."""
+
+    def test_the_ways_a_person_writes_two_months(self):
+        for said in ("2 months", "2 month", "2mo", "2 mo", "2m", "2-m", "2 Months"):
+            self.assertEqual(normalize_frequency(said), "2-m", said)
+
+    def test_weeks_too(self):
+        for said in ("3 weeks", "3w", "3 wk", "3-w"):
+            self.assertEqual(normalize_frequency(said), "3-w", said)
+
+    # "monthly" has no number in it, and guessing 1 would be inventing a
+    # quantity the user did not type.
+    def test_things_that_are_not_a_frequency(self):
+        for said in ("monthly", "", "soon", "every month", "2 years", None):
+            self.assertIsNone(normalize_frequency(said))
+
+
+class ScheduleOptionsTest(unittest.TestCase):
+    """The three dropdowns, read off the captured change-schedule page."""
+
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        self.page = DomPage.from_fixture("change_schedule.html")
+
+    def test_quantity_offers_what_this_product_allows(self):
+        # Three, on this item. Hard-coding a range would be wrong on the next.
+        self.assertEqual([o["label"] for o in select_options(self.page, SCHEDULE_QTY)], ["1", "2", "3"])
+
+    def test_frequency_carries_both_the_value_and_the_words(self):
+        freqs = select_options(self.page, SCHEDULE_FREQ)
+        self.assertEqual(len(freqs), 14)
+        two_months = next(o for o in freqs if o["value"] == "2-m")
+        self.assertEqual(two_months["label"], "2 months")
+
+    def test_the_current_selection_is_readable(self):
+        self.assertEqual(selected_option(select_options(self.page, SCHEDULE_QTY))["label"], "1")
+        self.assertEqual(selected_option(select_options(self.page, SCHEDULE_FREQ))["value"], "1-m")
+
+    # The trap this command exists to report: the form's date dropdown is not
+    # the date the subscription currently shows.
+    def test_the_date_dropdown_has_its_own_idea_of_the_next_delivery(self):
+        dates = select_options(self.page, SCHEDULE_DATE)
+        self.assertEqual(selected_option(dates)["label"], "October")
+        self.assertEqual(dates[0]["label"], "September")
+
+    def test_amazons_note_about_discounts_is_found(self):
+        note = schedule_note(self.page)
+        self.assertTrue(note.startswith("Note:"))
+        self.assertIn("discounts", note)
+
+    def test_a_page_without_the_note_says_nothing(self):
+        self.assertIsNone(schedule_note(DomPage("<div></div>")))
+
+
+class ChooseOptionTest(unittest.TestCase):
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        page = DomPage.from_fixture("change_schedule.html")
+        self.freqs = select_options(page, SCHEDULE_FREQ)
+        self.qtys = select_options(page, SCHEDULE_QTY)
+
+    def test_nothing_asked_for_is_not_a_choice(self):
+        self.assertIsNone(choose_option(self.freqs, None, "a frequency of"))
+
+    def test_a_frequency_resolves_through_normalization(self):
+        self.assertEqual(choose_option(self.freqs, "2 months", "x", normalize_frequency)["value"], "2-m")
+        self.assertEqual(choose_option(self.freqs, "6mo", "x", normalize_frequency)["value"], "6-m")
+
+    def test_amazons_own_label_and_value_both_work(self):
+        self.assertEqual(choose_option(self.freqs, "2 weeks", "x", normalize_frequency)["value"], "2-w")
+        self.assertEqual(choose_option(self.freqs, "2-w", "x", normalize_frequency)["value"], "2-w")
+
+    def test_a_quantity_is_matched_by_its_label(self):
+        self.assertEqual(choose_option(self.qtys, "2", "a quantity of")["value"], "2")
+
+    # Falling back to the current value would apply a change nobody asked for
+    # and then report success for the change they did ask for.
+    def test_an_unavailable_choice_is_refused_with_the_real_ones(self):
+        with self.assertRaises(ScheduleChoiceUnknown) as e:
+            choose_option(self.qtys, "9", "a quantity of")
+        self.assertIn("1, 2, 3", str(e.exception))
+
+    def test_a_frequency_amazon_does_not_offer_lists_the_ones_it_does(self):
+        with self.assertRaises(ScheduleChoiceUnknown) as e:
+            choose_option(self.freqs, "9 months", "a frequency of", normalize_frequency)
+        self.assertIn("12 months", str(e.exception))
+
+
+class SchedulePage(SkipPage):
+    """List -> edit modal -> change-schedule page, with a recording form."""
+
+    MODAL = (
+        '<div id="root">'
+        '<a class="t-action-type-CHANGE_QUANTITY_FREQUENCY"'
+        ' href="https://www.amazon.com/auto-deliveries/consumptionPatternReactivate?x=1">'
+        "Change your delivery schedule</a></div>"
+    )
+
+    def __init__(self, *, has_link=True, has_form=True, after=None):
+        super().__init__(tab=False)
+        self._has_link = has_link
+        self._has_form = has_form
+        self._after = after or {}
+        self.selected = []
+        self.applied = False
+        self._load_list()
+
+    def _load_list(self):
+        html = (FIXTURES / "subscriptions_list.html").read_text(encoding="utf-8")
+        root = self._soup.select_one("#root")
+        box = BeautifulSoup('<div class="subscription-list-container"></div>', "html.parser").div
+        for card in BeautifulSoup(html, "html.parser").select(SUBSCRIPTION_CARD):
+            if self.applied:
+                self._rewrite(card)
+            box.append(card)
+        root.append(box)
+
+    def _rewrite(self, card):
+        """Make the list agree with `after` so verification has something to read."""
+        link = card.select_one(SCHEDULE_SELECTOR)
+        if link and "schedule" in self._after:
+            link.string = self._after["schedule"]
+
+    def goto(self, url, **_kw):
+        self.gotos.append(url)
+        root = self._soup.select_one("#root")
+        root.clear()
+        if "ajax/subscription?" in url:
+            if self._has_link:
+                root.append(BeautifulSoup(self.MODAL, "html.parser").select_one("a"))
+        elif "consumptionPatternReactivate" in url:
+            if self._has_form:
+                page = (FIXTURES / "change_schedule.html").read_text(encoding="utf-8")
+                root.append(BeautifulSoup(page, "html.parser").div)
+        else:
+            self._load_list()
+
+    def select_option(self, selector, value):
+        self.selected.append((selector, value))
+
+    def clicked(self, node, timeout):
+        super().clicked(node, timeout)
+        if node.get("id") == "copaModalApplyButton":
+            self.applied = True
+
+
+class ChangeScheduleTest(unittest.TestCase):
+    def setUp(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        self.page = SchedulePage()
+
+    def change(self, confirm=False, **kw):
+        return change_schedule(self.page, None, "Dishwasher", confirm, **kw)
+
+    def test_reading_the_schedule_changes_nothing_and_reports_everything(self):
+        result = self.change()
+        self.assertFalse(result["applied"])
+        self.assertEqual(result["current"]["quantity"], "1")
+        self.assertEqual(result["current"]["frequency"], "1 month")
+        self.assertEqual(len(result["choices"]["frequency"]), 14)
+        self.assertEqual(self.page.selected, [])
+
+    def test_a_dry_run_shows_what_would_change(self):
+        result = self.change(quantity="2", frequency="2 months")
+        self.assertEqual(result["wanted"]["quantity"], "2")
+        self.assertEqual(result["wanted"]["frequency"], "2 months")
+        self.assertFalse(self.page.applied)
+
+    # The card's date and the form's dropdown disagree, and both are reported
+    # so the caller can say so rather than silently moving a delivery.
+    def test_the_cards_date_and_the_forms_date_are_separate_fields(self):
+        result = self.change()
+        self.assertEqual(result["current"]["next_date"], "October")
+        self.assertTrue(result["next_delivery_label"])
+        self.assertNotIn("October", result["next_delivery_label"])
+
+    def test_applying_selects_only_what_was_asked_for(self):
+        self.change(confirm=True, quantity="2")
+        self.assertEqual(self.page.selected, [(SCHEDULE_QTY, "2")])
+        self.assertTrue(self.page.applied)
+
+    def test_applying_all_three_sends_all_three(self):
+        self.change(confirm=True, quantity="2", frequency="2 months", next_date="November")
+        self.assertEqual(
+            self.page.selected,
+            [
+                (SCHEDULE_QTY, "2"),
+                (SCHEDULE_FREQ, "2-m"),
+                (SCHEDULE_DATE, "2026-11-03T00:00:00.000-08:00"),
+            ],
+        )
+
+    def test_confirming_with_nothing_to_change_is_refused(self):
+        with self.assertRaises(ScheduleChoiceUnknown) as e:
+            self.change(confirm=True)
+        self.assertIn("nothing to change", str(e.exception))
+        self.assertFalse(self.page.applied)
+
+    # Refused before Apply: a form submitted with a wrong value has already
+    # changed the schedule by the time anyone reads the error.
+    def test_a_bad_choice_stops_before_the_form_is_touched(self):
+        with self.assertRaises(ScheduleChoiceUnknown):
+            self.change(confirm=True, frequency="9 months")
+        self.assertEqual(self.page.selected, [])
+        self.assertFalse(self.page.applied)
+
+    def test_verification_reads_the_card_back(self):
+        self.page = SchedulePage(after={"schedule": "1 unit every 2 months"})
+        result = self.change(confirm=True, frequency="2 months")
+        self.assertTrue(result["applied"])
+        self.assertTrue(result["verified"])
+
+    # Amazon accepted the click and the list still says 1 month.
+    def test_a_schedule_that_did_not_move_is_reported_as_such(self):
+        result = self.change(confirm=True, frequency="2 months")
+        self.assertIs(result["verified"], False)
+
+    def test_a_quantity_that_did_not_move_is_reported_as_such(self):
+        result = self.change(confirm=True, quantity="3")
+        self.assertIs(result["verified"], False)
+
+    def test_a_verification_that_cannot_be_made_is_none(self):
+        page = SchedulePage()
+        page.goto = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("network"))
+        self.assertIsNone(verify_schedule(page, "SNSD0_FIXTURESUB0000000001", {"quantity": None}))
+
+    def test_a_subscription_with_no_schedule_link_is_a_refusal(self):
+        self.page = SchedulePage(has_link=False)
+        with self.assertRaises(NotSchedulable) as e:
+            self.change()
+        self.assertIn("does not offer", str(e.exception))
+
+    def test_a_page_that_renders_no_form_is_a_refusal_too(self):
+        self.page = SchedulePage(has_form=False)
+        with self.assertRaises(NotSchedulable) as e:
+            self.change()
+        self.assertIn("rendered no form", str(e.exception))
+
+    def test_an_unknown_subscription_never_opens_a_form(self):
+        with self.assertRaises(NoSuchSubscription):
+            change_schedule(self.page, None, "bicycle", False)
+        self.assertFalse(any("consumptionPattern" in u for u in self.page.gotos))

@@ -301,7 +301,82 @@ module Amazon
       end
     end
 
+    # A schedule change, applied or merely contemplated.
+    def schedule(result)
+      return puts(JSON.pretty_generate(result)) if @json
+
+      title = result["title"] || "(untitled subscription)"
+      puts "#{result["applied"] ? green("changed") : bold("would change")} #{bold(title)}"
+      rows = schedule_rows(result)
+      width = rows.map { |label, _| label.length }.max || 0
+      rows.each { |label, value| puts "  #{dim(label.ljust(width))}  #{value}" }
+      if result["applied"]
+        puts schedule_verdict(result["verified"])
+      else
+        puts "  #{yellow(squish(result["note"]))}" if result["note"]
+        puts dim("  choices: #{schedule_choices(result)}")
+        puts dim("  nothing changed — pass --yes to apply")
+      end
+    end
+
     private
+
+    def schedule_rows(result)
+      current = result["current"] || {}
+      wanted = result["wanted"] || {}
+      rows = []
+      rows << ["quantity", change_arrow(current["quantity"], wanted["quantity"])]
+      rows << ["frequency", change_arrow(current["frequency"], wanted["frequency"])]
+      rows << ["next delivery", next_delivery_cell(result)]
+      rows.reject { |_, value| value.nil? }
+    end
+
+    def change_arrow(from, to)
+      return nil if from.nil? && to.nil?
+      return from.to_s if to.nil? || to == from
+
+      "#{from} #{dim("→")} #{bold(to)}"
+    end
+
+    # Amazon puts the next delivery date in the same form as quantity and
+    # frequency, behind the same Apply, and its dropdown does not always hold
+    # the date the subscription currently shows. Applying anything applies
+    # that too, so the row says so before it happens rather than after.
+    def next_delivery_cell(result)
+      shown = result["next_delivery_label"] || result["next_delivery_date"]
+      form = (result["current"] || {})["next_date"]
+      asked = (result["wanted"] || {})["next_date"]
+      return change_arrow(shown, asked) if asked
+      return shown if form.nil? || shown.nil? || shown.include?(form)
+
+      "#{shown} #{dim("→")} #{bold(form)} #{yellow("(Amazon's form sets this too)")}"
+    end
+
+    def schedule_choices(result)
+      choices = result["choices"] || {}
+      %w[quantity frequency next_date].filter_map do |key|
+        values = Array(choices[key])
+        next if values.empty?
+
+        "#{key.sub("next_date", "next")} #{summarize_choices(values)}"
+      end.join(" · ")
+    end
+
+    # Fourteen frequencies and eight months is a paragraph. The ends of an
+    # ordered range say more than the middle of it does.
+    def summarize_choices(values)
+      return values.join(", ") if values.length <= 5
+
+      "#{values.first}…#{values.last} (#{values.length})"
+    end
+
+    def schedule_verdict(verified)
+      case verified
+      when true  then dim("  confirmed — your subscription list agrees")
+      when false then red("  but your subscription list still shows the old schedule — check Amazon")
+      else dim("  Amazon accepted it; couldn't re-read the list to confirm")
+      end
+    end
 
     def cancellation_facts(result)
       lines = []
