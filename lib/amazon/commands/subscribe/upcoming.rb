@@ -8,9 +8,10 @@ module Amazon
         include Images
 
         # Amazon schedules deliveries months out; the real account had seven,
-        # 84 items between them. Everything is available with --all, but the
-        # question "what's coming" has a short answer and this is it.
-        DEFAULT_LIMIT = 3
+        # 84 items between them. "What's coming" means the next box — the one
+        # with prices, a deadline, and something you can still do about it.
+        # The rest are a list of things that might be true in March.
+        DEFAULT_LIMIT = 1
 
         # Smaller than `list`: these are already nested under a delivery
         # heading, and a delivery can hold eighteen of them.
@@ -65,7 +66,8 @@ module Amazon
             Future deliveries carry no prices on Amazon's side, so none are
             shown for them rather than a guess from today's listing.
 
-            Amazon schedules months ahead, so only the next #{DEFAULT_LIMIT} print by
+            Amazon schedules months ahead, but only the next delivery has
+            prices and an edit deadline, so that's the one that prints by
             default; a note says how many more there are.
 
             Cached for 30 minutes. --fresh re-reads Amazon and drops the cached

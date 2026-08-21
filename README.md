@@ -347,7 +347,7 @@ estimate that excludes tax (and, from a subtotal, shipping too).
 ```bash
 amazon subscribe list                 # every subscription, soonest delivery first
 amazon subscribe list --all           # click past the first 30
-amazon subscribe upcoming             # the next 3 deliveries, with prices
+amazon subscribe upcoming             # the next delivery, with prices
 amazon subscribe upcoming --all       # every scheduled delivery
 amazon subscribe show dishwasher      # one subscription in full, by id or by title
 amazon subscribe list --image         # with the product photos (needs chafa)
@@ -374,7 +374,13 @@ Sep 2  3 items  $48.95  · next
      $14.22  Gain Liquid Laundry Detergent, Freshness, Odor De…  Saving 5%
      $11.99  BodyMed Adjustable Heel Lift for Men and Woman, S…
      $22.74  Viva Multi-Surface Cloth Paper Towels, 12 Super R…  Saving 5%
+6 more deliveries scheduled — pass --all
+```
 
+With `--all`, the later boxes print too — with a rate instead of a price,
+because Amazon hasn't set one:
+
+```
 September 30  16 items
              Cascade Free & Clear Dishwasher Detergent Liquid …  Saving 15%
              …
@@ -427,10 +433,13 @@ seconds for 59). If pagination stalls, you get the partial list plus a
 warning on stderr — never a short list that looks complete.
 
 Amazon schedules deliveries months ahead — seven of them, 84 item lines, on
-the account this was built against — so `upcoming` prints the next three and
-says how many more there are. `--limit N` and `--all` override that. `--json`
-ignores both: a caller piping to `jq` asked for the data, not for Amazon's
-next three.
+the account this was built against — so `upcoming` prints the next one and
+says how many more there are. That's not just brevity: the next delivery is
+the only one with prices, an edit deadline, and anything you can still do
+about it. The rest are a forecast of what March might hold, at a discount
+rate that changes with whatever else lands in the box. `--limit N` and
+`--all` override it. `--json` ignores both: a caller piping to `jq` asked for
+the data, not for the next box.
 
 All three cache for 30 minutes, and a cached read says its age on stderr
 (`[cached 12 minutes ago — --fresh to re-read]`) — a schedule you changed on

@@ -3910,17 +3910,18 @@ class SubscribeUpcomingCommandTest < Minitest::Test
   end
 
   def test_it_prints_each_delivery
-    out = run_upcoming(%w[subscribe upcoming], cards: [SAMPLE_DELIVERY, FUTURE_DELIVERY])
+    out = run_upcoming(%w[subscribe upcoming --all], cards: [SAMPLE_DELIVERY, FUTURE_DELIVERY])
     assert_includes out, 'Sep 2'
     assert_includes out, 'September 30'
   end
 
   # Seven deliveries and 84 item lines is not an answer to "what's coming".
-  def test_only_the_next_few_print_by_default
+  # Only the next one has prices and a deadline; the rest are a forecast.
+  def test_only_the_next_delivery_prints_by_default
     out = run_upcoming(%w[subscribe upcoming], cards: many_deliveries(7))
-    assert_includes out, 'Delivery 3'
-    refute_includes out, 'Delivery 4'
-    assert_includes out, '4 more deliveries scheduled'
+    assert_includes out, 'Delivery 1'
+    refute_includes out, 'Delivery 2'
+    assert_includes out, '6 more deliveries scheduled'
   end
 
   def test_all_prints_every_delivery
@@ -3937,12 +3938,12 @@ class SubscribeUpcomingCommandTest < Minitest::Test
   end
 
   def test_the_note_is_singular_for_one_remaining
-    out = run_upcoming(%w[subscribe upcoming], cards: many_deliveries(4))
+    out = run_upcoming(%w[subscribe upcoming], cards: many_deliveries(2))
     assert_includes out, '1 more delivery scheduled'
   end
 
   def test_a_limit_larger_than_the_list_adds_no_note
-    out = run_upcoming(%w[subscribe upcoming --limit 50], cards: many_deliveries(2))
+    out = run_upcoming(%w[subscribe upcoming --limit 50], cards: many_deliveries(1))
     refute_includes out, 'more deliveries'
   end
 
