@@ -58,6 +58,14 @@ AUTH_COOKIE_NAMES = ("x-main", "at-main", "sess-at-main", "sst-main", "ubid-main
 # the repair but never the thing that arms it.
 AUTH_COOKIE = "x-main"
 
+# amazon-orders' built-in Playwright forms launch a browser that advertises
+# automation, so Amazon's sensor never resolves. These local subclasses keep
+# its detection/cookie bridge while launching the installed Chrome coherently.
+AUTH_FORM_CLASSES = (
+    "amazon_browser.CoherentPlaywrightAcicForm",
+    "amazon_browser.CoherentPlaywrightJSAuthForm",
+)
+
 
 def _jar_dict(raw: str | None) -> dict[str, Any]:
     """A jar blob as a mapping. Anything unreadable is `{}` — never an exception."""
@@ -666,6 +674,10 @@ def main() -> int:
             # Cap parallel detail fetches; Amazon 503s above ~7 concurrent.
             "thread_pool_size": 7,
             "connection_pool_size": 14,
+            # Playwright being installed is not enough: challenge forms are
+            # opt-in, and the package defaults advertise automation to the
+            # sensor. Register our coherent headless-Chrome variants.
+            "auth_forms_classes": list(AUTH_FORM_CLASSES),
             # Don't blow up the whole year if one ancient order has an
             # unparseable required field (common on pre-2018 orders).
             "warn_on_missing_required_field": True,

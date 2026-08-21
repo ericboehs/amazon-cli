@@ -589,6 +589,27 @@ class PackageAssumptionsTest(unittest.TestCase):
         except ImportError:
             self.skipTest(NO_DEPS.format(pkg="amazon-orders"))
 
+    def test_the_registered_browser_forms_exist_and_are_auth_forms(self):
+        from amazonorders.forms import AuthForm
+        from amazonorders.util import load_class
+
+        for path in fetch.AUTH_FORM_CLASSES:
+            module_path, class_name = path.rsplit(".", 1)
+            cls = load_class(module_path.split("."), class_name)
+            self.assertTrue(issubclass(cls, AuthForm), path)
+
+    def test_coherent_chrome_launch_hides_automation_with_an_honest_ua(self):
+        import amazon_browser
+
+        reported = mock.Mock(stdout="Google Chrome 151.0.7922.109\n")
+        with mock.patch.object(amazon_browser.subprocess, "run", return_value=reported):
+            args = amazon_browser.chrome_launch_args("/fake/Google Chrome")
+
+        self.assertIn("--disable-blink-features=AutomationControlled", args)
+        ua = next(arg for arg in args if arg.startswith("--user-agent="))
+        self.assertIn("Chrome/151.0.0.0", ua)
+        self.assertNotIn("HeadlessChrome", ua)
+
     def test_the_cookie_we_key_on_is_the_one_amazon_orders_keys_on(self):
         # `auth_cookies_stored()` walks this list; whatever is in it is what
         # "signed in" means to the library. Our rollback trigger has to be the
