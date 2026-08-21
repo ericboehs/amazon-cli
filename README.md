@@ -203,7 +203,9 @@ amazon config edit
 
 The `op://` references use the [1Password CLI](https://developer.1password.com/docs/cli/);
 swap in your own password manager or just hardcode a value if you must.
-The Python worker never logs the password.
+`otp_op_ref` can point directly at a 1Password one-time-password field: `op
+read` returns its `otpauth://` URI, and the worker extracts the TOTP secret
+without persisting or logging it. The Python worker never logs credentials.
 
 ## Use
 

@@ -35,6 +35,7 @@ from fetch import (  # noqa: E402
     jar_cookie_names,
     jar_regressed,
     jar_without_auth,
+    normalize_otp_secret,
     restore_jar,
     split_known,
     write_jar,
@@ -565,6 +566,25 @@ class ClassifyFailureTest(unittest.TestCase):
         # reads the message, and the two must not be able to disagree about
         # what they are looking at.
         self.assertEqual(classify_failure(AmazonOrdersError("503 Service Unavailable")), TRANSIENT)
+
+
+class OtpSecretTest(unittest.TestCase):
+    def test_a_raw_secret_passes_through(self):
+        self.assertEqual(normalize_otp_secret("JBSWY3DPEHPK3PXP"), "JBSWY3DPEHPK3PXP")
+
+    def test_a_1password_totp_uri_yields_its_secret(self):
+        uri = "otpauth://totp/Amazon%3Auser?secret=JBSWY3DPEHPK3PXP&issuer=Amazon"
+        self.assertEqual(normalize_otp_secret(uri), "JBSWY3DPEHPK3PXP")
+
+    def test_an_otpauth_uri_without_a_secret_is_rejected_without_echoing_it(self):
+        uri = "otpauth://totp/Amazon?issuer=sensitive-account-name"
+        with self.assertRaisesRegex(ValueError, "no secret parameter") as raised:
+            normalize_otp_secret(uri)
+        self.assertNotIn(uri, str(raised.exception))
+        self.assertNotIn("sensitive-account-name", str(raised.exception))
+
+    def test_no_config_stays_none(self):
+        self.assertIsNone(normalize_otp_secret(None))
 
 
 class PackageAssumptionsTest(unittest.TestCase):

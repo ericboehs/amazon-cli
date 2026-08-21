@@ -35,6 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from browser import session_rejected
 
@@ -601,6 +602,29 @@ def _name_some(numbers: list[str], limit: int = 5) -> str:
     return shown + (f" (and {len(numbers) - limit} more)" if len(numbers) > limit else "")
 
 
+def normalize_otp_secret(value: Any) -> str | None:
+    """Turn a 1Password TOTP field into the secret amazon-orders expects.
+
+    ``op read`` returns an ``otpauth://`` URI for a one-time-password field,
+    while amazon-orders passes its argument to ``pyotp.TOTP`` as a raw Base32
+    secret. Accept both shapes so config can keep an ordinary 1Password field
+    reference instead of storing or duplicating the secret itself.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("the OTP value must be a non-empty string")
+    if not value.lower().startswith("otpauth://"):
+        return value
+
+    parsed = urlsplit(value)
+    secret = parse_qs(parsed.query).get("secret", [None])[0]
+    if not secret:
+        # Never include the URI in this message: its query string is the secret.
+        raise ValueError("the otpauth URI has no secret parameter")
+    return secret
+
+
 def main() -> int:
     raw = sys.stdin.readline()
     if not raw:
@@ -630,7 +654,11 @@ def main() -> int:
     password = req.get("password")
     years = req.get("years") or [date.today().year]
     full_details = bool(req.get("full_details", True))
-    otp_secret = req.get("otp_secret")
+    try:
+        otp_secret = normalize_otp_secret(req.get("otp_secret"))
+    except ValueError as e:
+        emit("error", msg=f"invalid OTP configuration: {e}")
+        return 2
     known_order_ids = set(req.get("known_order_ids") or [])
     # Rate-limit knobs (seconds). Conservative defaults so Amazon doesn't 503.
     detail_delay = float(req.get("detail_delay", 0.05))
