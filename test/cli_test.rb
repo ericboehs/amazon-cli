@@ -523,6 +523,66 @@ class CacheTest < Minitest::Test
     assert_nil cache.read('k')
   end
 
+  # The guard above counts keys, so the wrapper `subscribe list` caches —
+  # {"rows" => [], "total" => nil} — sailed past it and pinned a failed scrape
+  # for the full TTL. `upcoming` caches a bare array and was protected; two
+  # commands, same failure, opposite behaviour.
+  def test_a_wrapper_around_no_rows_is_still_nothing
+    ns = "wrapped-#{rand(1_000_000)}"
+    cache = Amazon::Cache.new(ns)
+    calls = 0
+    2.times { cache.fetch('k') { calls += 1; { 'rows' => [], 'total' => nil } } }
+    assert_equal 2, calls, 'an empty scrape must not satisfy the second call'
+    assert_nil cache.read('k')
+  end
+
+  def test_a_wrapper_with_rows_in_it_is_cached_normally
+    ns = "wrapped2-#{rand(1_000_000)}"
+    cache = Amazon::Cache.new(ns)
+    calls = 0
+    2.times { cache.fetch('k') { calls += 1; { 'rows' => [{ 'title' => 'Soap' }], 'total' => 1 } } }
+    assert_equal 1, calls
+  end
+
+  # A record whose fields are real and whose one list happens to be empty is a
+  # genuine result. Refusing to cache it would make the wrapper rule a rule
+  # against empty lists anywhere, and `subscribe show` on an item with no
+  # actions would stop caching for no reason.
+  def test_a_record_with_real_fields_and_one_empty_list_is_a_result
+    ns = "detail-#{rand(1_000_000)}"
+    cache = Amazon::Cache.new(ns)
+    calls = 0
+    2.times do
+      cache.fetch('k') { calls += 1; { 'title' => 'Soap', 'actions' => [], 'price' => nil } }
+    end
+    assert_equal 1, calls, 'a populated detail record must still cache'
+  end
+
+  # `clear` is the entire mechanism behind post-mutation invalidation, and
+  # rm_rf's force: true meant it could not report a failure to forget.
+  def test_a_cache_that_cannot_be_cleared_says_so
+    ns = "unclearable-#{rand(1_000_000)}"
+    cache = Amazon::Cache.new(ns)
+    cache.write('k', [{ 'a' => 1 }])
+    dir = File.join(Amazon::Config.cache_dir, 'live', ns)
+    File.chmod(0o500, dir)
+    begin
+      out = err = nil
+      out, err = capture_io_streams { @ok = cache.clear }
+      skip 'running as root: an unwritable directory is still writable' if @ok
+      refute @ok
+      assert_includes err, 'stale'
+      assert_includes err, '--fresh'
+      assert_empty out
+    ensure
+      File.chmod(0o700, dir)
+    end
+  end
+
+  def test_clearing_a_cache_that_was_never_written_is_fine
+    assert Amazon::Cache.new("never-#{rand(1_000_000)}").clear
+  end
+
   def test_stored_empty_array_reads_as_a_miss
     ns = "storedempty-#{rand(1_000_000)}"
     cache = Amazon::Cache.new(ns)
@@ -6042,6 +6102,44 @@ class SubscribeScheduleCommandTest < Minitest::Test
       end
     end
     assert_equal 1, reads, 'the list would still show the old cadence'
+  end
+
+  # The worst case this protects: Amazon accepted the change, something threw
+  # on the way back, and the CLI exits saying it failed while `subscribe list`
+  # serves the old cadence for half an hour. The click already happened; the
+  # cache has to assume it did.
+  def test_a_confirmed_change_that_blows_up_still_clears_the_cache
+    exploding = Object.new
+    def exploding.schedule(*, **) = raise(Amazon::Worker::Error, 'browser died after the click')
+    def exploding.subscriptions(*, **) = [SAMPLE_SUBSCRIPTION]
+    def exploding.deliveries(*, **) = [SAMPLE_DELIVERY]
+    def exploding.subscription_total = 1
+    def exploding.not_found = nil
+
+    with_worker(->(*) { exploding }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      refute_empty Dir.glob(File.join(Amazon::Config.cache_dir, 'live', 'subscribe', '*.json'))
+      capture_io_streams { Amazon::CLI.run(%w[subscribe schedule dishwasher --qty 2 --yes]) }
+      assert_empty Dir.glob(File.join(Amazon::Config.cache_dir, 'live', 'subscribe', '*.json')),
+                   'the list would still show the pre-change schedule'
+    end
+  end
+
+  # ...but a dry run touched nothing, so it must not throw away a good cache.
+  def test_a_dry_run_that_blows_up_leaves_the_cache_alone
+    exploding = Object.new
+    def exploding.schedule(*, **) = raise(Amazon::Worker::Error, 'browser died')
+    def exploding.subscriptions(*, **) = [SAMPLE_SUBSCRIPTION]
+    def exploding.deliveries(*, **) = [SAMPLE_DELIVERY]
+    def exploding.subscription_total = 1
+    def exploding.not_found = nil
+
+    with_worker(->(*) { exploding }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      before = Dir.glob(File.join(Amazon::Config.cache_dir, 'live', 'subscribe', '*.json'))
+      capture_io_streams { Amazon::CLI.run(%w[subscribe schedule dishwasher --qty 2]) }
+      assert_equal before.sort, Dir.glob(File.join(Amazon::Config.cache_dir, 'live', 'subscribe', '*.json')).sort
+    end
   end
 
   def test_json_is_the_whole_record

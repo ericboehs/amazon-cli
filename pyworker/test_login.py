@@ -23,6 +23,7 @@ from login import (  # noqa: E402
     describe_state,
     dismiss_upsell,
     should_dismiss_upsell,
+    autofill_otp,
     fill_otp,
     fill_password,
     read_request,
@@ -775,6 +776,54 @@ class FillOtpTest(unittest.TestCase):
         page = FakePage({"#cvf-input-code": FakeField()})
         self.assertIsNone(fill_otp(page, self.SECRET, None))
         self.assertNotIn("#cvf-input-code", page.asked)
+
+
+class AutofillOtpTest(unittest.TestCase):
+    """The rule is that this can fail in any way and cost only the 2FA step."""
+
+    SECRET = "JBSWY3DPEHPK3PXP"
+
+    class Exploding:
+        """A tab whose DOM probe raises — a frame detached mid-navigation, or
+        a secret pyotp cannot decode."""
+
+        url = "https://www.amazon.com/ap/signin"
+
+        def locator(self, _selector):
+            raise RuntimeError("Frame was detached")
+
+    def test_a_tab_that_throws_costs_the_code_and_nothing_else(self):
+        sent, error = autofill_otp([self.Exploding()], self.SECRET, None)
+        self.assertIsNone(sent)
+        self.assertEqual(error, "RuntimeError")
+
+    def test_an_undecodable_secret_is_reported_not_raised(self):
+        try:
+            import pyotp  # noqa: F401
+        except ImportError:
+            self.skipTest("pyotp not installed")
+        page = FakePage({"#auth-mfa-otpcode": FakeField(), "#auth-signin-button": FakeField()})
+        sent, error = autofill_otp([page], "not-valid-base32!", None)
+        self.assertIsNone(sent)
+        self.assertTrue(error, "a bad secret must be reported, not swallowed")
+
+    def test_nothing_asking_for_a_code_is_not_an_error(self):
+        sent, error = autofill_otp([FakePage({})], self.SECRET, None)
+        self.assertIsNone(sent)
+        self.assertIsNone(error, "no 2FA box is the normal case, not a failure")
+
+    def test_it_stops_at_the_tab_that_took_the_code(self):
+        try:
+            import pyotp  # noqa: F401
+        except ImportError:
+            self.skipTest("pyotp not installed")
+        field = FakeField()
+        asking = FakePage({"#auth-mfa-otpcode": field, "#auth-signin-button": FakeField()})
+        later = FakePage({"#auth-mfa-otpcode": FakeField(), "#auth-signin-button": FakeField()})
+        sent, error = autofill_otp([asking, later], self.SECRET, None)
+        self.assertEqual(field.filled, sent)
+        self.assertIsNone(error)
+        self.assertEqual(later.asked, [], "a second tab was typed into as well")
 
 
 class ShouldDismissUpsellTest(unittest.TestCase):

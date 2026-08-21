@@ -124,7 +124,15 @@ module Amazon
 
       def configured_password_ref
         Amazon::Config.load.password_op_ref
-      rescue StandardError
+      rescue StandardError => e
+        # A missing config is the ordinary not-set-up-yet case, and the login
+        # works fine without one, so it says nothing. A config that *exists*
+        # and won't parse is a different animal: `amazon order sync` refuses
+        # to run at all on that file (cli.rb), while this path quietly decided
+        # you had no credentials configured. Same broken file, two verdicts,
+        # and the quiet one is the one you'd hit first.
+        warn "amazon login: couldn't read config (#{e.message.lines.first&.strip}) — " \
+             "signing in by hand; run `amazon config edit` to fix it" if Amazon::Config.config_path.exist?
         nil
       end
 

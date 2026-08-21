@@ -676,6 +676,30 @@ def fill_otp(page: Any, secret: str, last_code: str | None) -> str | None:
     return code
 
 
+def autofill_otp(pages: Any, secret: str, last_code: str | None) -> tuple[str | None, str | None]:
+    """Type the 2FA code into whichever tab is asking. Never raises.
+
+    Returns ``(code_sent, error_name)``, at most one of which is set.
+
+    The "never raises" is the whole point, and it is a function rather than a
+    `try` in the poll loop so that it can be tested. Autofill is a convenience
+    laid over a login that works without it — the person is sitting right there
+    with an authenticator app. But the call used to sit unguarded among the
+    loop's DOM probes, so an unusable secret raised on every tick, counted as a
+    failed probe, and five ticks later closed the browser window mid-login with
+    a message blaming the network. The convenience destroyed the thing it was
+    assisting.
+    """
+    try:
+        for page in pages:
+            sent = fill_otp(page, secret, last_code)
+            if sent:
+                return sent, None
+    except Exception as e:  # noqa: BLE001
+        return None, type(e).__name__
+    return None, None
+
+
 def main() -> int:
     try:
         from playwright.sync_api import sync_playwright
@@ -810,6 +834,8 @@ def main() -> int:
         # The last TOTP we submitted, so a rejected code isn't retried on every
         # tick for the thirty seconds it stays current.
         last_otp_code: str | None = None
+        # Whether the "autofill broke, carry on by hand" line has been said.
+        otp_warned = False
         # URLs we've already tried to dismiss, so one unanswerable page doesn't
         # get clicked at every tick for ten minutes.
         dismissed: set[str] = set()
@@ -852,12 +878,23 @@ def main() -> int:
                 # so it is checked here rather than in the setup above — and on
                 # every tab, because Amazon's challenges open their own.
                 if otp_secret:
-                    for p in open_pages:
-                        sent = fill_otp(p, otp_secret, last_otp_code)
-                        if sent:
-                            last_otp_code = sent
-                            emit("log", msg="entered the 2FA code from 1Password")
-                            break
+                    sent, otp_error = autofill_otp(open_pages, otp_secret, last_otp_code)
+                    if sent:
+                        last_otp_code = sent
+                        emit("log", msg="entered the 2FA code from 1Password")
+                    elif otp_error and not otp_warned:
+                        # Once. This runs every two seconds for up to ten
+                        # minutes, and a warning repeated 300 times buries the
+                        # sign-in instructions printed next to it.
+                        otp_warned = True
+                        emit(
+                            "log",
+                            level="warn",
+                            msg=(
+                                f"could not enter the 2FA code ({otp_error}) — "
+                                "type it yourself; nothing else about this login changes"
+                            ),
+                        )
                 # An upsell is only in the way once. Re-clicking a page we have
                 # already answered would fight whatever the user chose to do
                 # with it instead — so each URL gets one attempt, and a page

@@ -43,10 +43,19 @@ module Amazon
 
           Amazon::Config.load
           worker = Amazon::Worker.new(verbose: @global.verbose)
-          result = worker.skip(target, confirm: confirm)
+          # On attempt, not on outcome. The old form only cleared the cache
+          # if a result came back, so a click that landed and *then* threw —
+          # the browser dying during verification, say — left `subscribe list`
+          # describing the world from before the change for the next half
+          # hour, while the command that made it exited saying it failed. A
+          # cleared cache costs one re-read; a wrong one costs trust.
+          result = begin
+            worker.skip(target, confirm: confirm)
+          ensure
+            Cached.invalidate! if confirm
+          end
           return refuse(worker.not_found) unless result
 
-          Cached.invalidate! if result["confirmed"]
           Amazon::Formatter.new(json: @global.json).skip(result)
           # A dry run did not do the thing that was asked, and a script that
           # forgot --yes should be able to tell that from the exit code.

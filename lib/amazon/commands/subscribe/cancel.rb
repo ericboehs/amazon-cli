@@ -43,10 +43,19 @@ module Amazon
 
           Amazon::Config.load
           worker = Amazon::Worker.new(verbose: @global.verbose)
-          result = worker.cancel(target, confirm: confirm, reason: reason)
+          # On attempt, not on outcome. The old form only cleared the cache
+          # if a result came back, so a click that landed and *then* threw —
+          # the browser dying during verification, say — left `subscribe list`
+          # describing the world from before the change for the next half
+          # hour, while the command that made it exited saying it failed. A
+          # cleared cache costs one re-read; a wrong one costs trust.
+          result = begin
+            worker.cancel(target, confirm: confirm, reason: reason)
+          ensure
+            Cached.invalidate! if confirm
+          end
           return refuse(worker.not_found) unless result
 
-          Cached.invalidate! if result["cancelled"]
           Amazon::Formatter.new(json: @global.json).cancellation(result)
           result["cancelled"] ? 0 : 2
         end
