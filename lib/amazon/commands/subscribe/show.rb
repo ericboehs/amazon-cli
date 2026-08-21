@@ -10,17 +10,24 @@ module Amazon
       class Show
         include Args
         include Cached
+        include Images
 
         def initialize(global)
           @global = global
         end
 
+        # Room for the whole detail block beside it — this is the one view
+        # showing a single product, so the picture can be worth looking at.
+        IMAGE_ROWS = 12
+
         def run(argv)
           fresh = false
+          images = false
           target = nil
           while (a = argv.shift)
             case a
             when "--fresh" then fresh = true
+            when "--image", "--images" then images = true
             when "-h", "--help"
               puts help_text
               return 0
@@ -43,7 +50,8 @@ module Amazon
             return 2
           end
 
-          Amazon::Formatter.new(json: @global.json).subscription(detail)
+          Amazon::Formatter.new(json: @global.json)
+            .subscription(detail, thumbnails: thumbnails(images, IMAGE_ROWS))
           0
         end
 
@@ -88,6 +96,7 @@ module Amazon
             subscribe upcoming` has the prices.
 
             Options:
+              --image  Draw the product photo beside the details (needs chafa)
               --fresh  Ignore the cache and re-read Amazon
               --json   JSON output
           HELP

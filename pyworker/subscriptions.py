@@ -310,6 +310,27 @@ def _inner_text(scope: Any) -> str:
         return ""
 
 
+# Amazon lazy-loads anything below the fold: `src` holds a 35-byte grey pixel
+# until the card scrolls into view, and the real photograph waits in
+# data-a-hires (290px) or data-src (145px). Reading src alone gets a picture
+# for the first screenful and a tracking pixel for the other 29 — which is
+# invisible in the JSON, where both are strings ending in a plausible filename.
+LAZY_PLACEHOLDER = re.compile(r"grey-pixel|transparent-pixel|1x1", re.I)
+
+# Amazon's own "no image available" graphic is left alone: it is not a
+# loading artifact, it is the answer.
+IMAGE_ATTRS = ("data-a-hires", "data-src", "src")
+
+
+def product_image(scope: Any, *selectors: str) -> str | None:
+    for selector in selectors:
+        for name in IMAGE_ATTRS:
+            url = attr(scope, selector, name)
+            if url and not LAZY_PLACEHOLDER.search(url):
+                return url
+    return None
+
+
 def scrape_subscription_card(card: Any) -> dict[str, Any] | None:
     """One `.subscription-card` -> a record, or None if it has no id.
 
@@ -336,7 +357,7 @@ def scrape_subscription_card(card: Any) -> dict[str, Any] | None:
         "title": text(card, *TITLE_SELECTORS),
         "variation": text(card, *VARIATION_SELECTORS),
         "next_delivery_label": next_delivery,
-        "image": attr(card, "img.sns-product-image", "src") or attr(card, "img", "src"),
+        "image": product_image(card, "img.sns-product-image", "img"),
     }
     record.update(parse_schedule(schedule))
     return record
@@ -771,7 +792,7 @@ def scrape_subscription_detail(page: Any) -> dict[str, Any]:
     detail: dict[str, Any] = {
         "title": text(page, *DETAIL_TITLE),
         "asin": asin.group(1).upper() if asin else None,
-        "image": attr(page, ".productImage img", "src") or attr(page, "img", "src"),
+        "image": product_image(page, ".productImage img", "img"),
         "merchant": SOLD_BY_RE.sub("", merchant) if merchant else None,
         "next_delivery_label": next_label,
         "next_delivery_date": parse_label_date(next_label),

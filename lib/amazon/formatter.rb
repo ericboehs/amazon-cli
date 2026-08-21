@@ -208,26 +208,11 @@ module Amazon
     # asked for all of it. Both are needed to say anything honest about a short
     # list: 30 rows out of 59 is a page, 30 out of 30 is the whole thing, and
     # the rows cannot tell the two apart.
-    def subscriptions(rows, total: nil, loaded_all: false)
+    def subscriptions(rows, total: nil, loaded_all: false, thumbnails: nil)
       return puts(JSON.pretty_generate(rows)) if @json
       return puts("(no Subscribe & Save subscriptions)") if rows.empty?
 
-      headers = %w[next every qty price subscription_id item]
-      # Everything but the title is fixed width; give the title the rest.
-      title_width = [term_width - 74, 24].max
-      data = rows.map do |r|
-        [
-          r["next_delivery_label"] || "?",
-          interval_phrase(r),
-          (r["quantity"] || "?").to_s,
-          # Blank, not $0.00, for a delivery Amazon hasn't priced yet. The
-          # discount is what it has committed to for those.
-          subscription_price(r),
-          r["subscription_id"],
-          truncate(r["title"], title_width)
-        ]
-      end
-      print_table(headers, data)
+      thumbnails ? subscription_cards(rows, thumbnails) : subscription_table(rows)
       note = subscription_count_note(rows.size, total, loaded_all)
       puts dim(note) if note
     end
@@ -258,18 +243,107 @@ module Amazon
     # One subscription, from the edit modal. Laid out as labelled lines rather
     # than a table: it is one record with a dozen fields, half of which are
     # sentences.
-    def subscription(detail)
+    def subscription(detail, thumbnails: nil)
       return puts(JSON.pretty_generate(detail)) if @json
 
-      puts bold(detail["title"] || "(untitled subscription)")
-      puts dim(detail["variation"]) if detail["variation"]
-      puts
+      head = [bold(detail["title"] || "(untitled subscription)")]
+      head << dim(detail["variation"]) if detail["variation"]
       rows = subscription_detail_rows(detail)
       width = rows.map { |label, _| label.length }.max || 0
-      rows.each { |label, value| puts "  #{dim(label.ljust(width))}  #{value}" }
+      fields = rows.map { |label, value| "  #{dim(label.ljust(width))}  #{value}" }
+
+      unless thumbnails
+        puts head
+        puts
+        return puts(fields)
+      end
+
+      thumbnails.prefetch([detail["image"]])
+      beside_image(thumbnails.block(detail["image"]), head + [""] + fields, thumbnails)
     end
 
     private
+
+    def subscription_table(rows)
+      headers = %w[next every qty price subscription_id item]
+      # Everything but the title is fixed width; give the title the rest.
+      title_width = [term_width - 74, 24].max
+      data = rows.map do |r|
+        [
+          r["next_delivery_label"] || "?",
+          interval_phrase(r),
+          (r["quantity"] || "?").to_s,
+          # Blank, not $0.00, for a delivery Amazon hasn't priced yet. The
+          # discount is what it has committed to for those.
+          subscription_price(r),
+          r["subscription_id"],
+          truncate(r["title"], title_width)
+        ]
+      end
+      print_table(headers, data)
+    end
+
+    # With a photograph in the left margin the table has to go. Six columns is
+    # a table; six columns and a picture is a wall. Each subscription becomes a
+    # block instead, and the columns become a sentence.
+    def subscription_cards(rows, thumbnails)
+      thumbnails.prefetch(rows.map { |r| r["image"] })
+      width = [term_width - thumbnails.cols - 4, 24].max
+      rows.each_with_index do |r, i|
+        puts if i.positive?
+        lines = [bold(truncate(r["title"], width))]
+        lines << dim(truncate(r["variation"], width)) if r["variation"]
+        lines << subscription_summary(r)
+        lines << dim(r["subscription_id"].to_s)
+        beside_image(thumbnails.block(r["image"]), lines, thumbnails)
+      end
+    end
+
+    # The table's columns rejoined into a sentence: what ships next, how often,
+    # how many, and what it costs.
+    def subscription_summary(row)
+      parts = [row["next_delivery_label"] || "?", "every #{interval_phrase(row)}"]
+      parts << "qty #{row["quantity"]}" if row["quantity"] && row["quantity"] != 1
+      line = parts.join(dim(" · "))
+      price = subscription_price(row)
+      price.empty? ? line : "#{line}#{dim(" · ")}#{price}"
+    end
+
+    # Text to the right of a picture, without knowing which graphics protocol
+    # drew the picture.
+    #
+    # The text goes down first and the image is painted over its left margin
+    # afterwards, which looks backwards and isn't: printing the text first is
+    # what scrolls the terminal, so by the time the image is drawn the rows it
+    # needs exist. Drawing first at the bottom of a screen clips the photo
+    # against the last line.
+    def beside_image(blob, lines, thumbnails)
+      body = lines.dup
+      body << "" while body.size < thumbnails.rows
+      indent = " " * (thumbnails.cols + 2)
+
+      # Autowrap off, and the cursor parked after the text rather than counted
+      # back to.
+      #
+      # Ruby counts "Clorox®" as six characters and the terminal draws it in
+      # seven cells, so a line this side believes fits can wrap; and chafa fits
+      # the photo *within* the box rather than filling it, so a wide product
+      # shot comes back three rows tall instead of six. Either one breaks
+      # arithmetic that counts rows. Saving the position after the text and
+      # restoring it after the image returns to where the text ended no matter
+      # what the image did in between.
+      print "\e[?7l"
+      begin
+        body.each { |l| puts l.empty? ? "" : "#{indent}#{l}" }
+        return if blob.nil?
+
+        print "\e7\e[#{body.size}A"
+        print blob
+        print "\e8"
+      ensure
+        print "\e[?7h"
+      end
+    end
 
     def subscription_price(row)
       return format_money(row["price"]) if row["price"]

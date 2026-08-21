@@ -5,18 +5,26 @@ module Amazon
       class List
         include Args
         include Cached
+        include Images
 
         def initialize(global)
           @global = global
         end
 
+        # Six rows is the smallest thumbnail in which a bottle of detergent is
+        # still a bottle of detergent, and it happens to be exactly the height
+        # of the four lines of text beside it.
+        IMAGE_ROWS = 6
+
         def run(argv)
           load_all = false
           fresh = false
+          images = false
           while (a = argv.shift)
             case a
             when "--all" then load_all = true
             when "--fresh" then fresh = true
+            when "--image", "--images" then images = true
             when "-h", "--help"
               puts help_text
               return 0
@@ -28,8 +36,10 @@ module Amazon
 
           Amazon::Config.load
           payload = cached("list:all=#{load_all}", fresh: fresh) { scrape(load_all) }
-          Amazon::Formatter.new(json: @global.json)
-            .subscriptions(payload["rows"], total: payload["total"], loaded_all: load_all)
+          Amazon::Formatter.new(json: @global.json).subscriptions(
+            payload["rows"], total: payload["total"], loaded_all: load_all,
+            thumbnails: thumbnails(images, IMAGE_ROWS)
+          )
           0
         end
 
@@ -68,8 +78,12 @@ module Amazon
             copy of `upcoming` and `show` too, since all three describe the
             same account.
 
+            --image swaps the table for one block per subscription with its
+            product photo alongside. Needs chafa; images are cached on disk.
+
             Options:
               --all    Page through every subscription, not just the first page
+              --image  Draw the product photo beside each subscription
               --fresh  Ignore the cache and re-read Amazon
               --json   JSON output
           HELP

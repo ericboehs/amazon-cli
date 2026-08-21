@@ -50,6 +50,7 @@ require 'amazon/cache'
 require 'amazon/store'
 require 'amazon/reviews'
 require 'amazon/worker'
+require 'amazon/thumbnail'
 require 'amazon/formatter'
 require 'amazon/cli'
 require 'amazon/commands/args'
@@ -66,6 +67,7 @@ require 'amazon/commands/order/show'
 require 'amazon/commands/order/search'
 require 'amazon/commands/subscribe'
 require 'amazon/commands/subscribe/cached'
+require 'amazon/commands/subscribe/images'
 require 'amazon/commands/subscribe/list'
 require 'amazon/commands/subscribe/show'
 require 'amazon/commands/subscribe/upcoming'
@@ -4404,6 +4406,577 @@ class SubscribeWorkerProtocolTest < Minitest::Test
     SCRIPT
     with_python_cmd(body) do
       assert_raises(Amazon::Worker::Error) { capture_io_streams { worker.subscription('zzz') } }
+    end
+  end
+end
+
+# --- thumbnails --------------------------------------------------------
+
+# Stands in for a terminal without being one, so the tty-only paths are
+# reachable from a test runner whose stdout is a pipe.
+class FakeTTY < StringIO
+  def initialize(tty: true)
+    super()
+    @tty = tty
+  end
+
+  def tty? = @tty
+end
+
+# Everything but the network and chafa. The two seams it replaces are the two
+# that can't run in CI, and both are exercised separately below.
+class FakeThumbnail < Amazon::Thumbnail
+  attr_reader :fetched, :rendered
+
+  def initialize(body: "JPEGBYTES", **kw)
+    super(**kw)
+    @body = body
+    @fetched = []
+    @rendered = []
+  end
+
+  private
+
+  def get(url, redirects: 2)
+    @fetched << url
+    @body
+  end
+
+  def render(path)
+    @rendered << path
+    "<image #{File.basename(path)}>"
+  end
+end
+
+class ThumbnailTest < Minitest::Test
+  def setup
+    write_config!
+    Amazon::Thumbnail.command = true
+    FileUtils.rm_rf(Amazon::Config.cache_dir.join("thumbs"))
+  end
+
+  def teardown = Amazon::Thumbnail.command = nil
+
+  def url(size = 145) = "https://m.media-amazon.com/images/I/41ib._SS#{size}_.jpg"
+
+  # Piping kitty graphics into a file writes megabytes of escape codes where
+  # the user expected text, and there is no way to tell from the other end.
+  def test_a_pipe_is_refused_with_a_reason
+    t = Amazon::Thumbnail.new(rows: 6, stream: FakeTTY.new(tty: false))
+    assert_match(/need a terminal/, t.unsupported_reason)
+  end
+
+  def test_a_missing_chafa_names_itself_and_how_to_get_it
+    Amazon::Thumbnail.command = false
+    t = Amazon::Thumbnail.new(rows: 6, stream: FakeTTY.new)
+    assert_match(/chafa/, t.unsupported_reason)
+    assert_match(/brew install/, t.unsupported_reason)
+  end
+
+  def test_a_terminal_with_chafa_is_supported
+    assert_nil Amazon::Thumbnail.new(rows: 6, stream: FakeTTY.new).unsupported_reason
+  end
+
+  def test_the_probe_is_memoised_and_answers_from_the_real_system
+    Amazon::Thumbnail.command = nil
+    assert_includes [true, false], Amazon::Thumbnail.command?
+    first = Amazon::Thumbnail.command?
+    assert_equal first, Amazon::Thumbnail.command?
+  end
+
+  # Cells are about twice as tall as they are wide, so a thumbnail sized in
+  # rows has to be twice as many columns or every product is a squashed bottle.
+  def test_width_follows_from_height_unless_given
+    assert_equal 12, Amazon::Thumbnail.new(rows: 6).cols
+    assert_equal 5, Amazon::Thumbnail.new(rows: 6, cols: 5).cols
+  end
+
+  def test_it_downloads_renders_and_returns_the_blob
+    t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    assert_match(/\A<image /, t.block(url))
+    assert_equal 1, t.fetched.size
+  end
+
+  # Amazon serves any size from the same URL, so asking for one that matches
+  # the cell block beats downloading a 500px JPEG to throw most of it away.
+  def test_it_asks_amazon_for_a_size_that_fits_the_block
+    t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    t.block(url)
+    assert_includes t.fetched.first, "._SS240_."
+  end
+
+  # Only the size modifier is understood. `._CB1234_.` is a cache buster, not
+  # a dimension, and rewriting it would ask for an image that doesn't exist.
+  def test_a_url_with_no_size_modifier_is_fetched_as_served
+    plain = "https://m.media-amazon.com/images/G/01/thing._CB1234_.png"
+    t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    t.block(plain)
+    assert_equal plain, t.fetched.first
+  end
+
+  def test_the_second_ask_for_one_url_does_not_download_it_twice
+    t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    2.times { t.block(url) }
+    assert_equal 1, t.fetched.size
+  end
+
+  # The disk cache is what makes the second `subscribe list --image` instant.
+  def test_a_later_process_reads_the_image_off_disk
+    FakeThumbnail.new(rows: 6, stream: FakeTTY.new).block(url)
+    fresh = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    assert fresh.block(url)
+    assert_empty fresh.fetched
+  end
+
+  # Same product, two sizes, two files: `show` asks for a 12-row image and
+  # `list` for a 6-row one, and serving one from the other's cache entry means
+  # a blurry thumbnail or a wasted download.
+  def test_two_sizes_are_two_cache_entries
+    FakeThumbnail.new(rows: 6, stream: FakeTTY.new).block(url)
+    big = FakeThumbnail.new(rows: 12, stream: FakeTTY.new)
+    big.block(url)
+    assert_includes big.fetched.first, "._SS480_."
+  end
+
+  # Amazon's "no image available" graphic. Six rows and a download to draw a
+  # grey rectangle that says nothing.
+  def test_amazons_no_image_graphic_is_not_drawn
+    t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    assert_nil t.block("https://m.media-amazon.com/images/G/01/x-locale/subscriptions/no-img._CB44_.png")
+    assert_empty t.fetched
+  end
+
+  def test_a_missing_url_is_not_an_error
+    t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    assert_nil t.block(nil)
+    assert_nil t.block("")
+  end
+
+  # A thumbnail is decoration. A CDN timeout must not take down the listing.
+  def test_a_download_that_returns_nothing_yields_no_image
+    t = FakeThumbnail.new(rows: 6, body: nil, stream: FakeTTY.new)
+    assert_nil t.block(url)
+    t = FakeThumbnail.new(rows: 6, body: "", stream: FakeTTY.new)
+    assert_nil t.block(url)
+  end
+
+  def test_prefetch_warms_the_cache_for_every_url
+    t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    urls = (1..5).map { |i| url(100 + i) }
+    t.prefetch(urls + urls)
+    assert_equal 5, t.fetched.size
+    urls.each { |u| assert t.block(u) }
+    assert_equal 5, t.fetched.size, "block() should not re-download what prefetch fetched"
+  end
+
+  def test_prefetch_skips_the_placeholders_and_the_blanks
+    t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    t.prefetch([nil, "", "https://m.media-amazon.com/images/G/01/no-img._CB1_.png"])
+    assert_empty t.fetched
+  end
+
+  def test_prefetch_of_nothing_starts_no_threads
+    t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    t.prefetch([])
+    assert_empty t.fetched
+  end
+
+  # Image URLs come out of scraped HTML, so the fetcher is reachable by anything
+  # Amazon (or an injected page) puts in a src attribute. It speaks HTTP only.
+  def test_a_non_http_url_is_refused
+    t = Amazon::Thumbnail.new(rows: 6, stream: FakeTTY.new)
+    assert_nil t.send(:get, "file:///etc/passwd")
+    assert_nil t.send(:get, "not a url at all")
+  end
+
+  def test_the_render_command_asks_chafa_for_the_exact_block
+    t = Amazon::Thumbnail.new(rows: 6, stream: FakeTTY.new)
+    assert_equal ["chafa", "--size=12x6", "/tmp/x.img"], t.send(:render_command, "/tmp/x.img")
+  end
+
+  def renderer(argv)
+    Class.new(Amazon::Thumbnail) do
+      define_method(:render_command) { |_path| argv }
+    end.new(rows: 6, stream: FakeTTY.new)
+  end
+
+  def test_a_renderer_that_succeeds_returns_its_output
+    assert_equal "IMG", renderer(["printf", "IMG"]).send(:render, "/tmp/whatever")
+  end
+
+  # chafa exits non-zero on a file it can't decode. A truncated download is a
+  # missing thumbnail, not a dead listing.
+  def test_a_renderer_that_exits_non_zero_produces_no_image
+    assert_nil renderer(["false"]).send(:render, "/tmp/whatever")
+  end
+
+  # And a renderer that isn't installed at all raises rather than exiting,
+  # which is a different path to the same nil.
+  def test_a_renderer_that_is_not_installed_produces_no_image
+    assert_nil renderer(["/nonexistent/not-a-real-binary"]).send(:render, "/tmp/x")
+  end
+
+  # Every process shares one cache directory; an unwritable one is a slow
+  # listing, not a failed one.
+  def test_a_cache_it_cannot_write_produces_no_image
+    t = Class.new(FakeThumbnail) do
+      define_method(:cache_path) { |_url| Pathname.new("/dev/null/nope/x.img") }
+    end.new(rows: 6, stream: FakeTTY.new)
+    assert_nil t.block("https://m.media-amazon.com/images/I/41ib._SS145_.jpg")
+  end
+end
+
+# Reports what it was asked to draw and returns a marker instead of an escape
+# blob, so the layout around the image is readable in an assertion.
+class StubThumbnails
+  attr_reader :asked, :prefetched
+
+  def initialize(rows: 6, cols: 12, blob: "<IMG>")
+    @rows = rows
+    @cols = cols
+    @blob = blob
+    @asked = []
+    @prefetched = []
+  end
+
+  attr_reader :rows, :cols
+
+  def prefetch(urls) = @prefetched.concat(urls)
+
+  def block(url)
+    @asked << url
+    url.nil? ? nil : @blob
+  end
+end
+
+class ThumbnailLayoutTest < Minitest::Test
+  def fmt = Amazon::Formatter.new(json: false, color: false)
+
+  def render(rows, thumbs)
+    out, = capture_io_streams { fmt.subscriptions(rows, total: nil, thumbnails: thumbs) }
+    out
+  end
+
+  def test_the_table_gives_way_to_one_block_per_subscription
+    out = render([SAMPLE_SUBSCRIPTION], StubThumbnails.new)
+    refute_includes out, "subscription_id  item"
+    assert_includes out, SAMPLE_SUBSCRIPTION["title"]
+    assert_includes out, "<IMG>"
+  end
+
+  def test_every_text_line_clears_the_image
+    out = render([SAMPLE_SUBSCRIPTION], StubThumbnails.new(cols: 12))
+    body = out.lines.map { |l| l.gsub(/\e\[[0-9?]*[a-zA-Z]/, "") }
+                    .reject { |l| l.strip.empty? || l.include?("<IMG>") }
+    refute_empty body
+    body.each { |l| assert l.start_with?(" " * 14), "text ran into the image: #{l.inspect}" }
+  end
+
+  # The block has to be exactly as tall as the arithmetic that moves the cursor
+  # back over it, or the next photograph lands in this one's caption.
+  def test_the_cursor_goes_back_up_by_the_height_of_the_block
+    out = render([SAMPLE_SUBSCRIPTION], StubThumbnails.new(rows: 6))
+    up = out[/\e\[(\d+)A/, 1]
+    printed = out.split("\e7").first.lines.size
+    assert_equal printed, up.to_i
+  end
+
+  # Four lines of text against a six-row image still has to be a six-row block:
+  # short entries that print four lines would walk the images up the screen.
+  def test_a_short_entry_is_padded_to_the_image_height
+    out = render([SAMPLE_SUBSCRIPTION], StubThumbnails.new(rows: 9))
+    assert_equal 9, out[/\e\[(\d+)A/, 1].to_i
+  end
+
+  # And an entry with more to say than the image is tall must not be clipped.
+  def test_a_tall_entry_keeps_all_its_lines
+    row = SAMPLE_SUBSCRIPTION.merge("variation" => "Size: 75oz")
+    out = render([row], StubThumbnails.new(rows: 2))
+    assert_includes out, "Size: 75oz"
+    assert_equal 4, out[/\e\[(\d+)A/, 1].to_i
+  end
+
+  # chafa fits the photo within the box rather than filling it, so a wide
+  # product shot is three rows tall in a six-row block. Counting rows back down
+  # would land three rows high; the saved position doesn't care.
+  def test_the_cursor_is_restored_rather_than_counted_back_down
+    out = render([SAMPLE_SUBSCRIPTION], StubThumbnails.new)
+    assert_includes out, "\e7"
+    assert_includes out, "\e8"
+    refute_match(/\e\[\d+B/, out)
+  end
+
+  # "Clorox®" is six characters to Ruby and seven cells to the terminal, so a
+  # line this side thinks fits can wrap — and a wrapped line makes the block
+  # taller than the cursor arithmetic believes.
+  def test_wrapping_is_disabled_across_the_block_and_restored_after
+    out = render([SAMPLE_SUBSCRIPTION], StubThumbnails.new)
+    assert_includes out, "\e[?7l"
+    assert_includes out, "\e[?7h"
+    assert_operator out.index("\e[?7l"), :<, out.index("\e[?7h")
+  end
+
+  # Ctrl-C halfway down a 59-entry listing must not leave the shell it returns
+  # to without line wrapping.
+  def test_wrapping_is_restored_when_the_block_is_interrupted
+    boom = Object.new
+    def boom.empty? = raise(Interrupt)
+    out, = capture_io_streams do
+      assert_raises(Interrupt) { fmt.send(:beside_image, "<IMG>", [boom], StubThumbnails.new) }
+    end
+    assert_includes out, "\e[?7h"
+  end
+
+  # A subscription with no usable photo still has to hold its column, or the
+  # entries below it read as a different list.
+  def test_a_missing_image_leaves_the_gap_and_keeps_the_text_aligned
+    rows = [SAMPLE_SUBSCRIPTION.merge("image" => nil), SAMPLE_SUBSCRIPTION]
+    out = render(rows, StubThumbnails.new)
+    titled = out.lines.select { |l| l.include?("Example Dishwasher") }
+    assert_equal 2, titled.size
+    assert_equal 1, titled.map { |l| l.index("Example") }.uniq.size
+  end
+
+  def test_the_photos_are_all_fetched_before_the_first_one_is_drawn
+    thumbs = StubThumbnails.new
+    render([SAMPLE_SUBSCRIPTION, SAMPLE_SUBSCRIPTION.merge("image" => "b.jpg")], thumbs)
+    assert_equal [SAMPLE_SUBSCRIPTION["image"], "b.jpg"], thumbs.prefetched
+  end
+
+  def test_the_count_note_still_prints_under_the_blocks
+    out = render([SAMPLE_SUBSCRIPTION], StubThumbnails.new)
+    out2, = capture_io_streams do
+      fmt.subscriptions([SAMPLE_SUBSCRIPTION], total: 59, thumbnails: StubThumbnails.new)
+    end
+    refute_includes out, "showing"
+    assert_includes out2, "showing 1 of 59"
+  end
+
+  # The columns become a sentence, and it has to carry what the columns did.
+  def test_the_summary_line_carries_date_cadence_and_price
+    out = render([SAMPLE_SUBSCRIPTION], StubThumbnails.new)
+    assert_includes out, "September 30"
+    assert_includes out, "every 1 month"
+    assert_includes out, "$14.22"
+  end
+
+  def test_a_quantity_of_one_is_not_worth_a_word
+    out = render([SAMPLE_SUBSCRIPTION], StubThumbnails.new)
+    refute_includes out, "qty"
+    out = render([SAMPLE_SUBSCRIPTION.merge("quantity" => 3)], StubThumbnails.new)
+    assert_includes out, "qty 3"
+  end
+
+  def test_an_unpriced_row_shows_its_rate_and_no_dollar_sign
+    row = SAMPLE_SUBSCRIPTION.merge("price" => nil, "discount" => "Saving 15%")
+    out = render([row], StubThumbnails.new)
+    assert_includes out, "15%"
+    refute_includes out, "$"
+  end
+
+  def test_a_row_with_no_price_at_all_drops_the_separator_too
+    row = SAMPLE_SUBSCRIPTION.merge("price" => nil, "discount" => nil)
+    out = render([row], StubThumbnails.new)
+    assert_includes out, "every 1 month"
+    refute_includes out, "every 1 month ·"
+  end
+
+  def test_show_puts_the_detail_block_beside_the_photo
+    thumbs = StubThumbnails.new(rows: 12, cols: 24)
+    out, = capture_io_streams { fmt.subscription(SAMPLE_DETAIL, thumbnails: thumbs) }
+    assert_includes out, "<IMG>"
+    assert_equal [SAMPLE_DETAIL["image"]], thumbs.prefetched
+    assert_includes out, "#{" " * 28}asin"
+  end
+
+  # The title is the heading of this view; only its fields are indented under
+  # it. Adding a picture must not shift the layout of the version without one.
+  def test_show_without_a_thumbnail_is_unchanged
+    out, = capture_io_streams { fmt.subscription(SAMPLE_DETAIL) }
+    refute_includes out, "\e7"
+    assert out.lines.first.start_with?("Example Dishwasher"), out.lines.first.inspect
+    assert_includes out, "  asin"
+  end
+end
+
+class SubscribeImageFlagTest < Minitest::Test
+  def setup
+    write_config!
+    reset_subscribe_cache!
+    Amazon::Thumbnail.command = true
+  end
+
+  def teardown = Amazon::Thumbnail.command = nil
+
+  def run_cli(argv)
+    with_worker(->(*) { FakeSubscribeWorker.new }) { capture_io_streams { Amazon::CLI.run(argv) } }
+  end
+
+  # The test runner's stdout is a pipe, which is exactly the case that has to
+  # degrade rather than fill the terminal with escape codes.
+  def test_a_pipe_gets_a_warning_and_the_plain_table
+    out, err = run_cli(%w[subscribe list --image])
+    assert_includes err, "images need a terminal"
+    assert_includes out, "subscription_id"
+    refute_includes out, "\e[?7l"
+  end
+
+  def test_show_degrades_to_plain_text_with_one_line_of_explanation
+    Amazon::Thumbnail.command = false
+    out, err = run_cli(%w[subscribe show dishwasher --image])
+    assert_equal 1, err.lines.size
+    assert_includes out, "asin"
+    refute_includes out, "\e7"
+  end
+
+  # A picture is not data, and neither is the escape sequence that draws one.
+  def test_json_is_never_decorated
+    out, err = run_cli(%w[--json subscribe list --image])
+    assert_equal [SAMPLE_SUBSCRIPTION], JSON.parse(out)
+    refute_includes err, "terminal"
+  end
+
+  def test_both_spellings_are_accepted
+    %w[--image --images].each do |flag|
+      reset_subscribe_cache!
+      _, err = run_cli(["subscribe", "list", flag])
+      assert_includes err, "images need a terminal"
+    end
+  end
+
+  def test_the_flag_is_documented_where_it_works
+    %w[list show].each do |sub|
+      out, = capture_io_streams { Amazon::CLI.run(["subscribe", sub, "--help"]) }
+      assert_includes out, "--image"
+    end
+  end
+
+  # `subscribe upcoming` has no photos yet, and a flag that silently does
+  # nothing is worse than one that isn't there.
+  def test_upcoming_does_not_pretend_to_support_it
+    _, err = capture_io_streams { assert_equal 2, Amazon::CLI.run(%w[subscribe upcoming --image]) }
+    assert_includes err, "unknown upcoming option: --image"
+  end
+
+  # The renderer is handed to the formatter only when it can actually draw —
+  # which needs a terminal, so this one hands the command a stdout that says
+  # it is one.
+  def test_a_working_terminal_gets_a_renderer
+    cmd = Amazon::Commands::Subscribe::List.new(
+      Amazon::GlobalOptions.new(json: false, quiet: false, verbose: false)
+    )
+    real = $stdout
+    $stdout = FakeTTY.new
+    begin
+      refute_nil cmd.send(:thumbnails, true, 6)
+      assert_nil cmd.send(:thumbnails, false, 6)
+    ensure
+      $stdout = real
+    end
+  end
+end
+
+# The image fetcher is the only part of this CLI that talks to a server other
+# than through the Python worker, so its redirect and failure handling is
+# tested against a real socket rather than a stub of Net::HTTP.
+class TinyHTTP
+  attr_reader :port, :paths
+
+  def initialize(&handler)
+    @server = TCPServer.new("127.0.0.1", 0)
+    @port = @server.addr[1]
+    @paths = []
+    @handler = handler
+    @thread = Thread.new { serve }
+  end
+
+  def url(path) = "http://127.0.0.1:#{@port}#{path}"
+
+  def stop
+    @thread.kill
+    @server.close
+  rescue IOError
+    nil
+  end
+
+  private
+
+  def serve
+    loop do
+      sock = @server.accept
+      path = sock.gets.to_s.split(" ")[1]
+      nil while sock.gets&.strip&.!= ""
+      @paths << path
+      status, headers, body = @handler.call(path)
+      sock.print "HTTP/1.1 #{status}\r\n"
+      headers.each { |k, v| sock.print "#{k}: #{v}\r\n" }
+      sock.print "Content-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}"
+      sock.close
+    end
+  rescue IOError, Errno::EBADF, Errno::ECONNRESET
+    nil
+  end
+end
+
+class ThumbnailFetchTest < Minitest::Test
+  def setup
+    write_config!
+    @fetcher = Amazon::Thumbnail.new(rows: 6, stream: FakeTTY.new)
+  end
+
+  def with_server
+    server = TinyHTTP.new { |path| handler(path) }
+    yield server
+  ensure
+    server&.stop
+  end
+
+  def test_it_returns_the_body
+    body = with_server { |s| @fetcher.send(:get, s.url("/a.jpg")) }
+    assert_equal "IMAGEBYTES", body
+  end
+
+  # Amazon's image hosts redirect, and a thumbnail that gives up at the first
+  # 302 is a blank margin on every row. The Location header here is relative,
+  # which is legal and is what breaks a fetcher that treats it as a whole URL.
+  def test_it_follows_a_relative_redirect
+    with_server do |s|
+      assert_equal "IMAGEBYTES", @fetcher.send(:get, s.url("/start.jpg"))
+      assert_equal ["/start.jpg", "/final.jpg"], s.paths
+    end
+  end
+
+  def test_a_redirect_with_nowhere_to_go_is_not_followed
+    with_server { |s| assert_nil @fetcher.send(:get, s.url("/nowhere.jpg")) }
+  end
+
+  # A redirect loop is a hang, and this runs 59 times in a row.
+  def test_a_redirect_loop_gives_up
+    with_server do |s|
+      assert_nil @fetcher.send(:get, s.url("/loop.jpg"))
+      assert_operator s.paths.size, :<=, 4, "followed too many redirects"
+    end
+  end
+
+  def test_a_404_is_not_an_image
+    with_server { |s| assert_nil @fetcher.send(:get, s.url("/missing.jpg")) }
+  end
+
+  # Nothing about an unreachable CDN should take down a subscription listing.
+  def test_a_refused_connection_is_survivable
+    server = TinyHTTP.new { ["200 OK", {}, "x"] }
+    url = server.url("/a.jpg")
+    server.stop
+    assert_nil @fetcher.send(:get, url)
+  end
+
+  def handler(path)
+    case path
+    when "/start.jpg" then ["302 Found", { "Location" => "/final.jpg" }, ""]
+    when "/loop.jpg" then ["302 Found", { "Location" => "/loop.jpg" }, ""]
+    when "/nowhere.jpg" then ["302 Found", {}, ""]
+    when "/missing.jpg" then ["404 Not Found", {}, "no"]
+    else ["200 OK", { "Content-Type" => "image/jpeg" }, "IMAGEBYTES"]
     end
   end
 end

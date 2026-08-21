@@ -21,6 +21,7 @@ from browser import text
 from subscriptions import (
     CLICK_TIMEOUT_MS,
     DELIVERY_CARD,
+    DELIVERY_SUBSCRIPTION_CARD,
     FUTURE_DELIVERIES_KEY,
     MAX_PAGES,
     NAVIGATION_KEY,
@@ -46,6 +47,7 @@ from subscriptions import (
     parse_epoch_date,
     parse_label_date,
     parse_schedule,
+    product_image,
     scrape_delivery_card,
     scrape_subscription_card,
     scrape_subscription_detail,
@@ -855,3 +857,80 @@ class AvailableActionsTest(unittest.TestCase):
                 return FakeCardList(1, node=Exploding())
 
         self.assertEqual(available_actions(Page()), [])
+
+
+class ProductImageTest(FixtureTest):
+    """The lazy-load trap, against markup that carries it.
+
+    Amazon defers everything below the fold: `src` holds a 35-byte grey pixel
+    and the photograph waits in data-a-hires. Both are strings ending in a
+    plausible image filename, so reading `src` produces JSON that looks
+    complete and renders a row of grey smudges.
+    """
+
+    def test_a_lazy_loaded_card_yields_the_photo_not_the_grey_pixel(self):
+        page = DomPage.from_fixture("deliveries.html")
+        item = _cards(page, DELIVERY_CARD)[0].locator(DELIVERY_SUBSCRIPTION_CARD).nth(0)
+        # The captured markup has to still contain the trap, or this test
+        # passes by describing markup Amazon no longer serves.
+        self.assertIn("grey-pixel", item.locator("img.sns-product-image").get_attribute("src"))
+
+        url = product_image(item, "img.sns-product-image", "img")
+        self.assertIsNotNone(url)
+        self.assertNotIn("grey-pixel", url)
+        self.assertIn("media-amazon.com/images/", url)
+
+    def test_an_eagerly_loaded_card_yields_its_photo(self):
+        page = DomPage.from_fixture("subscriptions_list.html")
+        record = scrape_subscription_card(_cards(page, SUBSCRIPTION_CARD)[0])
+        self.assertIn("00FIXTUREIMG", record["image"])
+        self.assertNotIn("grey-pixel", record["image"])
+
+    def test_the_detail_modal_yields_its_photo(self):
+        page = DomPage.from_fixture("subscription_detail.html")
+        self.assertIn("00FIXTUREIMG", scrape_subscription_detail(page)["image"])
+
+
+class ProductImageFallbackTest(unittest.TestCase):
+    class FakeImg:
+        def __init__(self, attrs):
+            self.attrs = attrs
+
+        def locator(self, _sel):
+            return self
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1 if self.attrs else 0
+
+        def get_attribute(self, name):
+            return self.attrs.get(name)
+
+    def image(self, attrs, *selectors):
+        return product_image(self.FakeImg(attrs), *(selectors or ("img",)))
+
+    def test_the_hires_copy_wins(self):
+        url = self.image({"data-a-hires": "hi.jpg", "data-src": "mid.jpg", "src": "low.jpg"})
+        self.assertEqual(url, "hi.jpg")
+
+    def test_it_falls_through_to_data_src_then_src(self):
+        self.assertEqual(self.image({"data-src": "mid.jpg", "src": "low.jpg"}), "mid.jpg")
+        self.assertEqual(self.image({"src": "low.jpg"}), "low.jpg")
+
+    def test_a_card_with_only_placeholders_reports_nothing(self):
+        attrs = {"data-a-hires": "grey-pixel.gif", "src": "transparent-pixel.png"}
+        self.assertIsNone(self.image(attrs))
+
+    def test_a_card_with_no_image_at_all_reports_nothing(self):
+        self.assertIsNone(self.image({}))
+
+    # Amazon's own "no image available" graphic is an answer, not a loading
+    # artifact: it is what the account actually shows for that subscription.
+    # Suppressing it here would make a subscription with no photo
+    # indistinguishable from a scrape that failed.
+    def test_the_no_image_graphic_is_passed_through(self):
+        url = self.image({"src": "https://m.media-amazon.com/images/G/01/sns/no-img._CB44_.png"})
+        self.assertIn("no-img", url)

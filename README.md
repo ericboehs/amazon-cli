@@ -130,6 +130,7 @@ lib/amazon/
     search.rb           live product search
     order.rb            `amazon order …` dispatcher
     order/              sync, list, show, search over the local archive
+    thumbnail.rb        product photos in the terminal, via chafa
     subscribe.rb        `amazon subscribe …` dispatcher
     subscribe/          list, upcoming, show (Subscribe & Save, read-only)
     login.rb, config.rb, buy.rb
@@ -173,6 +174,8 @@ reuse the session that `amazon login` persisted.
 ~/.local/share/amazon/cache/storage_state.json  # full Playwright state
 ~/.local/share/amazon/cache/live/{item,item-reviews,search,reviews}/
                                                 # 15-min live-lookup cache
+~/.local/share/amazon/cache/live/subscribe/     # 30-min Subscribe & Save cache
+~/.local/share/amazon/cache/thumbs/             # product photos for --image
 ~/.local/state/amazon/sync.log                  # sync history
 ```
 
@@ -197,6 +200,9 @@ ln -sf "$PWD/../bin/amazon" ~/bin/amazon
 
 # 3) Create config
 amazon config edit
+
+# 4) Optional: terminal product photos for `subscribe --image`
+brew install chafa
 ```
 
 `~/.config/amazon/config.json`:
@@ -344,6 +350,7 @@ amazon subscribe list --all           # click past the first 30
 amazon subscribe upcoming             # the next 3 deliveries, with prices
 amazon subscribe upcoming --all       # every scheduled delivery
 amazon subscribe show dishwasher      # one subscription in full, by id or by title
+amazon subscribe list --image         # with the product photos (needs chafa)
 amazon subscribe list --fresh         # ignore the 30-minute cache
 amazon subscribe upcoming --json | jq '.[0].subtotal'
 ```
@@ -429,6 +436,41 @@ All three cache for 30 minutes, and a cached read says its age on stderr
 the website twenty minutes ago and one that never changed look identical
 otherwise. `--fresh` on any of them drops all three, since they describe one
 account; when write commands land they will invalidate through the same door.
+
+`--image` on `list` and `show` draws the product photo beside each entry.
+Rendering is chafa's job, not this CLI's: it negotiates with the terminal and
+emits kitty graphics, sixel, or unicode half-blocks depending on what
+answered, which is a thing to shell out to rather than reimplement worse. The
+table gives way to one block per subscription, because six columns and a
+photograph is a wall.
+
+```
+$ amazon subscribe list --image
+┌────────┐  Gain Liquid Laundry Detergent, Freshness, Odor Defense, 154 fl oz
+│ (photo)│  September 2 · every 2 months · $14.22
+└────────┘  SNSD0_CPWMW84DZS0X826Y8P77
+```
+
+Images are skipped, with one line on stderr, when stdout isn't a terminal or
+chafa isn't installed — a pipe gets the table, not megabytes of escape codes.
+Photos are cached on disk by URL and size, so the second run draws instantly.
+
+Two things about that layout were measured rather than assumed, and both were
+wrong on the first try. chafa fits a photo *within* the box instead of filling
+it, so a wide product shot comes back three rows tall in a six-row block; and
+Ruby counts `Clorox®` as six characters where the terminal draws seven cells,
+so a line that fits by `String#length` can wrap. Either one makes a block a
+different height than the arithmetic believes, which puts the next photograph
+through the middle of its own caption. The fix is to stop counting: wrapping
+is disabled across the block, and the cursor is saved after the text and
+restored after the image.
+
+Finding the photos had its own trap. Amazon lazy-loads everything below the
+fold, so `src` on those cards is a 35-byte grey pixel and the real URL waits
+in `data-a-hires`. Both are strings ending in a plausible filename, so reading
+`src` produces JSON that looks complete and a list where the first screenful
+has pictures and the rest have grey smudges. The fixtures carry that markup,
+and a test asserts they still do.
 
 Read-only for now: nothing here skips, reschedules, or cancels anything.
 
