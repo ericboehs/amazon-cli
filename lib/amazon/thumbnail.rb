@@ -12,9 +12,13 @@ module Amazon
   # reimplementing it worse, and the fallback path — coloured text — is the one
   # thing every terminal can already do.
   #
-  # Every renderer chafa picks writes a block exactly `cols` wide and `rows`
-  # tall and leaves the cursor at column 1 of the line *below* it, which is
-  # what makes text-beside-image possible without knowing which protocol won.
+  # chafa fits the image *within* the box rather than filling it, so what
+  # comes back is at most `cols`×`rows` and often shorter: a 400x80 product
+  # shot asked for 12x6 draws 2 rows. What every renderer does agree on is
+  # leaving the cursor at column 1 of the line below whatever it drew — which
+  # is why `beside_image` saves and restores the cursor instead of counting
+  # rows back up. The class comment used to claim the block was "exactly cols
+  # wide and rows tall", which is the opposite of the reason that code exists.
   class Thumbnail
     COMMAND = "chafa"
 
@@ -37,11 +41,24 @@ module Amazon
     # `rows` drives everything: the width follows from it, because terminal
     # cells are about twice as tall as they are wide and a thumbnail that
     # ignores that is a portrait of a squashed bottle.
+    #
+    # Validated at the door because every consequence of a bad value shows up
+    # far from the cause: `rows: nil` raised NoMethodError on `nil * 2` from
+    # inside a worker thread, and `rows: -5` sailed through to `chafa
+    # --size=-10x-5` ("Size must be specified as...") and to an image URL
+    # asking Amazon for `._SS-200_.`, both of which fail as a blank space.
     def initialize(rows:, cols: nil, stream: $stdout)
-      @rows = rows
-      @cols = cols || rows * 2
+      @rows = Integer(rows)
+      @cols = Integer(cols || @rows * 2)
+      raise ArgumentError, "thumbnail rows must be positive, got #{@rows}" unless @rows.positive?
+      raise ArgumentError, "thumbnail cols must be positive, got #{@cols}" unless @cols.positive?
+
       @stream = stream
       @cache = {}
+      # Eight threads write to @cache. CRuby's GVL makes that survivable in
+      # practice rather than by contract, and this costs nothing on a Hash
+      # that is written 59 times.
+      @cache_lock = Mutex.new
     end
 
     # Why images can't be drawn, or nil if they can.
@@ -74,8 +91,14 @@ module Amazon
       urls.uniq.select { |u| drawable?(u) }.each { |u| queue << u }
       Array.new([FETCH_THREADS, queue.size].min) do
         Thread.new do
+          # A thumbnail is decoration; a decoration must not be able to end the
+          # command. Anything raised in here used to be re-raised by `join`
+          # into `CLI#run` — and printed twice, because Ruby also reports an
+          # unhandled thread exception with a bare backtrace. `download`
+          # guards its own IO, but that is a list of the failures someone
+          # thought of, and this is the one that isn't.
           while (url = next_in(queue))
-            @cache[url] = download(url)
+            store(url, safe_download(url))
           end
         end
       end.each(&:join)
@@ -88,13 +111,27 @@ module Amazon
     def block(url)
       return nil unless drawable?(url)
 
-      path = @cache.fetch(url) { @cache[url] = download(url) }
+      path = @cache_lock.synchronize { @cache.fetch(url, :miss) }
+      path = store(url, safe_download(url)) if path == :miss
       return nil if path.nil?
 
       render(path)
     end
 
     private
+
+    def store(url, path)
+      @cache_lock.synchronize { @cache[url] = path }
+    end
+
+    # Distinct from `download`'s own rescue: that one knows which failures are
+    # expected, this one exists because the list is never complete.
+    def safe_download(url)
+      download(url)
+    rescue StandardError => e
+      warn "amazon: could not fetch a thumbnail (#{e.class}) — showing text only" if $VERBOSE
+      nil
+    end
 
     # Worth a download and six rows of screen. Both callers ask, because a
     # prefetch that queues what `block` will refuse to draw spends the network

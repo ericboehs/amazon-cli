@@ -6118,6 +6118,56 @@ end
 
 # `op` exits 0 with empty stdout for an empty field, and that empty string used
 # to survive all the way into a browser as a password.
+# A thumbnail is decoration. Nothing about it may end the command, and a bad
+# geometry must fail where it is written rather than as a blank space.
+class ThumbnailHardeningTest < Minitest::Test
+  def test_a_thread_that_raises_anything_does_not_take_down_the_listing
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:download) { |_u| raise ArgumentError, 'invalid byte sequence' }
+    t.prefetch(['https://example.com/a.jpg'])
+    assert_nil t.block('https://example.com/a.jpg'), 'a failed fetch draws nothing'
+  end
+
+  # `download` rescues the failures someone thought of; this is about the ones
+  # nobody did. Ruby also prints an unhandled thread exception on its own, so
+  # the old behaviour reported it twice.
+  def test_the_same_is_true_of_the_lazy_path
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:download) { |_u| raise 'kaboom' }
+    assert_nil t.block('https://example.com/a.jpg')
+  end
+
+  def test_a_geometry_chafa_cannot_use_is_refused_at_the_door
+    [0, -5].each do |rows|
+      e = assert_raises(ArgumentError) { Amazon::Thumbnail.new(rows: rows) }
+      assert_includes e.message, 'must be positive'
+    end
+    assert_raises(ArgumentError) { Amazon::Thumbnail.new(rows: 4, cols: 0) }
+  end
+
+  # `rows: nil` used to raise NoMethodError on `nil * 2`, from inside a worker
+  # thread, several frames from whoever passed the nil.
+  def test_a_missing_geometry_says_so_where_it_happened
+    assert_raises(TypeError) { Amazon::Thumbnail.new(rows: nil) }
+  end
+
+  def test_a_usable_geometry_still_works
+    t = Amazon::Thumbnail.new(rows: 6)
+    assert_equal [6, 12], [t.rows, t.cols]
+    assert_equal ['chafa', '--size=12x6', '/x.jpg'], t.send(:render_command, '/x.jpg')
+  end
+
+  # Eight threads share one Hash.
+  def test_concurrent_fetches_all_land
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:download) { |u| "/tmp/#{u[-5..]}" }
+    urls = Array.new(50) { |i| "https://example.com/#{i}.jpg" }
+    t.prefetch(urls)
+    t.define_singleton_method(:download) { |_u| flunk('should have been cached') }
+    urls.each { |u| assert t.send(:drawable?, u) }
+  end
+end
+
 class SecretsPostconditionTest < Minitest::Test
   # Hand-rolled, like the rest of this file, and above all never touching the
   # real `op`: a test that shells out to a password manager is a test that

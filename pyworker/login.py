@@ -94,8 +94,6 @@ ORDER_HISTORY_PATHS = (
     "/gp/css/order-history",
 )
 
-# Pages it is safe to steer away from: an idle tab sitting on the storefront.
-# Deliberately an allowlist — see `should_renavigate`.
 # Post-authentication upsells. Amazon signs you in and then, instead of your
 # orders, offers to add a passkey or a phone number — a page that is not a
 # sign-in step, not order history, and not going anywhere until someone
@@ -800,7 +798,15 @@ def main() -> int:
                             ),
                         )
             except Exception as e:  # noqa: BLE001
-                emit("log", msg=f"could not pre-fill email ({e}); continue manually")
+                # Not necessarily the email: this guard covers the continue
+                # click and the password fill too, and blaming the first step
+                # for the third one's failure sends the reader to the wrong
+                # config key. Autofill is a convenience over a login that
+                # works without it, so any of it failing is a log line.
+                emit(
+                    "log",
+                    msg=f"could not autofill the sign-in form ({type(e).__name__}); continue manually",
+                )
 
         emit(
             "log",
