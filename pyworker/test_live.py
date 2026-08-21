@@ -6,6 +6,8 @@ No Playwright needed — these functions never touch a browser.
 
 import io
 import json
+import math
+import re
 import unittest
 from contextlib import redirect_stdout
 from datetime import date
@@ -2095,3 +2097,90 @@ class RealMarkupPriceTest(unittest.TestCase):
                 1,
                 f"{name}: the seller is not inside the row the price is read from",
             )
+
+
+class FixtureHygieneTest(unittest.TestCase):
+    """Every fixture here was captured from a signed-in session.
+
+    Sanitizing them has been a regex per spelling, and that lost: Amazon
+    writes its CSRF token as `data-csrf-token="..."`, as an
+    `anti-csrftoken-a2z` hidden input with `type=` sitting between the name
+    and the value, as a `csrfT=` query parameter, and as `"csrfT":"..."`
+    inside a JSON blob. Three of those four shipped a live token at some
+    point, and the two in `review_listing.html` rode along for a whole
+    release. A scrub only covers the spellings someone thought of; this
+    covers the ones nobody has seen yet, because it grades the output
+    instead of the pattern.
+    """
+
+    # Amazon's tokens are base64 with an embedded timestamp — long, and dense
+    # in a way that markup is not. Real class names and ref_ tags reach the
+    # low fours; every captured token measured above 4.4.
+    MIN_LENGTH = 40
+    MAX_ENTROPY = 4.4
+
+    # Two shapes, both anchored at the token name so the scan grades the
+    # value that belongs to it rather than the next quoted thing on the line —
+    # which in review_listing.html is a review id, and looks alarming.
+    VALUE_PATTERNS = (
+        # csrfT=X   "csrfT":"X"   data-csrf-token="X"
+        re.compile(r'^["\']?\s*[:=]\s*["\']?([A-Za-z0-9+/=%]{12,})'),
+        # <input name="anti-csrftoken-a2z" type="hidden" value="X">
+        re.compile(r'^"(?:\s+[\w-]+="[^"]*")*?\s+value="([^"]{12,})"'),
+    )
+
+    @staticmethod
+    def _entropy(s):
+        return -sum(
+            (s.count(c) / len(s)) * math.log2(s.count(c) / len(s)) for c in set(s)
+        )
+
+    def fixtures(self):
+        found = sorted(FIXTURES.glob("*.html"))
+        self.assertTrue(found, "no fixtures found — this test would pass vacuously")
+        return found
+
+    def test_no_fixture_carries_a_live_csrf_token(self):
+        for path in self.fixtures():
+            text = path.read_text(encoding="utf-8")
+            for match in re.finditer(r"csrf[\w-]*", text, re.I):
+                # The placeholder contains the word too; matching it and then
+                # reading ahead finds whatever id happens to come next.
+                if text[max(0, match.start() - 8) : match.start()].endswith("FIXTURE_"):
+                    continue
+                # Whatever the spelling, the value near it must be the
+                # placeholder. 120 chars covers `type="hidden"` sitting
+                # between the name and the value.
+                window = text[match.end() : match.end() + 120]
+                for pattern in self.VALUE_PATTERNS:
+                    value = pattern.match(window)
+                    if value:
+                        self.assertEqual(
+                            value.group(1),
+                            "FIXTURE_CSRF",
+                            f"{path.name}: live CSRF token near {match.group(0)!r}",
+                        )
+                        break
+
+    def test_no_fixture_carries_anything_shaped_like_a_credential(self):
+        for path in self.fixtures():
+            for blob in set(
+                re.findall(r"[A-Za-z0-9+/=]{%d,}" % self.MIN_LENGTH, path.read_text(encoding="utf-8"))
+            ):
+                self.assertLessEqual(
+                    self._entropy(blob),
+                    self.MAX_ENTROPY,
+                    f"{path.name}: {blob[:24]}… looks captured, not synthetic",
+                )
+
+    def test_the_scan_would_actually_catch_one(self):
+        """A hygiene test that cannot fail is decoration."""
+        real = "hG7RESurQfEiUWu7GB3ltqBHWv711ScDiXOVFE3asPj4AAAAAGp6Bi8AAAAB"
+        self.assertGreater(self._entropy(real), self.MAX_ENTROPY)
+        self.assertGreaterEqual(len(real), self.MIN_LENGTH)
+
+    def test_no_fixture_names_the_account_it_came_from(self):
+        for path in self.fixtures():
+            text = path.read_text(encoding="utf-8").lower()
+            for tell in ("ericboehs", "@gmail", "@oddball", "boehs"):
+                self.assertNotIn(tell, text, f"{path.name} names its source")

@@ -676,7 +676,14 @@ selectors are checked against markup Amazon actually served rather than
 markup I remembered. The fixtures carry fake subscription ids, ship ids,
 CSRF tokens, product titles, and addresses; nothing in them identifies an
 account, and the edit-modal test asserts that no address or payment method
-reaches the output at all. Pagination is exercised against a fake page that
+reaches the output at all. That claim is now enforced rather than promised:
+`FixtureHygieneTest` scans every fixture for anything shaped like a captured
+credential. It exists because the hand-written scrub missed three of the four
+ways Amazon spells a CSRF token — an `anti-csrftoken-a2z` input with `type=`
+between the name and the value, a `csrfT=` query parameter, and a `"csrfT":`
+JSON key — and two live tokens rode along in `review_listing.html` for a
+whole release. A scrub only covers the spellings someone thought of.
+Pagination is exercised against a fake page that
 reproduces one measured Amazon quirk: clicking "show more" grows the DOM but
 leaves the server-rendered `loadedItemCount` frozen at its original value.
 Believing that counter is an infinite loop, and the fake is built to fail
