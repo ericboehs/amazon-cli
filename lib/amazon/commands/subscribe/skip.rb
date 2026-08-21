@@ -70,8 +70,7 @@ module Amazon
         end
 
         def refuse(reason)
-          warn "amazon: #{reason || "nothing to skip"}"
-          2
+          Mutation.refuse(reason, "the skip")
         end
 
         def help_text

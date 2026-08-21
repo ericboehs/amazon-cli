@@ -13,16 +13,50 @@ module Amazon
     class << self
       def read(ref)
         out, err, status = Open3.capture3(*command(ref))
-        raise Error, "op read failed for #{ref}: #{err.strip}" unless status.success?
+        raise Error, failure_message(ref, err) unless status.success?
 
-        out.chomp
+        value = out.chomp
+        # `op` can exit 0 and print nothing — an empty field, or a reference to
+        # a field that doesn't exist in some versions. An empty password then
+        # survives `.compact` on the Ruby side and is only caught by a `or
+        # None` in Python, which is an invariant enforced across a process
+        # boundary by accident.
+        raise Error, "#{ref} is empty in 1Password — check the field name" if value.empty?
+
+        value
       end
 
+      # 1Password's account shorthand. `my` is the default for a personal
+      # account and was hardcoded and undocumented, so anyone whose account is
+      # named anything else got "op read failed" with no hint that the account
+      # was the problem.
+      def account = ENV.fetch("AMAZON_OP_ACCOUNT", "my")
+
       def command(ref)
-        ["bash", "-lc", "op signin --account my >/dev/null && op read #{shellword(ref)}"]
+        ["bash", "-lc",
+         "op signin --account #{shellword(account)} >/dev/null && op read #{shellword(ref)}"]
       end
 
       private
+
+      # `op` sends both failures to the same stream, and "your vault is locked"
+      # and "that field does not exist" want completely different responses.
+      #
+      # The pattern is what `op` actually says, checked against it rather than
+      # guessed: a bad `--account` reports `found no accounts for filter "x"`,
+      # which an invented /signin|session/ did not match.
+      ACCOUNT_TROUBLE = /sign\s*in|not signed in|session|authenticat|no accounts|account/i
+
+      def failure_message(ref, err)
+        said = err.to_s.strip
+        if said.match?(ACCOUNT_TROUBLE)
+          "1Password wouldn't sign in to account #{account.inspect}: #{said}\n" \
+            "Set AMAZON_OP_ACCOUNT if your account shorthand isn't #{account.inspect}, " \
+            "or run `op signin` once by hand."
+        else
+          "op read failed for #{ref}: #{said}"
+        end
+      end
 
       def shellword(str)
         # Refs like op://Personal/Amazon/password are safe; still quote

@@ -5622,7 +5622,7 @@ class SecretsTest < Minitest::Test
   end
 
   def test_it_signs_in_before_reading
-    assert_includes Amazon::Secrets.command('op://a/b').last, 'op signin --account my'
+    assert_includes Amazon::Secrets.command('op://a/b').last, %(op signin --account 'my')
   end
 
   def test_a_successful_read_is_chomped
@@ -6113,6 +6113,141 @@ class SubscribeDegradationReplayTest < Minitest::Test
       out, = capture_io_streams { Amazon::CLI.run(%w[--json subscribe list]) }
     end
     refute_includes out, PARTIAL, 'rows are the payload; the note rides on the cache entry'
+  end
+end
+
+# `op` exits 0 with empty stdout for an empty field, and that empty string used
+# to survive all the way into a browser as a password.
+class SecretsPostconditionTest < Minitest::Test
+  # Hand-rolled, like the rest of this file, and above all never touching the
+  # real `op`: a test that shells out to a password manager is a test that
+  # prints a live password when it fails.
+  def with_op(stdout: '', stderr: '', ok: true)
+    original = Open3.method(:capture3)
+    status = Object.new
+    status.define_singleton_method(:success?) { ok }
+    Open3.define_singleton_method(:capture3) { |*| [stdout, stderr, status] }
+    yield
+  ensure
+    Open3.define_singleton_method(:capture3, original)
+  end
+
+  def test_an_empty_value_is_not_a_secret
+    with_op(stdout: "\n") do
+      e = assert_raises(Amazon::Secrets::Error) { Amazon::Secrets.read('op://a/b/c') }
+      assert_includes e.message, 'is empty in 1Password'
+      refute_includes e.message, 'op read failed'
+    end
+  end
+
+  def test_a_real_value_comes_back_without_its_newline
+    with_op(stdout: "hunter2\n") { assert_equal 'hunter2', Amazon::Secrets.read('op://a/b/c') }
+  end
+
+  # A locked vault and a mistyped field name arrive as the same failed `op`,
+  # and they want completely different things from the user.
+  def test_a_signin_failure_names_the_account_and_the_way_out
+    with_op(stderr: 'error: not signed in to any accounts', ok: false) do
+      e = assert_raises(Amazon::Secrets::Error) { Amazon::Secrets.read('op://a/b/c') }
+      assert_includes e.message, 'AMAZON_OP_ACCOUNT'
+      assert_includes e.message, '"my"'
+    end
+  end
+
+  # Verbatim from a real `op` 2.x, because the first pattern here was invented
+  # (/signin|session/) and did not match what it actually says.
+  def test_the_real_wording_of_a_bad_account_is_recognised
+    with_op(stderr: '[ERROR] found no accounts for filter "nosuchaccount"', ok: false) do
+      e = assert_raises(Amazon::Secrets::Error) { Amazon::Secrets.read('op://a/b/c') }
+      assert_includes e.message, 'AMAZON_OP_ACCOUNT'
+    end
+  end
+
+  def test_the_real_wording_of_a_bad_field_is_not_mistaken_for_one
+    said = "could not read secret 'op://Personal/Amazon/nosuchfield': " \
+           "item 'Personal/Amazon' does not have a field 'nosuchfield'"
+    with_op(stderr: said, ok: false) do
+      e = assert_raises(Amazon::Secrets::Error) { Amazon::Secrets.read('op://a/b/c') }
+      refute_includes e.message, 'AMAZON_OP_ACCOUNT'
+    end
+  end
+
+  def test_a_missing_field_still_blames_the_field
+    with_op(stderr: "isn't an item in the Personal vault", ok: false) do
+      e = assert_raises(Amazon::Secrets::Error) { Amazon::Secrets.read('op://a/b/c') }
+      assert_includes e.message, 'op read failed for op://a/b/c'
+      refute_includes e.message, 'AMAZON_OP_ACCOUNT'
+    end
+  end
+
+  # `my` is 1Password's shorthand for a personal account. It was hardcoded, so
+  # anyone whose account is named otherwise got an unexplained failure.
+  def test_the_account_is_overridable
+    old = ENV.fetch('AMAZON_OP_ACCOUNT', nil)
+    ENV['AMAZON_OP_ACCOUNT'] = 'work'
+    assert_includes Amazon::Secrets.command('op://a/b').last, %(--account 'work')
+  ensure
+    old.nil? ? ENV.delete('AMAZON_OP_ACCOUNT') : ENV['AMAZON_OP_ACCOUNT'] = old
+  end
+
+  # This value reaches a `bash -lc` string, so quoting is the whole defence.
+  # Asserting the substring is absent proves nothing — it is present, inside
+  # quotes. The property is that bash reads it back as one word, unchanged.
+  def test_an_account_name_cannot_smuggle_a_command
+    hostile = "x'; echo PWNED; echo '"
+    old = ENV.fetch('AMAZON_OP_ACCOUNT', nil)
+    ENV['AMAZON_OP_ACCOUNT'] = hostile
+    script = Amazon::Secrets.command('op://a/b').last
+        .sub('op signin', %(printf '%s\\n')).sub(' >/dev/null && op read', '; : ')
+    out, = Open3.capture3('bash', '-lc', script)
+    lines = out.lines.map(&:chomp)
+    assert_equal ['--account', hostile], lines.first(2)
+    # PWNED appears in that second line as *data*, which is the point. A line
+    # that is only PWNED would mean bash ran it.
+    refute_includes lines, 'PWNED'
+  ensure
+    old.nil? ? ENV.delete('AMAZON_OP_ACCOUNT') : ENV['AMAZON_OP_ACCOUNT'] = old
+  end
+end
+
+# A refusal from Amazon and a worker that produced no output are not the same
+# event. Reported identically, the second one printed "nothing to skip" — a
+# confident claim about the account, made on no evidence at all.
+class MutationRefusalTest < Minitest::Test
+  def test_a_reason_from_amazon_is_passed_through_as_an_answer
+    err, code = capture_refusal { Amazon::Commands::Subscribe::Mutation.refuse('no match for "xyz"', 'the skip') }
+    assert_includes err, 'no match for "xyz"'
+    assert_equal Amazon::Commands::Subscribe::Mutation::NOT_ATTEMPTED, code
+  end
+
+  def test_no_reason_at_all_is_reported_as_our_bug_not_as_an_account_fact
+    err, code = capture_refusal { Amazon::Commands::Subscribe::Mutation.refuse(nil, 'the skip') }
+    assert_includes err, 'without saying anything about the skip'
+    assert_includes err, 'nothing was changed'
+    assert_includes err, '-v'
+    assert_equal Amazon::Commands::Subscribe::Mutation::FAILED, code
+  end
+
+  def test_it_never_invents_a_reason
+    err, = capture_refusal { Amazon::Commands::Subscribe::Mutation.refuse(nil, 'the cancellation') }
+    refute_includes err, 'nothing to cancel'
+  end
+
+  # Each command names its own action, so the line still makes sense in a
+  # scrollback with everything else in it.
+  def test_each_command_names_what_it_could_not_do
+    { 'skip' => 'the skip', 'cancel' => 'the cancellation',
+      'schedule' => 'the schedule change' }.each do |cmd, phrase|
+      src = File.read(File.expand_path("../lib/amazon/commands/subscribe/#{cmd}.rb", __dir__))
+      assert_includes src, %(Mutation.refuse(reason, "#{phrase}")),
+                      "#{cmd} should delegate refusal to the shared rule"
+    end
+  end
+
+  def capture_refusal
+    code = nil
+    _, err = capture_io_streams { code = yield }
+    [err, code]
   end
 end
 

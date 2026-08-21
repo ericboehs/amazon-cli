@@ -85,8 +85,7 @@ module Amazon
         end
 
         def refuse(reason)
-          warn "amazon: #{reason || "nothing to change"}"
-          2
+          Mutation.refuse(reason, "the schedule change")
         end
 
         def help_text

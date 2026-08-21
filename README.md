@@ -239,6 +239,13 @@ swap in your own password manager or just hardcode a value if you must.
 read` returns its `otpauth://` URI, and the worker extracts the TOTP secret
 without persisting or logging it. The Python worker never logs credentials.
 
+Signing in uses 1Password's `my` account shorthand, which is the default for a
+personal account. If yours is called something else, set `AMAZON_OP_ACCOUNT`:
+
+```sh
+export AMAZON_OP_ACCOUNT=work
+```
+
 ## Use
 
 ```bash

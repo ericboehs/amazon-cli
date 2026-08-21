@@ -35,6 +35,24 @@ module Amazon
         # `applied` is the command's own key — "confirmed", "cancelled",
         # "applied" — already read out of the result, since those names are
         # part of the --json contract and not worth breaking to unify.
+        # Amazon said no, or the worker broke. These are not the same thing
+        # and they were reported identically: `refuse(worker.not_found)` with
+        # a nil reason printed "nothing to skip", which is a confident claim
+        # about the account made on no evidence. The worker returning nil
+        # *without* a refusal means it exited 0 having emitted no result at
+        # all — a bug on our side, not a fact about the subscription — so it
+        # exits 1 like other failures instead of 2 like an answer.
+        def refuse(reason, what)
+          if reason
+            warn "amazon: #{reason}"
+            return NOT_ATTEMPTED
+          end
+
+          warn "amazon: the worker finished without saying anything about #{what} — " \
+               "nothing was changed. Re-run with -v to see what it did."
+          FAILED
+        end
+
         def exit_code(applied:, verified:)
           return NOT_ATTEMPTED unless applied
           return UNVERIFIED if verified.nil?
