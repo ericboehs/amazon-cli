@@ -451,8 +451,13 @@ def scrape_delivery_card(card: Any) -> dict[str, Any]:
     try:
         epoch = card.get_attribute("data-delivery-date")
         kind = card.get_attribute("data-delivery-type")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # These two `pass`es used to be silent, and between them they turn an
+        # unreadable card into `{date: None, items: [], subtotal: None}` — which
+        # the formatter renders as "(undated) 0 items". That is a confident,
+        # well-formed lie: a delivery that failed to parse and a delivery with
+        # nothing in it look identical, and only one of them is real.
+        warn(f"could not read a delivery's date ({type(e).__name__}) — it will show as undated")
 
     items: list[dict[str, Any]] = []
     try:
@@ -461,8 +466,11 @@ def scrape_delivery_card(card: Any) -> dict[str, Any]:
             item = scrape_delivery_item(nodes.nth(i))
             if item:
                 items.append(item)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        warn(
+            f"could not read the items in the delivery dated {parse_epoch_date(epoch) or 'unknown'} "
+            f"({type(e).__name__}) — it will show as empty, which is not the same as being empty"
+        )
 
     priced = [i["price"] for i in items if isinstance(i["price"], (int, float))]
     return {
@@ -522,37 +530,29 @@ def load_all_pages(page: Any) -> None:
             return
         trigger = page.locator(".subscription-pagination-trigger")
         if not _clickable(trigger):
-            emit(
-                "log",
-                level="warn",
-                msg=f"only {before} of {total} subscriptions loaded and no usable "
-                "'show more' trigger is on the page — reporting a partial list",
+            warn(
+                f"only {before} of {total} subscriptions loaded and no usable "
+                "'show more' trigger is on the page — reporting a partial list"
             )
             return
         try:
             trigger.first.click(timeout=CLICK_TIMEOUT_MS)
         except Exception as e:  # noqa: BLE001
-            emit(
-                "log",
-                level="warn",
-                msg=f"'show more' would not accept a click at {before} of {total} "
-                f"subscriptions ({type(e).__name__}) — reporting a partial list",
+            warn(
+                f"'show more' would not accept a click at {before} of {total} "
+                f"subscriptions ({type(e).__name__}) — reporting a partial list"
             )
             return
         page.wait_for_timeout(PAGE_SETTLE_MS)
         after = len(_cards(page, SUBSCRIPTION_CARD))
         if after <= before:
-            emit(
-                "log",
-                level="warn",
-                msg=f"'show more' added no subscriptions (stuck at {after} of "
-                f"{total}) — reporting a partial list",
+            warn(
+                f"'show more' added no subscriptions (stuck at {after} of "
+                f"{total}) — reporting a partial list"
             )
             return
-    emit(
-        "log",
-        level="warn",
-        msg=f"stopped after {MAX_PAGES} pages of subscriptions — reporting a partial list",
+    warn(
+        f"stopped after {MAX_PAGES} pages of subscriptions — reporting a partial list"
     )
 
 
@@ -616,11 +616,9 @@ def _delivery_cards_or_warn(page: Any, nav: dict[str, Any]) -> list[dict[str, An
     try:
         return fetch_delivery_cards(page, nav)
     except Exception as e:  # noqa: BLE001
-        emit(
-            "log",
-            level="warn",
-            msg=f"could not read the deliveries view ({type(e).__name__}), so prices "
-            "and discounts are missing below — the schedules are still real",
+        warn(
+            f"could not read the deliveries view ({type(e).__name__}), so prices "
+            "and discounts are missing below — the schedules are still real"
         )
         return []
 
@@ -693,11 +691,9 @@ def _warn_selector_rot(rows: list[dict[str, Any]]) -> None:
     for field in EXPECTED_SUBSCRIPTION_FIELDS:
         missing = sum(1 for r in rows if not r.get(field))
         if missing == len(rows):
-            emit(
-                "log",
-                level="warn",
-                msg=f"every subscription came back with no {field} — the selector "
-                "for it has probably changed; the rest of this output is still real",
+            warn(
+                f"every subscription came back with no {field} — the selector "
+                "for it has probably changed; the rest of this output is still real"
             )
 
 
@@ -738,17 +734,34 @@ def fetch_delivery_cards(page: Any, nav: dict[str, Any]) -> list[dict[str, Any]]
         guard(page)
         cards.extend(scrape_delivery_card(c) for c in _cards(page, DELIVERY_CARD))
     else:
-        emit(
-            "log",
-            level="warn",
-            msg="no future-deliveries URL in the page state — showing only the "
-            "current delivery",
+        warn(
+            "no future-deliveries URL in the page state — showing only the "
+            "current delivery"
         )
 
     # A delivery with no date is a card we failed to read, not a delivery, and
     # sorting it against real ones would put it somewhere arbitrary.
     cards.sort(key=lambda c: (c["date"] is None, c["date"] or ""))
     return cards
+
+
+# Warnings said during a scrape, so they can ride along with the payload.
+#
+# A degraded read is cached like any other, and on a hit the warning was
+# already spoken — to a process that has since exited. What is left is a
+# partial answer that looks exactly like a whole one for the next half hour.
+# `live.py` solved this with `_degraded`; this module emitted its warnings and
+# forgot them.
+_DEGRADED: list[str] = []
+
+
+def warn(msg: str) -> None:
+    _DEGRADED.append(msg)
+    emit("log", level="warn", msg=msg)
+
+
+def degradations() -> list[str]:
+    return list(_DEGRADED)
 
 
 class NoSuchSubscription(Exception):
@@ -1487,14 +1500,14 @@ def main() -> int:
                     )
                     for row in rows:
                         emit("subscription", data=row)
-                    emit("done", count=len(rows), total=total)
+                    emit("done", count=len(rows), total=total, degraded=degradations())
 
                 elif action == "deliveries":
                     emit("log", level="info", msg="reading your scheduled deliveries")
                     cards = scrape_deliveries(page)
                     for card in cards:
                         emit("delivery", data=card)
-                    emit("done", count=len(cards))
+                    emit("done", count=len(cards), degraded=degradations())
 
                 elif action == "subscription":
                     sub_id = req.get("subscription_id")
@@ -1504,7 +1517,7 @@ def main() -> int:
                         return 2
                     emit("log", level="info", msg=f"looking up {sub_id or query}")
                     emit("detail", data=scrape_subscription(page, sub_id, query))
-                    emit("done", count=1)
+                    emit("done", count=1, degraded=degradations())
 
                 elif action == "skip":
                     sub_id = req.get("subscription_id")

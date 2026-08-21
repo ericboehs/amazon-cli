@@ -24,7 +24,15 @@ module Amazon
           cache = Amazon::Cache.new(NAMESPACE, ttl: TTL, read: !fresh)
           cache.clear if fresh
           value = cache.fetch(key) { yield }
-          note_cache_age(cache, key) if cache.hit
+          if cache.hit
+            # The worker's warnings were spoken on the run that scraped this,
+            # to a process that has since exited. Without replaying them a
+            # partial list served from disk looks exactly like a whole one —
+            # `item` and `reviews` already do this; the subscribe path had
+            # neither half.
+            cache.replay_degradations(value)
+            note_cache_age(cache, key)
+          end
           value
         end
 

@@ -3738,6 +3738,15 @@ class FakeSubscribeWorker
     @schedule_result.merge('applied' => confirm)
   end
 
+  # What the real worker reports it had to give up on. Empty unless a test
+  # says otherwise, so the degraded path has to be asked for.
+  def degradations = @degradations || []
+
+  def with_degradations(*msgs)
+    @degradations = msgs
+    self
+  end
+
   attr_reader :asked_for, :asked_confirm, :asked_reason, :asked_schedule
 
   def with_skip(result)
@@ -6003,6 +6012,72 @@ end
 # two lists were the same list, so renaming a kind on either side turns a clean
 # exit-2 refusal into "amazon: live lookup failed" at exit 1 — with both test
 # suites green, because each one is right about its own half.
+# A degraded scrape is cached like any other. The warnings that explain it are
+# said once, on the run that scraped — and then the same partial answer is
+# served for thirty minutes looking exactly like a whole one.
+class SubscribeDegradationReplayTest < Minitest::Test
+  PARTIAL = "only 30 of 59 subscriptions loaded and no usable 'show more' trigger".freeze
+
+  def setup
+    write_config!
+    reset_subscribe_cache!
+  end
+
+  def run_twice(argv)
+    worker = FakeSubscribeWorker.new.with_degradations(PARTIAL)
+    first = second = nil
+    with_worker(->(*) { worker }) do
+      _, first = capture_io_streams { Amazon::CLI.run(argv) }
+      _, second = capture_io_streams { Amazon::CLI.run(argv) }
+    end
+    [first, second, worker]
+  end
+
+  # Only the second run is asserted on. On the first the real worker prints
+  # this to stderr itself as it scrapes, which the fake does not model — and
+  # the first run was never the problem.
+  def test_list_says_it_again_on_a_cache_hit
+    _first, second, worker = run_twice(%w[subscribe list])
+    assert_equal 1, worker.calls, 'the second run was not served from cache'
+    assert_includes second, PARTIAL
+    assert_includes second, '[cached]', 'a replayed warning must say it is a replay'
+  end
+
+  def test_upcoming_says_it_again_too
+    _first, second, = run_twice(%w[subscribe upcoming])
+    assert_includes second, PARTIAL
+  end
+
+  def test_show_says_it_again_too
+    _first, second, = run_twice(%w[subscribe show dishwasher])
+    assert_includes second, PARTIAL
+  end
+
+  # The ordinary case must stay silent, or the marker becomes noise and the
+  # one time it matters gets skimmed past.
+  def test_a_whole_scrape_replays_nothing
+    worker = FakeSubscribeWorker.new
+    err = nil
+    with_worker(->(*) { worker }) do
+      capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+      _, err = capture_io_streams { Amazon::CLI.run(%w[subscribe list]) }
+    end
+    refute_includes err, '[cached]'
+    assert_includes err, 'cached', 'the age note should still be there'
+  end
+
+  # --json is a data channel; the degradation belongs in the payload, and the
+  # human-facing replay must not be the only record of it.
+  def test_json_carries_the_reason_in_the_payload
+    worker = FakeSubscribeWorker.new.with_degradations(PARTIAL)
+    out = nil
+    with_worker(->(*) { worker }) do
+      out, = capture_io_streams { Amazon::CLI.run(%w[--json subscribe list]) }
+    end
+    refute_includes out, PARTIAL, 'rows are the payload; the note rides on the cache entry'
+  end
+end
+
 class RefusalKindContractTest < Minitest::Test
   WORKER = 'pyworker/subscriptions.py'.freeze
 
@@ -6259,6 +6334,7 @@ class SubscribeScheduleCommandTest < Minitest::Test
     def exploding.subscriptions(*, **) = [SAMPLE_SUBSCRIPTION]
     def exploding.deliveries(*, **) = [SAMPLE_DELIVERY]
     def exploding.subscription_total = 1
+    def exploding.degradations = []
     def exploding.not_found = nil
 
     with_worker(->(*) { exploding }) do
@@ -6277,6 +6353,7 @@ class SubscribeScheduleCommandTest < Minitest::Test
     def exploding.subscriptions(*, **) = [SAMPLE_SUBSCRIPTION]
     def exploding.deliveries(*, **) = [SAMPLE_DELIVERY]
     def exploding.subscription_total = 1
+    def exploding.degradations = []
     def exploding.not_found = nil
 
     with_worker(->(*) { exploding }) do

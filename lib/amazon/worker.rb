@@ -119,10 +119,13 @@ module Amazon
     def subscriptions(all: false)
       rows = []
       @subscription_total = nil
+      @degradations = []
       run({ action: "subscriptions", all: all }, script: "subscriptions.py") do |event|
         case event["event"]
         when "subscription" then rows << event["data"]
-        when "done"         then @subscription_total = event["total"]
+        when "done"
+          @subscription_total = event["total"]
+          @degradations = Array(event["degraded"])
         when "log"          then log_event(event)
         when "error"        then raise Error, live_error(event)
         end
@@ -134,11 +137,23 @@ module Amazon
     # same as the number returned when the caller asked for all of them.
     attr_reader :subscription_total
 
+    # What the worker had to give up on during this scrape, in its own words.
+    #
+    # Kept so the caller can store it with the payload: these warnings go to
+    # stderr as they happen, which is the right place exactly once. On a cache
+    # hit they were said to a process that has already exited, and what is
+    # left is a partial answer indistinguishable from a whole one.
+    def degradations
+      @degradations || []
+    end
+
     def deliveries
       cards = []
+      @degradations = []
       run({ action: "deliveries" }, script: "subscriptions.py") do |event|
         case event["event"]
         when "delivery" then cards << event["data"]
+        when "done"     then @degradations = Array(event["degraded"])
         when "log"      then log_event(event)
         when "error"    then raise Error, live_error(event)
         end
@@ -152,11 +167,13 @@ module Amazon
     # two want different exit codes.
     def subscription(id_or_query)
       begin_lookup!
+      @degradations = []
       detail = nil
       key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
       run({ action: "subscription", key => id_or_query }, script: "subscriptions.py") do |event|
         case event["event"]
         when "detail" then detail = event["data"]
+        when "done"   then @degradations = Array(event["degraded"])
         when "log"    then log_event(event)
         when "error"
           raise Error, live_error(event) unless event["kind"] == "not_found"

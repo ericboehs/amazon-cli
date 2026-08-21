@@ -71,6 +71,12 @@ module Amazon
             worker = Amazon::Worker.new(verbose: @global.verbose)
             result = worker.subscription(target)
             reason = worker.not_found
+            # The detail *is* the cached payload here, so the warnings have to
+            # travel inside it — merged rather than assigned, because the
+            # worker's hash is not ours to modify.
+            if result && !worker.degradations.empty?
+              result = result.merge("_degraded" => worker.degradations)
+            end
             result
           end
           [detail, reason]

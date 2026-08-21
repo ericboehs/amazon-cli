@@ -46,9 +46,16 @@ module Amazon
           # v2: the cached shape gained a product image per item. Serving a v1
           # payload to --image would draw a screen of blank margins for half an
           # hour, with nothing on it to say why.
-          cards = cached("deliveries:v2", fresh: fresh) do
-            Amazon::Worker.new(verbose: @global.verbose).deliveries
+          #
+          # v3: a wrapper rather than a bare array, so a degraded scrape can
+          # carry the reason it was degraded and say it again on every cache
+          # hit rather than only on the run that discovered it.
+          payload = cached("deliveries:v3", fresh: fresh) do
+            worker = Amazon::Worker.new(verbose: @global.verbose)
+            cards = worker.deliveries
+            { "cards" => cards, "_degraded" => worker.degradations }
           end
+          cards = payload["cards"]
           Amazon::Formatter.new(json: @global.json)
             .deliveries(cards, limit: limit, thumbnails: thumbnails(images, IMAGE_ROWS))
           0

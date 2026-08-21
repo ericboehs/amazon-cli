@@ -52,7 +52,8 @@ module Amazon
         def scrape(load_all)
           worker = Amazon::Worker.new(verbose: @global.verbose)
           rows = worker.subscriptions(all: load_all)
-          { "rows" => rows, "total" => worker.subscription_total }
+          { "rows" => rows, "total" => worker.subscription_total,
+            "_degraded" => worker.degradations }
         end
 
         def help_text

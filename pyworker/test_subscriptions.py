@@ -56,6 +56,7 @@ from subscriptions import (
     NotSkippable,
     ScheduleChoiceUnknown,
     _cards,
+    emit,
     _card_by_query,
     _clickable,
     _copa_links,
@@ -2114,3 +2115,71 @@ class _FakeBrowser:
 class _FakeContext:
     def new_page(self):
         return DomPage("<div></div>") if HAVE_BS4 else object()
+
+
+class DegradationRecordTest(unittest.TestCase):
+    """Warnings have to survive the run that produced them.
+
+    They are emitted to stderr as they happen, which is right exactly once:
+    the payload is then cached for thirty minutes and re-served to runs that
+    never saw them. `warn` records as well as says.
+    """
+
+    def setUp(self):
+        subscriptions._DEGRADED.clear()
+        self.addCleanup(subscriptions._DEGRADED.clear)
+
+    def test_a_warning_is_both_said_and_kept(self):
+        with collecting() as events:
+            subscriptions.warn("only 30 of 59 subscriptions loaded")
+        self.assertEqual(events[0]["level"], "warn")
+        self.assertEqual(subscriptions.degradations(), ["only 30 of 59 subscriptions loaded"])
+
+    def test_a_clean_run_records_nothing(self):
+        self.assertEqual(subscriptions.degradations(), [])
+
+    def test_the_record_is_a_copy(self):
+        with collecting():
+            subscriptions.warn("x")
+        subscriptions.degradations().append("y")
+        self.assertEqual(subscriptions.degradations(), ["x"])
+
+    # A card that cannot be read renders as "(undated) 0 items", which is also
+    # what an empty delivery looks like. Only one of them is real.
+    def test_an_unreadable_delivery_card_is_not_reported_as_an_empty_one(self):
+        class Broken:
+            def get_attribute(self, _name):
+                raise RuntimeError("detached")
+
+            def locator(self, _sel):
+                raise RuntimeError("detached")
+
+        with collecting() as events:
+            card = subscriptions.scrape_delivery_card(Broken())
+        self.assertEqual(card["items"], [])
+        self.assertIsNone(card["date"])
+        msgs = " ".join(e.get("msg", "") for e in events)
+        self.assertIn("undated", msgs)
+        self.assertIn("not the same as being empty", msgs)
+        self.assertEqual(len(subscriptions.degradations()), 2)
+
+    def test_a_readable_card_says_nothing(self):
+        if not HAVE_BS4:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        page = DomPage.from_fixture("deliveries.html")
+        with collecting() as events:
+            for node in _cards(page, DELIVERY_CARD):
+                subscriptions.scrape_delivery_card(node)
+        self.assertEqual([e for e in events if e.get("level") == "warn"], [])
+        self.assertEqual(subscriptions.degradations(), [])
+
+    # The worker hands them to Ruby on `done`, which is the only event the
+    # caller is guaranteed to see.
+    def test_the_done_event_carries_them(self):
+        page = TrunkPage() if HAVE_BS4 else None
+        if page is None:
+            self.skipTest(NO_DEPS.format(pkg="beautifulsoup4"))
+        with collecting() as events:
+            subscriptions.warn("something went wrong")
+            emit("done", count=0, degraded=subscriptions.degradations())
+        self.assertEqual(events[-1]["degraded"], ["something went wrong"])
