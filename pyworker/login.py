@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -32,6 +33,20 @@ from typing import Any
 from urllib.parse import urlparse
 
 from browser import SIGNIN_URLS
+from otp import current_code, normalize_otp_secret
+
+# The authenticator-app field, and only that one. Amazon reuses a similar box
+# for codes it emails or texts you (`#cvf-input-code`), and a TOTP typed into
+# that one is simply wrong — six digits that will never match, submitted over
+# and over by a loop that thinks it is helping.
+OTP_SELECTOR = "#auth-mfa-otpcode"
+OTP_SUBMIT_SELECTOR = "#auth-signin-button"
+PASSWORD_SELECTOR = "#ap_password"
+PASSWORD_SUBMIT_SELECTOR = "#signInSubmit"
+# Amazon renders the password step after Continue, so the field we want does
+# not exist at the moment we click. This is how long we'll wait for it before
+# deciding this is a page we don't understand and leaving it to the human.
+PASSWORD_WAIT_MS = 8000
 
 
 def emit(event: str, **fields: Any) -> None:
@@ -79,8 +94,28 @@ ORDER_HISTORY_PATHS = (
     "/gp/css/order-history",
 )
 
-# Pages it is safe to steer away from: an idle tab sitting on the storefront.
-# Deliberately an allowlist — see `should_renavigate`.
+# Post-authentication upsells. Amazon signs you in and then, instead of your
+# orders, offers to add a passkey or a phone number — a page that is not a
+# sign-in step, not order history, and not going anywhere until someone
+# declines it. Left alone the poll waits the full ten minutes on a screen the
+# user has to notice and dismiss themselves, which is the opposite of what
+# reading the password out of 1Password was for.
+#
+# Text, not CSS, because these screens are A/B tested and their class names are
+# generated; the copy on the decline control is the stable part. Exact matches
+# only — "skip" as a substring also matches "Skip to main content", the first
+# link on every Amazon page.
+DECLINE_LABELS = (
+    "not now",
+    "maybe later",
+    "remind me later",
+    "no thanks",
+    "skip for now",
+)
+# The one Amazon gives an id to, kept because an id beats a text match when
+# it's on offer.
+DECLINE_SELECTOR = "#ap-account-fixup-phone-skip-link"
+
 IDLE_PATHS = ("", "/", "/gp/css/homepage.html", "/gp/css/homepage")
 
 # Markers that the order list itself rendered. Several, because this layout is
@@ -499,6 +534,170 @@ def should_renavigate(url: str | None) -> bool:
     return parts.path in IDLE_PATHS
 
 
+def should_dismiss_upsell(url: str | None) -> bool:
+    """Whether this page is the kind that might hold a "Not now" worth clicking.
+
+    Not the sign-in flow: those pages ask for things only the user has, and a
+    stray click on one is how you throw away a 2FA code. Not order history
+    either — that's the finish line. What's left is the interstitial Amazon
+    invented this quarter, which is precisely the page we can't enumerate in
+    advance and the only kind worth probing.
+    """
+    if not url or is_signin_url(url) or is_order_history_url(url):
+        return False
+    # An idle page — the homepage, usually — already has an owner: the nudge
+    # steers it back to orders. Probing it too would put "nothing to decline"
+    # in the log for the most ordinary path through a login.
+    if should_renavigate(url):
+        return False
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return False
+    return "amazon." in (parts.netloc or "")
+
+
+def dismiss_upsell(page: Any) -> str | None:
+    """Click a decline control if one is on the page. Returns what it clicked.
+
+    Declining is always the safe half of these prompts: "Not now" adds nothing,
+    changes nothing, and is the button the user would press. The risk is
+    clicking something else by accident, so the match is exact and the search
+    is limited to buttons and links.
+    """
+    with contextlib.suppress(Exception):
+        known = page.locator(DECLINE_SELECTOR).first
+        if known.count() > 0 and known.is_visible():
+            known.click()
+            return DECLINE_SELECTOR
+
+    for label in DECLINE_LABELS:
+        pattern = re.compile(rf"^\s*{re.escape(label)}\s*$", re.I)
+        for role in ("button", "link"):
+            with contextlib.suppress(Exception):
+                control = page.get_by_role(role, name=pattern).first
+                if control.count() > 0 and control.is_visible():
+                    control.click()
+                    return label
+    return None
+
+
+def read_request() -> dict[str, Any]:
+    """The optional credentials line the Ruby side writes to stdin.
+
+    Optional in both directions: `python login.py` from a shell is a supported
+    way to run this, and it must not hang waiting for a line that no one is
+    going to type — hence the isatty guard. An unreadable or malformed line is
+    not fatal either; the browser window still opens and the human still has
+    hands.
+    """
+    if sys.stdin is None or sys.stdin.isatty():
+        return {}
+    try:
+        raw = sys.stdin.readline()
+    except (OSError, ValueError):
+        return {}
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Deliberately not echoed. If this line is malformed it is still the
+        # line with the password in it.
+        emit("log", msg="ignoring an unreadable credentials line on stdin")
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def credentials_from(req: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Pull (password, otp_secret) out of the request.
+
+    Empty strings become None so that a config with a blank field behaves like
+    a config without one, rather than filling the form with nothing and
+    submitting it.
+    """
+    password = req.get("password") or None
+    try:
+        secret = normalize_otp_secret(req.get("otp_secret") or None)
+    except ValueError as e:
+        emit("log", msg=f"ignoring the OTP secret: {e}")
+        return password, None
+    return password, secret
+
+
+def should_submit_otp(current_value: str, code: str, last_code: str | None) -> bool:
+    """Whether to type this code into the two-factor box.
+
+    Two ways to get this wrong, both of which cost the login:
+
+    Typing over the user. The box may already hold digits they are halfway
+    through entering from their phone; `fill` would silently replace them.
+
+    Resubmitting. This runs inside a poll that ticks every couple of seconds,
+    and a TOTP is valid for thirty of them. If Amazon rejects a code — clock
+    skew, a stale secret — the field comes back empty and unchanged, and
+    without this check the loop would submit the same six digits ten times in
+    a row and earn a rate limit. One attempt per code; the next window brings
+    a new one.
+    """
+    if current_value.strip():
+        return False
+    return code != last_code
+
+
+def fill_password(page: Any, password: str) -> bool:
+    """Fill and submit the password field, if it turns up."""
+    field = page.locator(PASSWORD_SELECTOR).first
+    try:
+        field.wait_for(state="visible", timeout=PASSWORD_WAIT_MS)
+    except Exception:  # noqa: BLE001
+        return False
+    field.fill(password)
+    submit = page.locator(PASSWORD_SUBMIT_SELECTOR).first
+    if submit.count() > 0:
+        submit.click()
+    return True
+
+
+def fill_otp(page: Any, secret: str, last_code: str | None) -> str | None:
+    """Type the current TOTP into the two-factor box. Returns the code sent."""
+    field = page.locator(OTP_SELECTOR).first
+    if field.count() == 0 or not field.is_visible():
+        return None
+    code = current_code(secret)
+    if not should_submit_otp(field.input_value(), code, last_code):
+        return None
+    field.fill(code)
+    submit = page.locator(OTP_SUBMIT_SELECTOR).first
+    if submit.count() > 0:
+        submit.click()
+    return code
+
+
+def autofill_otp(pages: Any, secret: str, last_code: str | None) -> tuple[str | None, str | None]:
+    """Type the 2FA code into whichever tab is asking. Never raises.
+
+    Returns ``(code_sent, error_name)``, at most one of which is set.
+
+    The "never raises" is the whole point, and it is a function rather than a
+    `try` in the poll loop so that it can be tested. Autofill is a convenience
+    laid over a login that works without it — the person is sitting right there
+    with an authenticator app. But the call used to sit unguarded among the
+    loop's DOM probes, so an unusable secret raised on every tick, counted as a
+    failed probe, and five ticks later closed the browser window mid-login with
+    a message blaming the network. The convenience destroyed the thing it was
+    assisting.
+    """
+    try:
+        for page in pages:
+            sent = fill_otp(page, secret, last_code)
+            if sent:
+                return sent, None
+    except Exception as e:  # noqa: BLE001
+        return None, type(e).__name__
+    return None, None
+
+
 def main() -> int:
     try:
         from playwright.sync_api import sync_playwright
@@ -514,6 +713,10 @@ def main() -> int:
         pass
     cookies_path = cache_dir / "cookies.json"
     storage_state_path = cache_dir / "storage_state.json"
+
+    password, otp_secret = credentials_from(read_request())
+    if password:
+        emit("log", msg="got credentials from 1Password — the window is for captcha only")
 
     emit("log", msg=f"opening browser; cookies will be saved to {cookies_path}")
 
@@ -579,17 +782,31 @@ def main() -> int:
                     cont = page.locator("#continue, input[type=submit][aria-labelledby*=continue]").first
                     if cont.count() > 0:
                         cont.click()
-                        emit("log", msg="clicked Continue — finish password + any 2FA in the window")
+                        if password and fill_password(page, password):
+                            emit("log", msg="filled the password from 1Password and submitted it")
+                        else:
+                            emit("log", msg="clicked Continue — finish password + any 2FA in the window")
                 elif password_visible:
-                    emit(
-                        "log",
-                        msg=(
-                            "Amazon is asking for your password on this page — type it in "
-                            "the window. Leaving the form alone so Continue can't reset it."
-                        ),
-                    )
+                    if password and fill_password(page, password):
+                        emit("log", msg="filled the password from 1Password and submitted it")
+                    else:
+                        emit(
+                            "log",
+                            msg=(
+                                "Amazon is asking for your password on this page — type it in "
+                                "the window. Leaving the form alone so Continue can't reset it."
+                            ),
+                        )
             except Exception as e:  # noqa: BLE001
-                emit("log", msg=f"could not pre-fill email ({e}); continue manually")
+                # Not necessarily the email: this guard covers the continue
+                # click and the password fill too, and blaming the first step
+                # for the third one's failure sends the reader to the wrong
+                # config key. Autofill is a convenience over a login that
+                # works without it, so any of it failing is a log line.
+                emit(
+                    "log",
+                    msg=f"could not autofill the sign-in form ({type(e).__name__}); continue manually",
+                )
 
         emit(
             "log",
@@ -600,7 +817,6 @@ def main() -> int:
                 "orders to load, then saves cookies automatically."
             ),
         )
-
         # Poll until order history renders. The old check — an `x-main` cookie
         # plus "not on /ap/signin" — is satisfied by a merely recognized
         # session, so it reported success for sessions that `amazon order sync`
@@ -621,6 +837,14 @@ def main() -> int:
         matched: dict[str, int] = {}
         last_error: str | None = None
         probe_failures = 0
+        # The last TOTP we submitted, so a rejected code isn't retried on every
+        # tick for the thirty seconds it stays current.
+        last_otp_code: str | None = None
+        # Whether the "autofill broke, carry on by hand" line has been said.
+        otp_warned = False
+        # URLs we've already tried to dismiss, so one unanswerable page doesn't
+        # get clicked at every tick for ten minutes.
+        dismissed: set[str] = set()
         while time.time() < deadline:
             # Above the try, because closing the window is not an error to retry
             # past. The blanket `except` below used to swallow it, buying ten more
@@ -656,6 +880,42 @@ def main() -> int:
                         proved = True
                         matched = counts
                         break
+                # The two-factor box only exists after the password is accepted,
+                # so it is checked here rather than in the setup above — and on
+                # every tab, because Amazon's challenges open their own.
+                if otp_secret:
+                    sent, otp_error = autofill_otp(open_pages, otp_secret, last_otp_code)
+                    if sent:
+                        last_otp_code = sent
+                        emit("log", msg="entered the 2FA code from 1Password")
+                    elif otp_error and not otp_warned:
+                        # Once. This runs every two seconds for up to ten
+                        # minutes, and a warning repeated 300 times buries the
+                        # sign-in instructions printed next to it.
+                        otp_warned = True
+                        emit(
+                            "log",
+                            level="warn",
+                            msg=(
+                                f"could not enter the 2FA code ({otp_error}) — "
+                                "type it yourself; nothing else about this login changes"
+                            ),
+                        )
+                # An upsell is only in the way once. Re-clicking a page we have
+                # already answered would fight whatever the user chose to do
+                # with it instead — so each URL gets one attempt, and a page
+                # that stays put after that is theirs.
+                for p in open_pages:
+                    if not should_dismiss_upsell(p.url) or p.url in dismissed:
+                        continue
+                    dismissed.add(p.url)
+                    clicked = dismiss_upsell(p)
+                    if clicked:
+                        emit("log", msg=f"declined an Amazon prompt ({clicked}) to get back to your orders")
+                    else:
+                        # The URL, because the next unknown interstitial is
+                        # only knowable if this line names the last one.
+                        emit("log", msg=f"nothing to decline on {p.url[:80]} — over to you")
                 # Give the tab a few seconds to settle before steering it, so a
                 # redirect in flight isn't mistaken for an idle page.
                 # `last_state` is `poll_state`'s pick, so a sign-in tab anywhere

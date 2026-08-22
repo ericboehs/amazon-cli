@@ -19,7 +19,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from login import (  # noqa: E402
     ORDER_MARKERS,
     ORDERS_URL,
+    credentials_from,
     describe_state,
+    dismiss_upsell,
+    should_dismiss_upsell,
+    autofill_otp,
+    fill_otp,
+    fill_password,
+    read_request,
+    should_submit_otp,
     is_amazon_domain,
     is_signin_url,
     marker_counts,
@@ -585,3 +593,341 @@ class OrderMarkersTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeField:
+    """One form field, standing in for a Playwright locator."""
+
+    def __init__(self, present=True, visible=True, value="", raise_wait=False):
+        self.present = present
+        self.visible = visible
+        self.value = value
+        self.raise_wait = raise_wait
+        self.filled = None
+        self.waited = False
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return 1 if self.present else 0
+
+    def is_visible(self):
+        return self.visible
+
+    def input_value(self):
+        return self.value
+
+    def fill(self, value):
+        self.filled = value
+        self.value = value
+
+    def wait_for(self, state=None, timeout=None):
+        self.waited = True
+        if self.raise_wait:
+            raise RuntimeError("timeout")
+
+    def click(self):
+        self.clicked = True
+
+
+class FakePage:
+    def __init__(self, fields):
+        self.fields = fields
+        self.asked = []
+
+    def locator(self, selector):
+        self.asked.append(selector)
+        return self.fields.get(selector, FakeField(present=False, visible=False))
+
+
+class ReadRequestTest(unittest.TestCase):
+    def read_with(self, stream):
+        real = sys.stdin
+        sys.stdin = stream
+        try:
+            return read_request()
+        finally:
+            sys.stdin = real
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    def test_a_credentials_line_is_parsed(self):
+        self.assertEqual(
+            self.read_with(io.StringIO('{"password": "hunter2"}\n')),
+            {"password": "hunter2"},
+        )
+
+    # `python login.py` from a shell is a supported way to run this. Blocking
+    # on a line nobody is going to type would hang it forever.
+    def test_a_terminal_is_never_read(self):
+        self.assertEqual(self.read_with(self.Tty("{}")), {})
+
+    def test_an_empty_stdin_is_fine(self):
+        self.assertEqual(self.read_with(io.StringIO("")), {})
+        self.assertEqual(self.read_with(io.StringIO("   \n")), {})
+
+    # Deliberately not echoed: a malformed line is still the line with the
+    # password in it.
+    def test_a_broken_line_is_reported_without_being_quoted(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(self.read_with(io.StringIO('{"password": "hunt\n')), {})
+        self.assertIn("unreadable credentials line", buf.getvalue())
+        self.assertNotIn("hunt", buf.getvalue())
+
+    def test_a_json_scalar_is_not_a_request(self):
+        self.assertEqual(self.read_with(io.StringIO('"hunter2"\n')), {})
+
+
+class CredentialsFromTest(unittest.TestCase):
+    def test_it_returns_both(self):
+        self.assertEqual(
+            credentials_from({"password": "hunter2", "otp_secret": "JBSWY3DPEHPK3PXP"}),
+            ("hunter2", "JBSWY3DPEHPK3PXP"),
+        )
+
+    def test_an_otpauth_uri_is_reduced_to_its_secret(self):
+        uri = "otpauth://totp/Amazon:me?secret=JBSWY3DPEHPK3PXP&issuer=Amazon"
+        self.assertEqual(credentials_from({"otp_secret": uri})[1], "JBSWY3DPEHPK3PXP")
+
+    # A blank field in config must behave like a missing one, not like a
+    # password of length zero submitted into the form.
+    def test_empty_strings_are_absent(self):
+        self.assertEqual(credentials_from({"password": "", "otp_secret": ""}), (None, None))
+        self.assertEqual(credentials_from({}), (None, None))
+
+    # A broken OTP costs the 2FA step, not the password step.
+    def test_a_useless_otp_uri_keeps_the_password(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            got = credentials_from({"password": "hunter2", "otp_secret": "otpauth://totp/x?issuer=y"})
+        self.assertEqual(got, ("hunter2", None))
+        self.assertIn("ignoring the OTP secret", buf.getvalue())
+        self.assertNotIn("hunter2", buf.getvalue())
+
+
+class ShouldSubmitOtpTest(unittest.TestCase):
+    def test_an_empty_box_and_a_new_code_goes(self):
+        self.assertTrue(should_submit_otp("", "123456", None))
+
+    # The user may be halfway through typing from their phone.
+    def test_it_never_types_over_the_user(self):
+        self.assertFalse(should_submit_otp("12", "123456", None))
+
+    # A TOTP is good for thirty seconds and this poll ticks every two. Without
+    # this the same rejected code is submitted fifteen times and earns a rate
+    # limit.
+    def test_the_same_code_is_not_submitted_twice(self):
+        self.assertFalse(should_submit_otp("", "123456", "123456"))
+        self.assertTrue(should_submit_otp("", "654321", "123456"))
+
+
+class FillPasswordTest(unittest.TestCase):
+    def test_it_fills_and_submits(self):
+        field = FakeField()
+        submit = FakeField()
+        page = FakePage({"#ap_password": field, "#signInSubmit": submit})
+        self.assertTrue(fill_password(page, "hunter2"))
+        self.assertEqual(field.filled, "hunter2")
+        self.assertTrue(getattr(submit, "clicked", False))
+
+    # Amazon renders the password step after Continue, so a field that never
+    # appears means this is a page we don't understand — leave it to the human.
+    def test_a_field_that_never_appears_is_declined(self):
+        page = FakePage({"#ap_password": FakeField(raise_wait=True)})
+        self.assertFalse(fill_password(page, "hunter2"))
+
+    def test_a_missing_submit_button_still_counts_as_filled(self):
+        field = FakeField()
+        page = FakePage({"#ap_password": field})
+        self.assertTrue(fill_password(page, "hunter2"))
+        self.assertEqual(field.filled, "hunter2")
+
+
+class FillOtpTest(unittest.TestCase):
+    SECRET = "JBSWY3DPEHPK3PXP"
+
+    def test_it_types_the_current_code(self):
+        try:
+            import pyotp  # noqa: F401
+        except ImportError:
+            self.skipTest("pyotp not installed")
+        field = FakeField()
+        page = FakePage({"#auth-mfa-otpcode": field, "#auth-signin-button": FakeField()})
+        code = fill_otp(page, self.SECRET, None)
+        self.assertRegex(code, r"^\d{6}$")
+        self.assertEqual(field.filled, code)
+
+    def test_no_box_means_nothing_to_do(self):
+        page = FakePage({})
+        self.assertIsNone(fill_otp(page, self.SECRET, None))
+
+    def test_an_invisible_box_is_left_alone(self):
+        page = FakePage({"#auth-mfa-otpcode": FakeField(visible=False)})
+        self.assertIsNone(fill_otp(page, self.SECRET, None))
+
+    # Amazon uses a similar box for codes it emails you. A TOTP typed into that
+    # one is simply wrong, so only the authenticator field is touched.
+    def test_the_email_verification_box_is_not_the_authenticator_box(self):
+        page = FakePage({"#cvf-input-code": FakeField()})
+        self.assertIsNone(fill_otp(page, self.SECRET, None))
+        self.assertNotIn("#cvf-input-code", page.asked)
+
+
+class AutofillOtpTest(unittest.TestCase):
+    """The rule is that this can fail in any way and cost only the 2FA step."""
+
+    SECRET = "JBSWY3DPEHPK3PXP"
+
+    class Exploding:
+        """A tab whose DOM probe raises — a frame detached mid-navigation, or
+        a secret pyotp cannot decode."""
+
+        url = "https://www.amazon.com/ap/signin"
+
+        def locator(self, _selector):
+            raise RuntimeError("Frame was detached")
+
+    def test_a_tab_that_throws_costs_the_code_and_nothing_else(self):
+        sent, error = autofill_otp([self.Exploding()], self.SECRET, None)
+        self.assertIsNone(sent)
+        self.assertEqual(error, "RuntimeError")
+
+    def test_an_undecodable_secret_is_reported_not_raised(self):
+        try:
+            import pyotp  # noqa: F401
+        except ImportError:
+            self.skipTest("pyotp not installed")
+        page = FakePage({"#auth-mfa-otpcode": FakeField(), "#auth-signin-button": FakeField()})
+        sent, error = autofill_otp([page], "not-valid-base32!", None)
+        self.assertIsNone(sent)
+        self.assertTrue(error, "a bad secret must be reported, not swallowed")
+
+    def test_nothing_asking_for_a_code_is_not_an_error(self):
+        sent, error = autofill_otp([FakePage({})], self.SECRET, None)
+        self.assertIsNone(sent)
+        self.assertIsNone(error, "no 2FA box is the normal case, not a failure")
+
+    def test_it_stops_at_the_tab_that_took_the_code(self):
+        try:
+            import pyotp  # noqa: F401
+        except ImportError:
+            self.skipTest("pyotp not installed")
+        field = FakeField()
+        asking = FakePage({"#auth-mfa-otpcode": field, "#auth-signin-button": FakeField()})
+        later = FakePage({"#auth-mfa-otpcode": FakeField(), "#auth-signin-button": FakeField()})
+        sent, error = autofill_otp([asking, later], self.SECRET, None)
+        self.assertEqual(field.filled, sent)
+        self.assertIsNone(error)
+        self.assertEqual(later.asked, [], "a second tab was typed into as well")
+
+
+class ShouldDismissUpsellTest(unittest.TestCase):
+    # A stray click during sign-in is how you throw away a 2FA code Amazon has
+    # already sent.
+    def test_the_signin_flow_is_never_clicked(self):
+        self.assertFalse(should_dismiss_upsell(SIGNIN))
+        self.assertFalse(should_dismiss_upsell("https://www.amazon.com/ap/mfa"))
+        self.assertFalse(should_dismiss_upsell("https://www.amazon.com/ap/cvf/request"))
+
+    def test_the_finish_line_is_not_an_upsell(self):
+        self.assertFalse(should_dismiss_upsell(ORDERS))
+
+    # The passkey pitch, the phone-number pitch, and whatever they invent next.
+    def test_an_interstitial_is_fair_game(self):
+        self.assertTrue(should_dismiss_upsell("https://www.amazon.com/ax/claim/webauthn/enroll"))
+        self.assertTrue(should_dismiss_upsell("https://www.amazon.com/ap/accountfixup"))
+
+    # The homepage already has an owner: should_renavigate steers it back to
+    # orders, so probing it for buttons would only add noise to a normal login.
+    def test_an_idle_page_belongs_to_the_nudge(self):
+        self.assertFalse(should_dismiss_upsell(HOME))
+        self.assertFalse(should_dismiss_upsell("https://www.amazon.com/gp/css/homepage.html"))
+
+    def test_nothing_off_amazon_is_touched(self):
+        self.assertFalse(should_dismiss_upsell("https://example.com/not-now"))
+        self.assertFalse(should_dismiss_upsell(None))
+        self.assertFalse(should_dismiss_upsell("http://["))
+
+
+class RoleField(FakeField):
+    """A control found by role and accessible name."""
+
+    def __init__(self, role, name, visible=True):
+        super().__init__(visible=visible)
+        self.role = role
+        self.name = name
+
+
+class RolePage:
+    def __init__(self, controls=(), by_selector=None):
+        self.controls = list(controls)
+        self.by_selector = by_selector or {}
+        self.clicked = []
+
+    def locator(self, selector):
+        return self.by_selector.get(selector, FakeField(present=False, visible=False))
+
+    def get_by_role(self, role, name=None):
+        for control in self.controls:
+            if control.role == role and name.match(control.name):
+                found = control
+                page = self
+
+                class Bound:
+                    first = found
+
+                    def __getattr__(self, attr):
+                        return getattr(found, attr)
+
+                found.click = lambda: page.clicked.append(found.name)
+                return Bound()
+        return FakeField(present=False, visible=False)
+
+
+class DismissUpsellTest(unittest.TestCase):
+    def test_it_clicks_not_now(self):
+        page = RolePage([RoleField("button", "Not now")])
+        self.assertEqual(dismiss_upsell(page), "not now")
+        self.assertEqual(page.clicked, ["Not now"])
+
+    def test_a_link_counts_too(self):
+        page = RolePage([RoleField("link", "Maybe later")])
+        self.assertEqual(dismiss_upsell(page), "maybe later")
+
+    # "Skip" as a substring also matches "Skip to main content", the first link
+    # on every Amazon page — which would click away from a page we mean to read.
+    def test_the_accessibility_skip_link_is_not_a_decline_button(self):
+        page = RolePage([RoleField("link", "Skip to main content")])
+        self.assertIsNone(dismiss_upsell(page))
+        self.assertEqual(page.clicked, [])
+
+    def test_an_id_beats_a_text_match(self):
+        known = FakeField()
+        page = RolePage([RoleField("button", "Not now")],
+                        by_selector={"#ap-account-fixup-phone-skip-link": known})
+        self.assertEqual(dismiss_upsell(page), "#ap-account-fixup-phone-skip-link")
+        self.assertTrue(getattr(known, "clicked", False))
+        self.assertEqual(page.clicked, [])
+
+    def test_an_invisible_control_is_not_clicked(self):
+        page = RolePage([RoleField("button", "Not now", visible=False)])
+        self.assertIsNone(dismiss_upsell(page))
+
+    def test_a_page_with_no_decline_control_says_so_by_returning_none(self):
+        self.assertIsNone(dismiss_upsell(RolePage()))
+
+    # A locator that throws is a page mid-navigation, not a reason to stop.
+    def test_a_throwing_locator_is_survivable(self):
+        class Angry:
+            def locator(self, _selector):
+                raise RuntimeError("detached")
+
+            def get_by_role(self, role, name=None):
+                raise RuntimeError("detached")
+
+        self.assertIsNone(dismiss_upsell(Angry()))

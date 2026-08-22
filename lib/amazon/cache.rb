@@ -8,12 +8,19 @@ module Amazon
   class Cache
     DEFAULT_TTL = 900 # 15 minutes
 
+    # Where a worker records what it had to give up on. Metadata about the
+    # scrape rather than part of it, which matters in two places: it is
+    # replayed on every cache hit, and it is excluded when deciding whether a
+    # payload is empty.
+    DEGRADED_KEY = "_degraded".freeze
+
     # `read:` and `write:` are separate because `--fresh` means "don't trust
     # what's on disk", not "don't record what I just fetched". Disabling both
     # would leave the stale entry in place with its original mtime, so a
     # `--fresh` run followed by a plain one inside the TTL served the *older*
     # price.
     def initialize(namespace, ttl: DEFAULT_TTL, read: true, write: true)
+      @namespace = namespace
       @dir = Config.cache_dir.join("live", namespace)
       @ttl = ttl
       @read = read
@@ -43,7 +50,7 @@ module Amazon
     # like a whole one.
     def replay_degradations(data)
       return unless @hit && data.is_a?(Hash)
-      Array(data["_degraded"]).each { |msg| warn "amazon: [cached] #{msg}" }
+      Array(data[DEGRADED_KEY]).each { |msg| warn "amazon: [cached] #{msg}" }
     end
 
     def read(key)
@@ -78,10 +85,56 @@ module Amazon
       path.exist? ? (Time.now - path.mtime).to_i : nil
     end
 
+    # Drop every entry in this namespace.
+    #
+    # Per-key invalidation is the wrong grain for anything that shares a
+    # subject. `amazon subscribe list` and `subscribe upcoming` are two
+    # renderings of one account state, so refreshing one while the other still
+    # serves a 25-minute-old copy of the same subscriptions reproduces exactly
+    # the staleness the TTL exists to bound. The same goes for a write: a
+    # cancellation changes both views, and only one of them knows it happened.
+    def clear
+      # `rm_rf` defaults to force: true, which swallows every SystemCallError.
+      # That is wrong here specifically: this is the whole mechanism behind
+      # `Cached.invalidate!`, so a cache directory that can't be removed —
+      # read-only mount, a permissions repair gone sideways — silently leaves
+      # a cancelled subscription looking active for the rest of the TTL. A
+      # failure to forget is worth a line on stderr.
+      FileUtils.remove_entry(@dir) if @dir.exist?
+      true
+    rescue SystemCallError => e
+      warn "amazon: couldn't clear the #{@namespace} cache at #{@dir} (#{e.message}) — " \
+           "readings may be stale; pass --fresh"
+      false
+    end
+
     private
 
     def empty_collection?(value)
-      value.respond_to?(:empty?) && value.empty?
+      return true if value.respond_to?(:empty?) && value.empty?
+      return false unless value.is_a?(Hash)
+
+      # A payload that *wraps* its rows is as empty as the rows it wraps, but
+      # `Hash#empty?` counts keys and says otherwise — so `subscribe list`,
+      # which caches `{"rows" => [], "total" => nil}`, walked straight past
+      # the guard above and pinned a failed scrape for the full TTL. That is
+      # the exact bug this method was written to prevent, arriving in a
+      # container.
+      #
+      # Only wrappers qualify: every value has to be a collection or nil. A
+      # record with real fields and one empty list in it — a subscription
+      # detail with no actions — is a genuine result and stays cacheable.
+      #
+      # `_degraded` is metadata about the scrape, not part of it, and has to be
+      # set aside before judging. Counting it inverted this guard exactly where
+      # it matters most: a scrape that returned nothing *and* warned it had
+      # given up became a non-empty wrapper, so the one payload carrying
+      # evidence of its own failure was the one that got pinned for the TTL.
+      values = value.reject { |k, _| k == DEGRADED_KEY }.values
+      collections = values.select { |v| v.is_a?(Array) || v.is_a?(Hash) }
+      collections.any? &&
+        values.all? { |v| v.nil? || v.is_a?(Array) || v.is_a?(Hash) } &&
+        collections.all? { |v| empty_collection?(v) }
     end
 
     def path_for(key)

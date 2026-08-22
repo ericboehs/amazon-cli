@@ -141,16 +141,7 @@ module Amazon
         end
 
         def fetch_password(ref)
-          out, err, status = Open3.capture3("bash", "-lc", "op signin --account my >/dev/null && op read #{shellword(ref)}")
-          unless status.success?
-            raise "op read failed for #{ref}: #{err.strip}"
-          end
-          out.chomp
-        end
-
-        def shellword(s)
-          # Refs like op://Personal/Amazon/password are safe; still quote defensively.
-          "'" + s.gsub("'", "'\\''") + "'"
+          Amazon::Secrets.read(ref)
         end
 
         def append_sync_log(years, count, listed: 0, known: 0, partial: nil)

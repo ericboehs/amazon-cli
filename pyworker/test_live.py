@@ -6,6 +6,13 @@ No Playwright needed — these functions never touch a browser.
 
 import io
 import json
+import math
+import pathlib
+import tempfile
+from unittest import mock
+
+import browser as browser_mod
+import re
 import unittest
 from contextlib import redirect_stdout
 from datetime import date
@@ -1707,7 +1714,16 @@ class DomLocator:
         return [_text_of(n) for n in self._nodes]
 
     def get_attribute(self, name):
-        return self._nodes[0].get(name) if self._nodes else None
+        if not self._nodes:
+            return None
+        value = self._nodes[0].get(name)
+        # bs4 hands back a list for space-separated attributes (class, rel);
+        # Playwright hands back the raw string. Code that regexes `class` to
+        # find `t-action-type-CANCEL` works against Chrome and blows up against
+        # a list, so the fake has to return what the browser returns.
+        if isinstance(value, list):
+            return " ".join(value)
+        return value
 
 
 class DomPage:
@@ -2086,3 +2102,160 @@ class RealMarkupPriceTest(unittest.TestCase):
                 1,
                 f"{name}: the seller is not inside the row the price is read from",
             )
+
+
+class FixtureHygieneTest(unittest.TestCase):
+    """Every fixture here was captured from a signed-in session.
+
+    Sanitizing them has been a regex per spelling, and that lost: Amazon
+    writes its CSRF token as `data-csrf-token="..."`, as an
+    `anti-csrftoken-a2z` hidden input with `type=` sitting between the name
+    and the value, as a `csrfT=` query parameter, and as `"csrfT":"..."`
+    inside a JSON blob. Three of those four shipped a live token at some
+    point, and the two in `review_listing.html` rode along for a whole
+    release. A scrub only covers the spellings someone thought of; this
+    covers the ones nobody has seen yet, because it grades the output
+    instead of the pattern.
+    """
+
+    # Amazon's tokens are base64 with an embedded timestamp — long, and dense
+    # in a way that markup is not. Real class names and ref_ tags reach the
+    # low fours; every captured token measured above 4.4.
+    MIN_LENGTH = 40
+    MAX_ENTROPY = 4.4
+
+    # Two shapes, both anchored at the token name so the scan grades the
+    # value that belongs to it rather than the next quoted thing on the line —
+    # which in review_listing.html is a review id, and looks alarming.
+    VALUE_PATTERNS = (
+        # csrfT=X   "csrfT":"X"   data-csrf-token="X"
+        re.compile(r'^["\']?\s*[:=]\s*["\']?([A-Za-z0-9+/=%]{12,})'),
+        # <input name="anti-csrftoken-a2z" type="hidden" value="X">
+        re.compile(r'^"(?:\s+[\w-]+="[^"]*")*?\s+value="([^"]{12,})"'),
+    )
+
+    @staticmethod
+    def _entropy(s):
+        return -sum(
+            (s.count(c) / len(s)) * math.log2(s.count(c) / len(s)) for c in set(s)
+        )
+
+    def fixtures(self):
+        found = sorted(FIXTURES.glob("*.html"))
+        self.assertTrue(found, "no fixtures found — this test would pass vacuously")
+        return found
+
+    def test_no_fixture_carries_a_live_csrf_token(self):
+        for path in self.fixtures():
+            text = path.read_text(encoding="utf-8")
+            for match in re.finditer(r"csrf[\w-]*", text, re.I):
+                # The placeholder contains the word too; matching it and then
+                # reading ahead finds whatever id happens to come next.
+                if text[max(0, match.start() - 8) : match.start()].endswith("FIXTURE_"):
+                    continue
+                # Whatever the spelling, the value near it must be the
+                # placeholder. 120 chars covers `type="hidden"` sitting
+                # between the name and the value.
+                window = text[match.end() : match.end() + 120]
+                for pattern in self.VALUE_PATTERNS:
+                    value = pattern.match(window)
+                    if value:
+                        self.assertEqual(
+                            value.group(1),
+                            "FIXTURE_CSRF",
+                            f"{path.name}: live CSRF token near {match.group(0)!r}",
+                        )
+                        break
+
+    def test_no_fixture_carries_anything_shaped_like_a_credential(self):
+        for path in self.fixtures():
+            for blob in set(
+                re.findall(r"[A-Za-z0-9+/=]{%d,}" % self.MIN_LENGTH, path.read_text(encoding="utf-8"))
+            ):
+                self.assertLessEqual(
+                    self._entropy(blob),
+                    self.MAX_ENTROPY,
+                    f"{path.name}: {blob[:24]}… looks captured, not synthetic",
+                )
+
+    def test_the_scan_would_actually_catch_one(self):
+        """A hygiene test that cannot fail is decoration."""
+        real = "hG7RESurQfEiUWu7GB3ltqBHWv711ScDiXOVFE3asPj4AAAAAGp6Bi8AAAAB"
+        self.assertGreater(self._entropy(real), self.MAX_ENTROPY)
+        self.assertGreaterEqual(len(real), self.MIN_LENGTH)
+
+    def test_no_fixture_names_the_account_it_came_from(self):
+        for path in self.fixtures():
+            text = path.read_text(encoding="utf-8").lower()
+            for tell in ("ericboehs", "@gmail", "@oddball", "boehs"):
+                self.assertNotIn(tell, text, f"{path.name} names its source")
+
+
+class HeadlessWebAuthnTest(unittest.TestCase):
+    """A background scrape must not be able to raise a passkey prompt.
+
+    Amazon's sign-in page loads `IdentityWebAuthnAssets` with a live challenge
+    in `webAuthnGetParametersForButton`. `launch()` prefers real Chrome, so
+    that request reaches the macOS platform authenticator and puts a Touch ID
+    sheet on screen — from `amazon subscribe upcoming`, which the user has no
+    reason to think opened a browser at all.
+
+    `guard()` does catch the sign-in redirect, but only once the page has
+    loaded and run its scripts, which is after the prompt is up.
+    """
+
+    class FakeContext:
+        def __init__(self):
+            self.init_scripts = []
+
+        def add_init_script(self, script):
+            self.init_scripts.append(script)
+
+    class FakeBrowser:
+        def __init__(self):
+            self.context = HeadlessWebAuthnTest.FakeContext()
+            self.kwargs = None
+
+        def new_context(self, **kwargs):
+            self.kwargs = kwargs
+            return self.context
+
+    def context_for(self, tmp):
+        state = pathlib.Path(tmp) / "storage_state.json"
+        state.write_text("{}")
+        browser = self.FakeBrowser()
+        with mock.patch.object(browser_mod, "storage_state_path", lambda: state):
+            return browser, browser_mod.new_context(browser)
+
+    def test_every_headless_context_disables_webauthn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ctx = self.context_for(tmp)
+        self.assertEqual(len(ctx.init_scripts), 1)
+        script = ctx.init_scripts[0]
+        self.assertIn("navigator.credentials", script)
+        self.assertIn("isUserVerifyingPlatformAuthenticatorAvailable", script)
+        self.assertIn("isConditionalMediationAvailable", script)
+
+    # An init script, not a per-page call: the prompt is raised by whatever
+    # Amazon redirects us *to*, which is not the page we opened.
+    def test_it_is_installed_on_the_context_not_a_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ctx = self.context_for(tmp)
+        self.assertTrue(ctx.init_scripts, "nothing would run before Amazon's own scripts")
+
+    def test_the_session_is_still_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            browser, _ = self.context_for(tmp)
+        self.assertIn("storage_state", browser.kwargs)
+
+    def test_no_session_still_refuses_before_launching_anything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = pathlib.Path(tmp) / "nope.json"
+            with mock.patch.object(browser_mod, "storage_state_path", lambda: missing):
+                with self.assertRaises(browser_mod.NotLoggedIn):
+                    browser_mod.new_context(self.FakeBrowser())
+
+    # Rejecting the way a cancelled sheet does, so Amazon's own error handling
+    # covers it rather than an unhandled promise.
+    def test_it_declines_the_way_a_user_cancelling_would(self):
+        self.assertIn("NotAllowedError", browser_mod.NO_WEBAUTHN_JS)

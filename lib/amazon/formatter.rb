@@ -7,6 +7,7 @@ module Amazon
     DIM   = "\e[2m"
     GREEN = "\e[32m"
     RED   = "\e[31m"
+    YELLOW = "\e[33m"
     RST   = "\e[0m"
 
     def initialize(json: false, color: $stdout.tty?)
@@ -202,7 +203,400 @@ module Amazon
       end
     end
 
+    # --- subscribe & save ----------------------------------------------
+
+    # `total` is what Amazon says the account holds; `loaded_all` is whether we
+    # asked for all of it. Both are needed to say anything honest about a short
+    # list: 30 rows out of 59 is a page, 30 out of 30 is the whole thing, and
+    # the rows cannot tell the two apart.
+    def subscriptions(rows, total: nil, loaded_all: false, thumbnails: nil)
+      return puts(JSON.pretty_generate(rows)) if @json
+      return puts("(no Subscribe & Save subscriptions)") if rows.empty?
+
+      thumbnails ? subscription_cards(rows, thumbnails) : subscription_table(rows)
+      note = subscription_count_note(rows.size, total, loaded_all)
+      puts dim(note) if note
+    end
+
+    # `limit` trims what prints, never what's returned: --json is a data
+    # interface and a caller piping to jq did not ask for Amazon's next three.
+    def deliveries(cards, limit: nil, thumbnails: nil)
+      return puts(JSON.pretty_generate(cards)) if @json
+      return puts("(no scheduled Subscribe & Save deliveries)") if cards.empty?
+
+      shown = limit ? cards.first(limit) : cards
+      # One warm-up for the whole screen rather than one per delivery: the
+      # downloads are the slow part and they don't depend on each other.
+      thumbnails&.prefetch(shown.flat_map { |c| Array(c["items"]).map { |i| i["image"] } })
+      shown.each_with_index do |card, i|
+        puts if i.positive?
+        puts delivery_heading(card)
+        # Only ever set on the delivery that is next out the door, and it is
+        # the one fact on this screen with a deadline attached.
+        puts "  #{bold(labelled(card, "editable_until", "Last day to edit:"))}" if card["editable_until"]
+        puts dim("  #{labelled(card, "savings", "Savings:")}") if card["savings"]
+        puts dim("  #{card["tiering"]}") if card["tiering"]
+        thumbnails ? delivery_item_cards(card, thumbnails) : delivery_items(card)
+      end
+      remaining = cards.size - shown.size
+      return unless remaining.positive?
+
+      puts dim("#{remaining} more #{remaining == 1 ? "delivery" : "deliveries"} scheduled — pass --all")
+    end
+
+    # One subscription, from the edit modal. Laid out as labelled lines rather
+    # than a table: it is one record with a dozen fields, half of which are
+    # sentences.
+    def subscription(detail, thumbnails: nil)
+      return puts(JSON.pretty_generate(detail)) if @json
+
+      head = [bold(detail["title"] || "(untitled subscription)")]
+      head << dim(detail["variation"]) if detail["variation"]
+      rows = subscription_detail_rows(detail)
+      width = rows.map { |label, _| label.length }.max || 0
+      fields = rows.map { |label, value| "  #{dim(label.ljust(width))}  #{value}" }
+
+      unless thumbnails
+        puts head
+        puts
+        return puts(fields)
+      end
+
+      thumbnails.prefetch([detail["image"]])
+      beside_image(thumbnails.block(detail["image"]), head + [""] + fields, thumbnails)
+    end
+
+    # The result of a skip, confirmed or merely contemplated.
+    def skip(result)
+      return puts(JSON.pretty_generate(result)) if @json
+
+      title = result["title"] || result["product"] || "(untitled subscription)"
+      when_ = result["delivery_label"] || result["delivery_date"]
+      if result["confirmed"]
+        puts "#{green("skipped")} #{bold(title)}"
+        puts dim("  from the #{when_} delivery") if when_
+        puts skip_verdict(result["verified"])
+      else
+        puts "#{bold("would skip")} #{bold(title)}"
+        puts dim("  from the #{when_} delivery") if when_
+        # Amazon's warning, not ours. "Skip" sounds harmless; their own dialog
+        # is the thing that says it may cost you a coupon.
+        puts "  #{yellow(result["warning"])}" if result["warning"]
+        puts dim("  nothing changed — pass --yes to skip it")
+      end
+    end
+
+    # The result of a cancellation, confirmed or merely contemplated.
+    def cancellation(result)
+      return puts(JSON.pretty_generate(result)) if @json
+
+      title = result["title"] || "(untitled subscription)"
+      if result["cancelled"]
+        puts "#{green("cancelled")} #{bold(title)}"
+        puts cancel_verdict(result["verified"])
+      else
+        puts "#{bold("would cancel")} #{bold(title)}"
+        cancellation_facts(result).each { |line| puts line }
+        puts dim("  nothing changed — pass --yes to cancel it")
+      end
+    end
+
+    # A schedule change, applied or merely contemplated.
+    def schedule(result)
+      return puts(JSON.pretty_generate(result)) if @json
+
+      title = result["title"] || "(untitled subscription)"
+      puts "#{result["applied"] ? green("changed") : bold("would change")} #{bold(title)}"
+      rows = schedule_rows(result)
+      width = rows.map { |label, _| label.length }.max || 0
+      rows.each { |label, value| puts "  #{dim(label.ljust(width))}  #{value}" }
+      if result["applied"]
+        puts schedule_verdict(result["verified"])
+      else
+        puts "  #{yellow(squish(result["note"]))}" if result["note"]
+        puts dim("  choices: #{schedule_choices(result)}")
+        puts dim("  nothing changed — pass --yes to apply")
+      end
+    end
+
     private
+
+    def schedule_rows(result)
+      current = result["current"] || {}
+      wanted = result["wanted"] || {}
+      rows = []
+      rows << ["quantity", change_arrow(current["quantity"], wanted["quantity"])]
+      rows << ["frequency", change_arrow(current["frequency"], wanted["frequency"])]
+      rows << ["next delivery", next_delivery_cell(result)]
+      rows.reject { |_, value| value.nil? }
+    end
+
+    def change_arrow(from, to)
+      return nil if from.nil? && to.nil?
+      return from.to_s if to.nil? || to == from
+
+      "#{from} #{dim("→")} #{bold(to)}"
+    end
+
+    # Amazon puts the next delivery date in the same form as quantity and
+    # frequency, behind the same Apply, and its dropdown does not always hold
+    # the date the subscription currently shows. Applying anything applies
+    # that too, so the row says so before it happens rather than after.
+    def next_delivery_cell(result)
+      shown = result["next_delivery_label"] || result["next_delivery_date"]
+      form = (result["current"] || {})["next_date"]
+      asked = (result["wanted"] || {})["next_date"]
+      return change_arrow(shown, asked) if asked
+      return shown if form.nil? || shown.nil? || shown.include?(form)
+
+      "#{shown} #{dim("→")} #{bold(form)} #{yellow("(Amazon's form sets this too)")}"
+    end
+
+    def schedule_choices(result)
+      choices = result["choices"] || {}
+      %w[quantity frequency next_date].filter_map do |key|
+        values = Array(choices[key])
+        next if values.empty?
+
+        "#{key.sub("next_date", "next")} #{summarize_choices(values)}"
+      end.join(" · ")
+    end
+
+    # Fourteen frequencies and eight months is a paragraph. The ends of an
+    # ordered range say more than the middle of it does.
+    def summarize_choices(values)
+      return values.join(", ") if values.length <= 5
+
+      "#{values.first}…#{values.last} (#{values.length})"
+    end
+
+    def schedule_verdict(verified)
+      case verified
+      when true  then dim("  confirmed — your subscription list agrees")
+      when false then red("  but your subscription list still shows the old schedule — check Amazon")
+      else dim("  Amazon accepted it; couldn't re-read the list to confirm")
+      end
+    end
+
+    def cancellation_facts(result)
+      lines = []
+      if (nxt = result["next_delivery_label"] || result["next_delivery_date"])
+        lines << dim("  next delivery #{nxt}")
+      end
+      lines << dim("  #{squish(result["lifetime_savings_text"])}") if result["lifetime_savings_text"]
+      # Amazon's list, in Amazon's order. The second line — that a box already
+      # being assembled goes too — is the one nobody expects from "cancel".
+      Array(result["consequences"]).each { |c| lines << "  #{yellow(c)}" }
+      lines << dim("  reasons: #{Array(result["reasons"]).join(", ")}") if result["reasons"]&.any?
+      lines
+    end
+
+    def cancel_verdict(verified)
+      case verified
+      when true  then dim("  confirmed — it's gone from your subscriptions")
+      when false then red("  but it is still in your subscriptions — check Amazon")
+      else dim("  Amazon accepted it; couldn't re-read the list to confirm")
+      end
+    end
+
+    def squish(text)
+      text.to_s.gsub(/\s+/, " ").strip
+    end
+
+    # A click that returned without error is not evidence, so the three
+    # outcomes stay three: it left the delivery, it didn't, or we couldn't
+    # look. The middle one is the only failure, and it must not be reported in
+    # the same words as the third.
+    def skip_verdict(verified)
+      case verified
+      when true  then dim("  confirmed — it's no longer in that delivery")
+      when false then red("  but it is still in that delivery — check Amazon")
+      else dim("  Amazon accepted it; couldn't re-read the delivery to confirm")
+      end
+    end
+
+    def subscription_table(rows)
+      headers = %w[next every qty price subscription_id item]
+      # Everything but the title is fixed width; give the title the rest.
+      title_width = [term_width - 74, 24].max
+      data = rows.map do |r|
+        [
+          r["next_delivery_label"] || "?",
+          interval_phrase(r),
+          (r["quantity"] || "?").to_s,
+          # Blank, not $0.00, for a delivery Amazon hasn't priced yet. The
+          # discount is what it has committed to for those.
+          subscription_price(r),
+          r["subscription_id"],
+          truncate(r["title"], title_width)
+        ]
+      end
+      print_table(headers, data)
+    end
+
+    # With a photograph in the left margin the table has to go. Six columns is
+    # a table; six columns and a picture is a wall. Each subscription becomes a
+    # block instead, and the columns become a sentence.
+    def subscription_cards(rows, thumbnails)
+      thumbnails.prefetch(rows.map { |r| r["image"] })
+      width = [term_width - thumbnails.cols - 4, 24].max
+      rows.each_with_index do |r, i|
+        puts if i.positive?
+        lines = [bold(truncate(r["title"], width))]
+        lines << dim(truncate(r["variation"], width)) if r["variation"]
+        lines << subscription_summary(r)
+        lines << dim(r["subscription_id"].to_s)
+        beside_image(thumbnails.block(r["image"]), lines, thumbnails)
+      end
+    end
+
+    # The table's columns rejoined into a sentence: what ships next, how often,
+    # how many, and what it costs.
+    def subscription_summary(row)
+      parts = [row["next_delivery_label"] || "?", "every #{interval_phrase(row)}"]
+      parts << "qty #{row["quantity"]}" if row["quantity"] && row["quantity"] != 1
+      line = parts.join(dim(" · "))
+      price = subscription_price(row)
+      price.empty? ? line : "#{line}#{dim(" · ")}#{price}"
+    end
+
+    # Text to the right of a picture, without knowing which graphics protocol
+    # drew the picture.
+    #
+    # The text goes down first and the image is painted over its left margin
+    # afterwards, which looks backwards and isn't: printing the text first is
+    # what scrolls the terminal, so by the time the image is drawn the rows it
+    # needs exist. Drawing first at the bottom of a screen clips the photo
+    # against the last line.
+    def beside_image(blob, lines, thumbnails)
+      body = lines.dup
+      body << "" while body.size < thumbnails.rows
+      indent = " " * (thumbnails.cols + 2)
+
+      # Autowrap off, and the cursor parked after the text rather than counted
+      # back to.
+      #
+      # Ruby counts "Clorox®" as six characters and the terminal draws it in
+      # seven cells, so a line this side believes fits can wrap; and chafa fits
+      # the photo *within* the box rather than filling it, so a wide product
+      # shot comes back three rows tall instead of six. Either one breaks
+      # arithmetic that counts rows. Saving the position after the text and
+      # restoring it after the image returns to where the text ended no matter
+      # what the image did in between.
+      print "\e[?7l"
+      begin
+        body.each { |l| puts l.empty? ? "" : "#{indent}#{l}" }
+        return if blob.nil?
+
+        print "\e7\e[#{body.size}A"
+        print blob
+        print "\e8"
+      ensure
+        print "\e[?7h"
+      end
+    end
+
+    def subscription_price(row)
+      return format_money(row["price"]) if row["price"]
+      row["discount"] ? dim(row["discount"].to_s.sub(/\ASaving /, "")) : ""
+    end
+
+    def subscription_detail_rows(detail)
+      rows = []
+      rows << ["next delivery", next_delivery_line(detail)] if detail["next_delivery_label"]
+      rows << ["schedule", detail["schedule_raw"]] if detail["schedule_raw"]
+      rows << ["discount", green(detail["discount_now"])] if detail["discount_now"]
+      rows << ["saved so far", format_money(detail["lifetime_savings"])] if detail["lifetime_savings"]
+      rows << ["sold by", detail["merchant"]] if detail["merchant"]
+      rows << ["asin", detail["asin"]] if detail["asin"]
+      # Amazon substitutes this if the subscribed item is out of stock, so its
+      # absence is worth stating rather than omitting — "none" is a setting.
+      rows << ["backup item", detail["backup_item"] || dim("none")]
+      rows << ["subscription id", detail["subscription_id"]] if detail["subscription_id"]
+      rows
+    end
+
+    # The modal prints "Next delivery will arrive by" above the date; keeping
+    # its wording distinguishes an arrival estimate from a ship date.
+    def next_delivery_line(detail)
+      label = detail["next_delivery_label"]
+      prefix = detail["next_delivery_prefix"].to_s[/arrive by/i]
+      prefix ? "#{label} #{dim("(arrives by)")}" : label
+    end
+
+    # Amazon's own label for a value, when it gave one. Its wording is more
+    # precise than anything invented here ("Estimated savings for this
+    # delivery:" vs "Savings:"), and on the savings line the label is doing
+    # load-bearing work: the value on its own is a bare "$1.95", which reads
+    # as a price.
+    def labelled(card, key, fallback)
+      label = card["#{key}_label"].to_s
+      "#{label.empty? ? fallback : label} #{card[key]}"
+    end
+
+    def delivery_heading(card)
+      when_ = card["date_label"] || card["date"] || "(undated)"
+      items = Array(card["items"]).size
+      head = "#{bold(when_)}  #{dim("#{plural(items, "item")}")}"
+      head += "  #{bold(format_money(card["subtotal"]))}" if card["subtotal"]
+      head += dim("  · next") if card["kind"] == "current"
+      head
+    end
+
+    def delivery_items(card)
+      title_width = [term_width - 30, 24].max
+      Array(card["items"]).each do |item|
+        # A future delivery has no prices at all, so the column is blank rather
+        # than $0.00 — the difference between "free" and "not priced yet".
+        price = item["price"] ? format_money(item["price"]).rjust(9) : " " * 9
+        line = "  #{price}  #{truncate(item["title"], title_width)}"
+        line += green("  #{item["discount"]}") if item["discount"]
+        puts line
+      end
+    end
+
+    # The same block layout as `list`, one step further in: these items sit
+    # under a delivery heading, so the price moves off the front of the line —
+    # a price column indented past a photograph is a column of one.
+    def delivery_item_cards(card, thumbnails)
+      width = [term_width - thumbnails.cols - 4, 24].max
+      Array(card["items"]).each do |item|
+        lines = [truncate(item["title"], width)]
+        lines << dim(truncate(item["variation"], width)) if item["variation"]
+        lines << delivery_item_price(item)
+        beside_image(thumbnails.block(item["image"]), lines.compact, thumbnails)
+      end
+    end
+
+    def delivery_item_price(item)
+      # A future delivery has no prices at all, so this is the discount alone
+      # rather than $0.00 — the difference between "free" and "not priced yet".
+      # With neither, the line is dropped rather than left blank.
+      return nil if item["price"].nil? && item["discount"].nil?
+      return green(item["discount"].to_s) unless item["price"]
+
+      line = bold(format_money(item["price"]))
+      item["discount"] ? "#{line}  #{green(item["discount"])}" : line
+    end
+
+    # "1 month", "2 weeks" — or whatever Amazon said, if it didn't parse.
+    def interval_phrase(row)
+      count = row["interval_count"]
+      unit = row["interval_unit"]
+      return "#{count} #{unit}#{"s" unless count == 1}" if count && unit
+      row["schedule_raw"] || "?"
+    end
+
+    def subscription_count_note(shown, total, loaded_all)
+      return nil unless total
+      return nil if shown >= total
+      # Without --all a short list is expected and the note is an offer; with
+      # it, a short list means pagination gave up early and the worker has
+      # already said so on stderr. Saying "use --all" there would be advice to
+      # do the thing that just failed.
+      return "showing #{shown} of #{total} — pass --all for the rest" unless loaded_all
+      "showing #{shown} of the #{total} subscriptions Amazon reports"
+    end
 
     # Every empty result in this file goes through here, because a zero is not
     # self-explanatory: it can mean nothing was stored to look at, or that
@@ -404,12 +798,31 @@ module Amazon
       field && order[field]
     end
 
+    # Escape sequences take up no space on screen but plenty in a Ruby string,
+    # and this table pads with `String#length`. One dim() price in the column —
+    # `subscribe list` renders a discount that way whenever Amazon hasn't
+    # priced the delivery yet — added nine invisible characters to the widest
+    # cell, so every other row in that column got nine spaces too many and the
+    # columns after it stopped lining up. Only when colour was on, which is to
+    # say only when a person was looking: piping to a file disables colour and
+    # produces a perfectly aligned table.
+    ANSI_RE = /\e\[[0-9;]*m/
+
+    def display_width(str) = str.to_s.gsub(ANSI_RE, "").length
+
     def print_table(headers, rows)
       cols = headers.size
-      widths = Array.new(cols) { |i| [headers[i].length, *rows.map { |r| r[i].to_s.length }].max }
-      fmt = widths.map { |w| "%-#{w}s" }.join("  ")
-      puts bold(fmt % headers)
-      rows.each { |r| puts(fmt % r) }
+      widths = Array.new(cols) do |i|
+        [display_width(headers[i]), *rows.map { |r| display_width(r[i]) }].max
+      end
+      puts bold(pad_cells(headers, widths))
+      rows.each { |r| puts pad_cells(r, widths) }
+    end
+
+    def pad_cells(cells, widths)
+      cells.each_with_index.map do |cell, i|
+        "#{cell}#{" " * (widths[i] - display_width(cell))}"
+      end.join("  ")
     end
 
     def format_money(val)
@@ -422,5 +835,6 @@ module Amazon
     def dim(s)   = @color ? "#{DIM}#{s}#{RST}"   : s
     def green(s) = @color ? "#{GREEN}#{s}#{RST}" : s
     def red(s)   = @color ? "#{RED}#{s}#{RST}"   : s
+    def yellow(s) = @color ? "#{YELLOW}#{s}#{RST}" : s
   end
 end

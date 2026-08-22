@@ -586,6 +586,37 @@ class OtpSecretTest(unittest.TestCase):
     def test_no_config_stays_none(self):
         self.assertIsNone(normalize_otp_secret(None))
 
+    # 1Password shows a TOTP secret in groups of four and a copied one keeps
+    # them. Rejecting that would be technically correct and useless.
+    def test_the_spacing_1password_displays_is_tolerated(self):
+        self.assertEqual(normalize_otp_secret("jbsw y3dp ehpk 3pxp"), "JBSWY3DPEHPK3PXP")
+        self.assertEqual(normalize_otp_secret("JBSW-Y3DP-EHPK-3PXP"), "JBSWY3DPEHPK3PXP")
+
+    # The bug this guards: pyotp decodes lazily, so a password sitting in
+    # `otp_op_ref` raised once every two seconds inside the login poll loop,
+    # counted as a failed browser probe, and killed the window mid-login.
+    def test_something_that_is_not_base32_is_rejected_at_the_door(self):
+        # 0, 1 and 8 are not in the Base32 alphabet; they are the digits most
+        # often mistaken for O, I and B when a secret is retyped.
+        for bad in ("hunter2!", "not base32", "8888", "JBSWY3DPEHPK3PX1"):
+            with self.assertRaises(ValueError, msg=bad):
+                normalize_otp_secret(bad)
+
+    def test_a_rejected_secret_is_never_echoed(self):
+        with self.assertRaises(ValueError) as raised:
+            normalize_otp_secret("correct-horse-battery-staple!")
+        self.assertNotIn("horse", str(raised.exception))
+        self.assertIn("Base32", str(raised.exception))
+
+    def test_a_bad_secret_inside_an_otpauth_uri_is_caught_too(self):
+        with self.assertRaises(ValueError) as raised:
+            normalize_otp_secret("otpauth://totp/Amazon?secret=hunter2!&issuer=Amazon")
+        self.assertNotIn("hunter2", str(raised.exception))
+
+    def test_a_blank_secret_is_not_a_secret(self):
+        with self.assertRaisesRegex(ValueError, "blank"):
+            normalize_otp_secret("   ")
+
 
 class PackageAssumptionsTest(unittest.TestCase):
     """The fixtures at the top of this file are a claim about amazon-orders.

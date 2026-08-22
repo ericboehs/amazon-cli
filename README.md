@@ -102,6 +102,15 @@ date        order_id             total    status
 - **Price memory** — live results are cross-referenced against your order
   archive, so anything you've bought before shows the date and price you
   paid, plus the delta.
+- **Subscribe & Save** — `amazon subscribe list` shows every subscription
+  sorted by what ships next, with its cadence, discount, and price;
+  `amazon subscribe upcoming` shows the deliveries themselves and the last
+  day you can still change each one; `amazon subscribe show` opens one
+  subscription in full. Reads cache for 30 minutes. `amazon subscribe skip`
+  drops one item from the next delivery, `amazon subscribe cancel` ends a
+  subscription for good, and `amazon subscribe schedule` changes quantity or
+  cadence — all three need `--yes`, and all three prove it worked before
+  saying so.
 - **Incremental sync** — only fetches orders not already on disk. A `--full`
   flag re-fetches everything.
 - **Parallel detail fetches** — `ThreadPoolExecutor` with a tunable worker
@@ -125,6 +134,10 @@ lib/amazon/
     search.rb           live product search
     order.rb            `amazon order …` dispatcher
     order/              sync, list, show, search over the local archive
+    secrets.rb          1Password reads, for sync and login
+    thumbnail.rb        product photos in the terminal, via chafa
+    subscribe.rb        `amazon subscribe …` dispatcher
+    subscribe/          list, upcoming, show, skip, cancel, schedule
     login.rb, config.rb, buy.rb
   config.rb             XDG paths, config load
   store.rb              JSON read/write, index, ASIN purchase history
@@ -135,9 +148,13 @@ lib/amazon/
 pyworker/
   fetch.py              order history: drives amazon-orders, emits NDJSON
   live.py               live product/search scraper
+  subscriptions.py      Subscribe & Save scraper (subscriptions + deliveries)
+  otp.py                TOTP secrets, shared by sync and login
   browser.py            shared Playwright session + selector fallbacks
   login.py              Playwright headed login, persists cookies
   test_live.py          unittest for the parsing helpers (no browser needed)
+  test_subscriptions.py unittest for the S&S parsers, against captured markup
+  fixtures/             scrubbed HTML captured from real pages
   pyproject.toml        deps: amazon-orders, playwright
 web.rb                  single-file Sinatra browser
 test/web_test.rb        Minitest, 95% line + branch coverage gate
@@ -163,6 +180,8 @@ reuse the session that `amazon login` persisted.
 ~/.local/share/amazon/cache/storage_state.json  # full Playwright state
 ~/.local/share/amazon/cache/live/{item,item-reviews,search,reviews}/
                                                 # 15-min live-lookup cache
+~/.local/share/amazon/cache/live/subscribe/     # 30-min Subscribe & Save cache
+~/.local/share/amazon/cache/thumbs/             # product photos for --image
 ~/.local/state/amazon/sync.log                  # sync history
 ```
 
@@ -187,6 +206,9 @@ ln -sf "$PWD/../bin/amazon" ~/bin/amazon
 
 # 3) Create config
 amazon config edit
+
+# 4) Optional: terminal product photos for `subscribe --image`
+brew install chafa
 ```
 
 `~/.config/amazon/config.json`:
@@ -201,16 +223,34 @@ amazon config edit
 }
 ```
 
+`amazon login` uses both refs too: it types the password into the browser
+window and answers the authenticator prompt with a code derived from
+`otp_op_ref`, leaving the window open only for the things a human has to do —
+a captcha, a "was this you?". It also clicks "Not now" on Amazon's
+post-sign-in upsells, which is otherwise where the flow parks itself while
+you're looking somewhere else. `--manual` turns all of that off. Note the
+window is a throwaway Chrome profile with no extensions, so your password
+manager's toolbar button isn't in it; that's what makes the autofill worth
+having.
+
 The `op://` references use the [1Password CLI](https://developer.1password.com/docs/cli/);
 swap in your own password manager or just hardcode a value if you must.
 `otp_op_ref` can point directly at a 1Password one-time-password field: `op
 read` returns its `otpauth://` URI, and the worker extracts the TOTP secret
 without persisting or logging it. The Python worker never logs credentials.
 
+Signing in uses 1Password's `my` account shorthand, which is the default for a
+personal account. If yours is called something else, set `AMAZON_OP_ACCOUNT`:
+
+```sh
+export AMAZON_OP_ACCOUNT=work
+```
+
 ## Use
 
 ```bash
-amazon login                  # one-time browser login (handles captcha + 2FA)
+amazon login                  # browser login; fills password + 2FA from 1Password
+amazon login --manual         # …or type them yourself
 ```
 
 ### Live (queries Amazon now)
@@ -326,6 +366,308 @@ estimate that excludes tax (and, from a subtotal, shipping too).
 > (`amazon list`, `amazon sync`, …); they now require the `order` prefix,
 > and the old spellings print a pointer to the new one.
 
+### Subscribe & Save
+
+```bash
+amazon subscribe list                 # every subscription, soonest delivery first
+amazon subscribe list --all           # click past the first 30
+amazon subscribe upcoming             # the next delivery, with prices
+amazon subscribe upcoming --all       # every scheduled delivery
+amazon subscribe show dishwasher      # one subscription in full, by id or by title
+amazon subscribe skip bodymed         # what skipping it would do — changes nothing
+amazon subscribe skip bodymed --yes   # actually drop it from the next delivery
+amazon subscribe cancel syringes      # what cancelling would cost — changes nothing
+amazon subscribe cancel syringes --yes --reason stopped_using
+amazon subscribe schedule cascade                     # current schedule + what it accepts
+amazon subscribe schedule cascade --qty 2 --every "2 months" --yes
+amazon subscribe list --no-image      # plain table, no product photos
+amazon subscribe list --fresh         # ignore the 30-minute cache
+amazon subscribe upcoming --json | jq '.[0].subtotal'
+```
+
+```
+$ amazon subscribe list --no-image
+next              every     qty  price   subscription_id             item
+September 2       2 months  1    $14.22  SNSD0_CPWMW84DZS0X826Y8P77  Gain Liquid Laundry Deterge…
+September 30      6 months  1    15%     SNST0_3DDC5AB24AB74C1087BE  Amazon Basic Care All Day A…
+October 28        3 months  1    15%     SNST0_FA2F200C1C3C40AE9F9B  Clorox Clean-Up Multi-Surfa…
+showing 30 of 59 — pass --all for the rest
+```
+
+```
+$ amazon subscribe upcoming --no-image
+Sep 2  3 items  $48.95  · next
+  Last day to edit delivery: Thursday, August 27
+  Estimated savings for this delivery: $1.95
+  Add 2 more subscriptions to this delivery and unlock extra savings up to 15%.
+     $14.22  Gain Liquid Laundry Detergent, Freshness, Odor De…  Saving 5%
+     $11.99  BodyMed Adjustable Heel Lift for Men and Woman, S…
+     $22.74  Viva Multi-Surface Cloth Paper Towels, 12 Super R…  Saving 5%
+6 more deliveries scheduled — pass --all
+```
+
+With `--all`, the later boxes print too — with a rate instead of a price,
+because Amazon hasn't set one:
+
+```
+September 30  16 items
+             Cascade Free & Clear Dishwasher Detergent Liquid …  Saving 15%
+             …
+```
+
+Two views of the same account, because Amazon keeps them on separate pages
+and each knows something the other doesn't. `list` is per-subscription:
+everything you're subscribed to and how often it ships. `upcoming` is
+per-shipment: those subscriptions regrouped into the boxes Amazon will
+actually send and charge for. `show` is the third page — one subscription's
+edit modal, which is the only place the ASIN, the seller, the backup item,
+and the running savings total live.
+
+```
+$ amazon subscribe show dishwasher
+Cascade Free & Clear Dishwasher Detergent Liquid Gel, Lemon, 75oz
+
+  next delivery    Wednesday, September 30 (arrives by)
+  schedule         1 unit every 1 month
+  discount         Get it now with 5% off
+  saved so far     $16.92
+  sold by          Amazon.com and top rated sellers
+  asin             B08R7FB5JS
+  backup item      none
+  subscription id  SNSD0_JW5SC777SESY1WWWNZPK
+```
+
+A subscription id is 26 characters nobody types twice, so `show` also takes
+words from the product title. A search matching more than one prints the
+matches and stops rather than picking for you — `show` is what you run before
+deciding what to cancel.
+
+**Prices come from the deliveries view.** A subscription card renders none:
+the price isn't settled until the delivery is assembled and its tier discount
+(5% → 15%, by item count in that one box) is known. So `list` reads both
+pages and joins them on subscription id. Only the delivery shipping next is
+priced; the rest show the rate they'll get without an amount, which is why
+the price column holds `15%` rather than a number. A `$0.00` there would be a
+lie. If the deliveries view fails, the schedules still print and stderr says
+what's missing.
+
+`list` is sorted by next delivery date, soonest first. Amazon's own order
+interleaves September, March, and December — there is nothing in it to
+preserve.
+
+The list page loads 30 subscriptions and hides the rest behind a "show more"
+button, so plain `list` says `showing 30 of 59 — pass --all for the rest`
+rather than pretending 30 is all of them. `--all` clicks through (a few
+seconds for 59). If pagination stalls, you get the partial list plus a
+warning on stderr — never a short list that looks complete.
+
+Amazon schedules deliveries months ahead — seven of them, 84 item lines, on
+the account this was built against — so `upcoming` prints the next one and
+says how many more there are. That's not just brevity: the next delivery is
+the only one with prices, an edit deadline, and anything you can still do
+about it. The rest are a forecast of what March might hold, at a discount
+rate that changes with whatever else lands in the box. `--limit N` and
+`--all` override it. `--json` ignores both: a caller piping to `jq` asked for
+the data, not for the next box.
+
+#### Skipping a delivery
+
+`skip` is the first of three subcommands here that change something, and none
+of them will without `--yes`:
+
+```
+$ amazon subscribe skip bodymed
+would skip BodyMed Adjustable Heel Lift for Men and Woman, Small (1-Pack)
+  from the Sep 2 delivery
+  This will cancel your order. You may lose applied coupons.
+  nothing changed — pass --yes to skip it
+```
+
+That warning is Amazon's sentence, not ours. The dry run is not a simulation:
+it drives the real flow up to the last click and reads back the confirmation
+dialog Amazon rendered, which is the only description of what skipping means
+that can't go stale. It exits 2, because a script that forgot `--yes` should
+be able to tell that nothing happened.
+
+With `--yes` the skip is confirmed and then **verified by re-reading the
+delivery**. A click that returns without error is not evidence — Amazon's
+dialog closes the same way whether the skip took or not — so the three
+outcomes stay three: it left the box, it's still there (say so loudly), or
+the re-read failed and we can't say. "We couldn't confirm" and "it didn't
+work" are different things to tell someone about their account.
+
+Only the next delivery can be skipped, and only until its last-edit date;
+`upcoming` shows both. Later deliveries have no Skip button in Amazon's
+markup at all, because there's nothing to skip until a box is being
+assembled. A search that matches something in a *later* delivery gets told
+what's in this one instead of "no such thing". Ambiguous searches refuse to
+pick: skipping the wrong item means something you needed doesn't arrive.
+
+One subscription per invocation. Two bare words is far more likely to be a
+two-word search that lost its quotes than a request to skip two things.
+
+A confirmed skip drops all three cached views, since the delivery it just
+changed is in every one of them. That happens on *attempt*, not on success: a
+click that landed and then failed to report back has still changed your
+account, and a cache that insists otherwise for half an hour is worse than one
+re-read.
+
+##### Exit codes
+
+The three outcomes above are only useful to a person reading the screen, so
+`skip`, `cancel` and `schedule` carry them out to the shell:
+
+| code | meaning |
+|---|---|
+| 0 | done, and confirmed by re-reading Amazon |
+| 1 | Amazon accepted the click and the change isn't there |
+| 2 | nothing was attempted — a dry run, or a refusal |
+| 3 | attempted, and the check couldn't be made |
+
+3 exists so `amazon subscribe cancel x --yes && something-else` doesn't treat
+"couldn't confirm" as confirmation. Folding it into 0 reports a shipped box as
+skipped; folding it into 1 cries wolf on a mutation that almost certainly
+worked, and a warning that's usually wrong gets ignored.
+
+`schedule` with no `--qty`/`--every`/`--next` is the exception: it asked what
+the item accepts rather than requesting a change, and it exits 0 because it
+answered.
+
+#### Cancelling a subscription
+
+`cancel` ends the subscription outright. Same contract as `skip` — nothing
+without `--yes`, and the dry run is Amazon's own page read back:
+
+```
+$ amazon subscribe cancel syringes
+would cancel Care Touch Disposable Syringes Without Needle Luer Lock
+  next delivery September 30
+  You have saved $3.90 on this subscription!
+  You will no longer receive your Subscribe & Save discount.
+  We will cancel any orders of this item that haven't yet entered the delivery process.
+  reasons: no_more_needed, stopped_using, different_flavor_brand_scent, …
+  nothing changed — pass --yes to cancel it
+```
+
+That second consequence is the reason this prints before it acts: cancelling
+doesn't just stop future deliveries, it pulls the item out of the box already
+being assembled. "Cancel" doesn't sound like that, and Amazon's sentence says
+it better than a paraphrase would.
+
+Verification pages through your **entire** active list, not the first thirty.
+A subscription that lived on page two is missing from page one whether or not
+the cancel worked, and a check that can only return "yes" isn't a check.
+
+The reason is optional — Amazon says so on the page — so none is sent unless
+you pass `--reason`. The keys come off Amazon's own dropdown at runtime
+(`stopped_using`, `accident`, `product_too_expensive`, …), which is why the
+dry run can list them and why a reason Amazon adds later needs no code change
+here. An unrecognised one is refused *before* the confirm click: a
+cancellation that went through with the wrong reason attached can't be taken
+back.
+
+Cancelling is not reversible from this CLI. Amazon's page notes you can
+reactivate an item later on the website.
+
+#### Changing quantity and cadence
+
+```
+$ amazon subscribe schedule cascade --qty 2 --every "2 months"
+would change Cascade Free & Clear Dishwasher Detergent Liquid Gel, Lemon, 75oz
+  quantity       1 → 2
+  frequency      1 month → 2 months
+  next delivery  September 30 → October (Amazon's form sets this too)
+  Note: This will change how often you receive deliveries for this item, which
+  may also change discounts on some upcoming orders.
+  choices: quantity 1, 2, 3 · frequency 2 weeks…12 months (14) · next September…April (8)
+  nothing changed — pass --yes to apply
+```
+
+With no flags it just prints that — the current schedule and everything Amazon
+will accept for this item. Worth running first: quantity caps are per product,
+and they are not what you'd guess. Cascade allows 1–3; a box of syringes
+allows 1–30.
+
+**Read the `next delivery` line.** Amazon puts quantity, frequency and the
+next delivery date in one form behind one Apply button, and its date dropdown
+does not always hold the date your subscription currently shows — on this
+account it offered October 3 for a subscription arriving September 30. So
+applying a quantity change also moves the delivery. That row prints the move
+whether or not you asked for it, and stays quiet when the form already agrees.
+
+`--every` takes what you'd say out loud: `"2 months"`, `2mo`, `3 weeks`, `3w`.
+Amazon's own `2-m` works too. `--next` takes a month name. Anything Amazon
+doesn't offer for that item is refused *before* the form is touched, with the
+list of what it does — a form submitted with a bad value has already changed
+the schedule by the time you read the error.
+
+Unlike `skip` and `cancel`, this one is reversible: run it again. Verification
+re-reads your subscription list and compares the cadence the card now states
+against what you asked for.
+
+The three read-only views cache for 30 minutes, and a cached read says its age on stderr
+(`[cached 12 minutes ago — --fresh to re-read]`) — a schedule you changed on
+the website twenty minutes ago and one that never changed look identical
+otherwise. `--fresh` on any of them drops all three, since they describe one
+account, and `skip`, `cancel` and `schedule` invalidate through the same door
+the moment they are confirmed — on attempt, not on success, because a click
+that landed and then failed to report has still changed your account.
+
+`list`, `upcoming`, and `show` draw the product photo beside each entry when
+they're printing to a terminal; `--no-image` gives you the plain table.
+Rendering is chafa's job, not this CLI's: it negotiates with the terminal and
+emits kitty graphics, sixel, or unicode half-blocks depending on what
+answered, which is a thing to shell out to rather than reimplement worse. The
+table gives way to one block per subscription, because six columns and a
+photograph is a wall.
+
+```
+$ amazon subscribe list
+┌────────┐  Gain Liquid Laundry Detergent, Freshness, Odor Defense, 154 fl oz
+│ (photo)│  September 2 · every 2 months · $14.22
+└────────┘  SNSD0_CPWMW84DZS0X826Y8P77
+
+$ amazon subscribe upcoming
+Sep 2  3 items  $48.95  · next
+  Last day to edit delivery: Thursday, August 27
+┌────┐  Gain Liquid Laundry Detergent, Freshness, Odor Defense
+│    │  Scent Original, Size 132 Fl Oz (Pack of 1)
+└────┘  $14.22  Saving 5%
+```
+
+The photos in `upcoming` are smaller, because those items are already nested
+under a delivery heading and one delivery can hold eighteen of them. The price
+moves off the front of the line and onto its own: a price column indented past
+a photograph is a column of one.
+
+Images are skipped when stdout isn't a terminal or chafa isn't installed — a
+pipe gets the table, not megabytes of escape codes. That happens silently
+unless you typed `--image` explicitly, because a default that can't run
+shouldn't make every `| grep` apologise for a feature nobody asked for.
+Photos are cached on disk by URL and size, so the second run draws instantly.
+
+Two things about that layout were measured rather than assumed, and both were
+wrong on the first try. chafa fits a photo *within* the box instead of filling
+it, so a wide product shot comes back three rows tall in a six-row block; and
+Ruby counts `Clorox®` as six characters where the terminal draws seven cells,
+so a line that fits by `String#length` can wrap. Either one makes a block a
+different height than the arithmetic believes, which puts the next photograph
+through the middle of its own caption. The fix is to stop counting: wrapping
+is disabled across the block, and the cursor is saved after the text and
+restored after the image.
+
+Finding the photos had its own trap. Amazon lazy-loads everything below the
+fold, so `src` on those cards is a 35-byte grey pixel and the real URL waits
+in `data-a-hires`. Both are strings ending in a plausible filename, so reading
+`src` produces JSON that looks complete and a list where the first screenful
+has pictures and the rest have grey smudges. The fixtures carry that markup,
+and a test asserts they still do.
+
+The three mutations — `skip`, `cancel`, `schedule` — share one contract:
+nothing happens without `--yes`, the dry run shows Amazon's own wording rather
+than a paraphrase of it, and the result is verified by re-reading afterwards
+rather than inferred from a click that returned without error.
+
 ## Tuning sync speed
 
 The worker honors `rate_limit` keys in `config.json` plus the worker pool
@@ -363,6 +705,25 @@ from URL shapes, money parsing, the delivery-date parser (Amazon omits the
 year, so December→January has to roll forward), and the review-card parsers
 (day-first international dates, "One person found this helpful", histogram
 labels in either percent-first order).
+
+`pyworker/test_subscriptions.py` runs the Subscribe & Save parsers against
+scrubbed HTML captured from the real pages (`pyworker/fixtures/`), so the
+selectors are checked against markup Amazon actually served rather than
+markup I remembered. The fixtures carry fake subscription ids, ship ids,
+CSRF tokens, product titles, and addresses; nothing in them identifies an
+account, and the edit-modal test asserts that no address or payment method
+reaches the output at all. That claim is now enforced rather than promised:
+`FixtureHygieneTest` scans every fixture for anything shaped like a captured
+credential. It exists because the hand-written scrub missed three of the four
+ways Amazon spells a CSRF token — an `anti-csrftoken-a2z` input with `type=`
+between the name and the value, a `csrfT=` query parameter, and a `"csrfT":`
+JSON key — and two live tokens rode along in `review_listing.html` for a
+whole release. A scrub only covers the spellings someone thought of.
+Pagination is exercised against a fake page that
+reproduces one measured Amazon quirk: clicking "show more" grows the DOM but
+leaves the server-rendered `loadedItemCount` frozen at its original value.
+Believing that counter is an infinite loop, and the fake is built to fail
+that way.
 
 `lib/amazon/reviews.rb` is pure and does no I/O, so it's tested directly
 against synthetic listings — a farmed one it should flag and a genuine one
@@ -412,7 +773,7 @@ identical to a pass. Two commands are honest about which suite you got:
 
 ```sh
 pyworker/.venv/bin/python -m unittest discover -s pyworker -p 'test_*.py'  # 0 skips
-/usr/bin/python3           -m unittest discover -s pyworker -p 'test_*.py'  # 27 skips
+/usr/bin/python3           -m unittest discover -s pyworker -p 'test_*.py'  # 84 skips
 ```
 
 The first is what `python-deps-test` runs; the second stands in for

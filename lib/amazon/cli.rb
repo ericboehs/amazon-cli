@@ -29,6 +29,7 @@ module Amazon
       when "item"   then Commands::Item.new(global).run(argv)
       when "reviews" then Commands::Reviews.new(global).run(argv)
       when "order"  then Commands::OrderNamespace.new(global).run(argv)
+      when "subscribe" then Commands::SubscribeNamespace.new(global).run(argv)
       when "config" then Commands::Config.new(global).run(argv)
       when "buy"    then Commands::Buy.new(global).run(argv)
       when *Commands::OrderNamespace::SUBCOMMANDS
@@ -80,6 +81,14 @@ module Amazon
           order list     List orders
           order show     Show one order in detail
           order search   Search your order history
+
+        Subscribe & Save (queries Amazon now):
+          subscribe list      Your subscriptions and their schedules
+          subscribe upcoming  Scheduled deliveries, prices, and edit deadlines
+          subscribe show      One subscription in full
+          subscribe skip      Drop one item from the next delivery (needs --yes)
+          subscribe cancel    End a subscription (needs --yes)
+          subscribe schedule  Change quantity or how often it arrives (needs --yes)
 
         Other:
           login    Open a browser so you can sign in (handles captcha/2FA)

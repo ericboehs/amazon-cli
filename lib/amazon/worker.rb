@@ -108,6 +108,167 @@ module Amazon
       results
     end
 
+    # Subscribe & Save. Same session and same failure modes as the live
+    # product lookups, so it shares `live_error` — an expired session is the
+    # single most likely way either ends, and it has one answer.
+    #
+    # `all:` pages through the whole list; without it Amazon's first page (~30)
+    # is what comes back. The count Amazon claims to hold is on the `done`
+    # event rather than in the rows, because "30 rows" and "30 of 59 rows" are
+    # different answers and the difference is invisible from the rows alone.
+    def subscriptions(all: false)
+      rows = []
+      @subscription_total = nil
+      @degradations = []
+      run({ action: "subscriptions", all: all }, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "subscription" then rows << event["data"]
+        when "done"
+          @subscription_total = event["total"]
+          @degradations = Array(event["degraded"])
+        when "log"          then log_event(event)
+        when "error"        then raise Error, live_error(event)
+        end
+      end
+      rows
+    end
+
+    # How many subscriptions Amazon says the account has, which is only the
+    # same as the number returned when the caller asked for all of them.
+    attr_reader :subscription_total
+
+    # What the worker had to give up on during this scrape, in its own words.
+    #
+    # Kept so the caller can store it with the payload: these warnings go to
+    # stderr as they happen, which is the right place exactly once. On a cache
+    # hit they were said to a process that has already exited, and what is
+    # left is a partial answer indistinguishable from a whole one.
+    def degradations
+      @degradations || []
+    end
+
+    def deliveries
+      cards = []
+      @degradations = []
+      run({ action: "deliveries" }, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "delivery" then cards << event["data"]
+        when "done"     then @degradations = Array(event["degraded"])
+        when "log"      then log_event(event)
+        when "error"    then raise Error, live_error(event)
+        end
+      end
+      cards
+    end
+
+    # One subscription in full, found by id or by a search over the titles.
+    # Returns nil when nothing matched: that is a question with an answer
+    # ("you have no such subscription"), not a failure to reach Amazon, and the
+    # two want different exit codes.
+    def subscription(id_or_query)
+      begin_lookup!
+      @degradations = []
+      detail = nil
+      key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
+      run({ action: "subscription", key => id_or_query }, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "detail" then detail = event["data"]
+        when "done"   then @degradations = Array(event["degraded"])
+        when "log"    then log_event(event)
+        when "error"
+          raise Error, live_error(event) unless event["kind"] == "not_found"
+          @not_found = event["msg"]
+        end
+      end
+      detail
+    end
+
+    # Worker errors that are facts about the account rather than failures of
+    # ours: a search that matched nothing, a delivery with nothing to skip, a
+    # subscription Amazon won't cancel or reschedule. They read back in
+    # Amazon's words and exit like refusals instead of raising.
+    REFUSALS = %w[not_found not_skippable not_cancellable not_schedulable].freeze
+
+    # Amazon's own words for why nothing matched — "no active subscription
+    # matching …" or the list of things that matched too many. Worth passing
+    # through verbatim rather than restating from the Ruby side.
+    attr_reader :not_found
+
+    # Cleared at the start of every method that can set it. Without this a
+    # reused Worker answers a successful call with the refusal message from a
+    # previous one — survivable today only because each command builds its
+    # own instance, which is a fact about the callers rather than a property
+    # of this class.
+    def begin_lookup!
+      @not_found = nil
+    end
+    private :begin_lookup!
+
+    # Skip one item out of the next delivery, or — with confirm: false — open
+    # Amazon's confirmation dialog, read it, and walk away without agreeing to
+    # it. The dry run is the same code path up to the last click, which is the
+    # only kind of dry run worth having for a mutation.
+    def skip(id_or_query, confirm:)
+      begin_lookup!
+      result = nil
+      key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
+      request = { action: "skip", key => id_or_query, confirm: confirm }
+      run(request, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "skip" then result = event["data"]
+        when "log"  then log_event(event)
+        when "error"
+          raise Error, live_error(event) unless REFUSALS.include?(event["kind"])
+
+          @not_found = event["msg"]
+        end
+      end
+      result
+    end
+
+    # End a subscription, or read back what ending it would cost. Same
+    # confirm: contract as `skip` — false stops at the page that describes it.
+    def cancel(id_or_query, confirm:, reason: nil)
+      begin_lookup!
+      result = nil
+      key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
+      request = { action: "cancel", key => id_or_query, confirm: confirm, reason: reason }
+      run(request, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "cancel" then result = event["data"]
+        when "log"    then log_event(event)
+        when "error"
+          raise Error, live_error(event) unless REFUSALS.include?(event["kind"])
+
+          @not_found = event["msg"]
+        end
+      end
+      result
+    end
+
+    # Change quantity/frequency/next date, or read back what changing would
+    # do. `confirm: false` stops at the page that describes it.
+    def schedule(id_or_query, confirm:, quantity: nil, frequency: nil, next_date: nil)
+      begin_lookup!
+      result = nil
+      key = id_or_query.to_s.start_with?("SNS") ? :subscription_id : :query
+      request = {
+        action: "schedule", key => id_or_query, confirm: confirm,
+        quantity: quantity, frequency: frequency, next_date: next_date
+      }
+      run(request, script: "subscriptions.py") do |event|
+        case event["event"]
+        when "schedule" then result = event["data"]
+        when "log"      then log_event(event)
+        when "error"
+          raise Error, live_error(event) unless REFUSALS.include?(event["kind"])
+
+          @not_found = event["msg"]
+        end
+      end
+      result
+    end
+
     class Progress
       BAR_WIDTH = 20
 
@@ -362,6 +523,16 @@ module Amazon
           # popen3's own teardown closes the pipes and frees the reader.
           err_thread.join(2)
         end
+      rescue Interrupt
+        # Ctrl-C in a terminal signals the whole foreground process group, so
+        # the worker usually gets it too. Usually is not a guarantee: signal
+        # only the parent — a supervisor, a `kill -INT` on the pid — and
+        # popen3's teardown blocks on `wait_thr` for a child that was never
+        # told to stop, so "stopped" prints and the CLI hangs anyway. And the
+        # child is a browser: abandoning it leaves Chrome running with no
+        # terminal attached to it.
+        stop_worker(wait)
+        raise
       end
     rescue Error => e
       # Every failure out of `run` gets the worker's own last words attached
@@ -422,6 +593,24 @@ module Amazon
     def malformed_note(count)
       return "" if count.zero?
       " after #{count} unparseable line#{"s" unless count == 1} on the event channel"
+    end
+
+    # Stop the worker process, politely and then not.
+    #
+    # TERM lets Playwright close the browser it launched; a browser killed
+    # outright leaves its own children behind. The wait is short because this
+    # runs while someone is holding Ctrl-C wondering why nothing happened.
+    def stop_worker(wait)
+      return unless wait.alive?
+
+      Process.kill("TERM", wait.pid)
+      return if wait.join(3)
+
+      Process.kill("KILL", wait.pid)
+      wait.join(2)
+    rescue Errno::ESRCH, Errno::EPERM
+      # Already gone, or never ours to signal.
+      nil
     end
 
     def python_cmd(script)

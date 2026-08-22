@@ -7,10 +7,12 @@ ROOT = Pathname(__dir__).join("..").realpath
 $LOAD_PATH.unshift(ROOT.join("lib").to_s)
 
 require "amazon/config"
+require "amazon/secrets"
 require "amazon/cache"
 require "amazon/store"
 require "amazon/reviews"
 require "amazon/worker"
+require "amazon/thumbnail"
 require "amazon/formatter"
 require "amazon/cli"
 require "amazon/commands/args"
@@ -25,5 +27,28 @@ require "amazon/commands/order/sync"
 require "amazon/commands/order/list"
 require "amazon/commands/order/show"
 require "amazon/commands/order/search"
+require "amazon/commands/subscribe"
+require "amazon/commands/subscribe/cached"
+require "amazon/commands/subscribe/images"
+require "amazon/commands/subscribe/list"
+require "amazon/commands/subscribe/show"
+require "amazon/commands/subscribe/mutation"
+require "amazon/commands/subscribe/skip"
+require "amazon/commands/subscribe/cancel"
+require "amazon/commands/subscribe/schedule"
+require "amazon/commands/subscribe/upcoming"
 
-exit(Amazon::CLI.run(ARGV))
+# Ctrl-C is how you stop a live scrape, not a crash. Ruby's default handler
+# prints an Interrupt backtrace for every frame it unwound, and because the
+# worker runs under Open3.popen3 there are two of them — the main thread and
+# the stdout reader — so stopping a lookup filled two screens with our
+# internals and buried the fact that nothing was written.
+#
+# 130 is the shell's convention for "killed by SIGINT", which keeps
+# `amazon ... && next-thing` from running `next-thing` after an abort.
+begin
+  exit(Amazon::CLI.run(ARGV))
+rescue Interrupt
+  warn "\namazon: stopped"
+  exit(130)
+end
