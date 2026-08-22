@@ -6139,15 +6139,30 @@ class SubscribeDegradationReplayTest < Minitest::Test
     assert_includes err, 'cached', 'the age note should still be there'
   end
 
-  # --json is a data channel; the degradation belongs in the payload, and the
-  # human-facing replay must not be the only record of it.
-  def test_json_carries_the_reason_in_the_payload
-    worker = FakeSubscribeWorker.new.with_degradations(PARTIAL)
-    out = nil
-    with_worker(->(*) { worker }) do
-      out, = capture_io_streams { Amazon::CLI.run(%w[--json subscribe list]) }
+  # `_degraded` is how a warning survives caching, not part of the record.
+  # `list` and `upcoming` hide it for free by unwrapping to rows and cards; a
+  # detail is its own payload, so `show` had to be told. Without it the JSON
+  # grows a key on exactly the runs where something went wrong.
+  def test_the_internal_key_never_reaches_the_json
+    %w[list upcoming show].each do |view|
+      argv = view == 'show' ? %w[--json subscribe show dishwasher] : ['--json', 'subscribe', view]
+      worker = FakeSubscribeWorker.new.with_degradations(PARTIAL)
+      out = nil
+      with_worker(->(*) { worker }) { out, = capture_io_streams { Amazon::CLI.run(argv) } }
+      refute_includes out, '_degraded', "#{view} --json leaked the cache's bookkeeping"
+      refute_includes out, PARTIAL, "#{view} --json put a stderr warning in the payload"
     end
-    refute_includes out, PARTIAL, 'rows are the payload; the note rides on the cache entry'
+  end
+
+  # ...but it must still be said, or caching a partial answer silences it.
+  def test_the_warning_still_reaches_stderr_in_json_mode
+    worker = FakeSubscribeWorker.new.with_degradations(PARTIAL)
+    err = nil
+    with_worker(->(*) { worker }) do
+      capture_io_streams { Amazon::CLI.run(%w[--json subscribe show dishwasher]) }
+      _, err = capture_io_streams { Amazon::CLI.run(%w[--json subscribe show dishwasher]) }
+    end
+    assert_includes err, PARTIAL
   end
 end
 

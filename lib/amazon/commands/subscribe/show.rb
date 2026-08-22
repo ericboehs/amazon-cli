@@ -52,7 +52,16 @@ module Amazon
           end
 
           renderer = thumbnails(images, IMAGE_ROWS)
-          Amazon::Formatter.new(json: @global.json).subscription(detail, thumbnails: renderer)
+          # `_degraded` is how a warning survives being cached; it is not part of
+          # the subscription. `list` and `upcoming` hide it for free because
+          # they unwrap to rows and cards, but a detail *is* its own payload,
+          # so without this `--json subscribe show` grows an extra key on
+          # exactly the runs where a scrape went wrong — an unstable shape for
+          # anything parsing it. The warning has already been said on stderr,
+          # which is where it belongs.
+          Amazon::Formatter.new(json: @global.json)
+            .subscription(detail.reject { |k, _| k == Amazon::Cache::DEGRADED_KEY },
+                          thumbnails: renderer)
           report_missing_images(renderer)
           0
         end
