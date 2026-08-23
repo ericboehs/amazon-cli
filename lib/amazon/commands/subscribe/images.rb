@@ -35,8 +35,24 @@ module Amazon
         def report_missing_images(renderer)
           return unless renderer&.failures&.positive?
 
-          warn "amazon: #{renderer.failures} " \
-               "#{renderer.failures == 1 ? "photo" : "photos"} could not be fetched"
+          count = renderer.failures
+          said = "amazon: #{count} #{count == 1 ? "photo" : "photos"} could not be fetched"
+          # The count answers "how many" and cannot answer "why", and the two
+          # answers lead opposite ways: a CDN timeout is worth retrying, a
+          # NameError in the fetcher is worth reporting. Both arrive here as
+          # the same sentence, so the exception goes behind --verbose rather
+          # than into every listing that loses a photo to a flaky network.
+          said += " (first error: #{error_detail(renderer.first_error)})" if @global.verbose && renderer.first_error
+          warn said
+        end
+
+        private
+
+        # Class included on purpose: "execution expired" alone doesn't say
+        # whether it was the connection or the read, and `Errno::ENOSPC` says
+        # more than "No space left on device" does about whose disk.
+        def error_detail(err)
+          "#{err.class}: #{err.message}"
         end
       end
     end
