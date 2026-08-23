@@ -81,6 +81,41 @@ require 'minitest/autorun'
 
 # --- helpers -----------------------------------------------------------
 
+# The suite must never run `op` for real. On CI it isn't installed, so the
+# words "op: command not found" arrive inside a stderr assertion and fail a
+# test that has nothing to do with 1Password. On a developer's machine it is
+# worse: `op read` pops a fingerprint prompt and blocks until someone touches
+# the sensor, which on an unattended run is a hang with no explanation.
+#
+# That rule was written down in `with_secrets` below and enforced by nobody,
+# so it held only as long as every test remembered to opt in. One didn't:
+# three tests in LoginAutofillTest leave a `password_op_ref` in the config
+# file, LoginCommandTest had no setup to overwrite it, and on the seeds where
+# minitest ordered them that way, login went to the real binary. It failed on
+# CI roughly one run in six and passed locally every time, because a machine
+# with `op` installed gets an answer instead of an error.
+#
+# `Secrets.read` is the only caller of capture3 in lib/, so this catches the
+# whole class of mistake at the one place it can reach a subprocess. The two
+# sanctioned seams (`with_secrets`, `with_capture3`) both replace the method
+# and are unaffected; anything else gets told which test and which ref.
+#
+# Not a StandardError, for the same reason Minitest::Assertion isn't one:
+# `login` wraps secret reads in `rescue StandardError` and turns them into a
+# polite "no credentials from 1Password" warning, which would bury this in
+# the very stderr assertion it is trying to explain.
+class OpWasInvoked < Exception; end # rubocop:disable Lint/InheritException
+
+OP_FORBIDDEN = Open3.method(:capture3)
+Open3.define_singleton_method(:capture3) do |*args, **kw|
+  if args.any? { |a| a.to_s.include?('op read ') }
+    raise OpWasInvoked, "the test suite tried to run `op` for real: #{args.inspect}\n" \
+                        'Wrap the test in with_secrets, or give it a config without an op:// ref.'
+  end
+
+  OP_FORBIDDEN.call(*args, **kw)
+end
+
 def capture_io_streams
   old_out, old_err = $stdout, $stderr
   out, err = StringIO.new, StringIO.new
@@ -123,7 +158,8 @@ end
 
 # Swaps the 1Password reader for a hash. Nothing in the suite may shell out to
 # `op` — it would prompt for a fingerprint on the developer's machine and hang
-# forever on CI.
+# forever on CI. The guard above makes that a loud failure rather than a
+# convention; this is how a test says what it wants `op` to have returned.
 def with_secrets(values)
   original = Amazon::Secrets.method(:read)
   Amazon::Secrets.define_singleton_method(:read) do |ref|
@@ -1256,6 +1292,12 @@ ensure
 end
 
 class LoginCommandTest < Minitest::Test
+  # These tests are about the worker protocol, not about autofill, and none of
+  # them writes a config. Without this they inherited whichever one the last
+  # test left on disk — including the `password_op_ref` that LoginAutofillTest
+  # writes — and then went looking for a real 1Password entry.
+  def setup = write_config!
+
   def login(quiet: false, verbose: false)
     Amazon::Commands::Login.new(Amazon::GlobalOptions.new(json: false, quiet: quiet, verbose: verbose))
   end
@@ -5566,6 +5608,15 @@ class LoginCredentialsTest < Minitest::Test
     puts({ event: 'done', count: 1, cookies_path: '/tmp/cookies.json' }.to_json)
   SCRIPT
 
+  # The config file is one path shared by the whole suite, and the tests below
+  # are the only ones that put an `op://` reference in it. Leaving one behind
+  # hands the next test a config that sends `login` to the real 1Password, so
+  # the ref is cleaned up here rather than guarded against everywhere else.
+  # (`with_secrets` protects these tests; it does nothing for whoever runs
+  # next.) The same goes for the one test that deletes the file outright.
+  def setup = write_config!
+  def teardown = write_config!
+
   def login = Amazon::Commands::Login.new(Amazon::GlobalOptions.new(json: false, quiet: false, verbose: false))
 
   def run_login(argv = [], refs: {}, secrets: {})
@@ -5724,6 +5775,10 @@ class SecretsTest < Minitest::Test
 end
 
 class LoginPipeTest < Minitest::Test
+  # Writes an `op://` ref of its own below — see LoginCredentialsTest.
+  def setup = write_config!
+  def teardown = write_config!
+
   def login = Amazon::Commands::Login.new(Amazon::GlobalOptions.new(json: false, quiet: false, verbose: false))
 
   # A worker that dies before reading leaves us writing into a closed pipe.
