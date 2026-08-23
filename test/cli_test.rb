@@ -4833,12 +4833,16 @@ class FakeThumbnail < Amazon::Thumbnail
     @body = body
     @fetched = []
     @rendered = []
+    # `prefetch` calls `get` from eight threads at once, and an Array that
+    # eight threads push to is only safe by the GVL's good graces. Rendering
+    # stays sequential, so @rendered needs no lock.
+    @fetched_lock = Mutex.new
   end
 
   private
 
   def get(url, redirects: 2)
-    @fetched << url
+    @fetched_lock.synchronize { @fetched << url }
     @body
   end
 
@@ -4857,7 +4861,7 @@ class ThumbnailTest < Minitest::Test
 
   def teardown = Amazon::Thumbnail.command = nil
 
-  def url(size = 145) = "https://m.media-amazon.com/images/I/41ib._SS#{size}_.jpg"
+  def url(id = "41ib") = "https://m.media-amazon.com/images/I/#{id}._SS145_.jpg"
 
   # Piping kitty graphics into a file writes megabytes of escape codes where
   # the user expected text, and there is no way to tell from the other end.
@@ -4960,9 +4964,16 @@ class ThumbnailTest < Minitest::Test
     assert_nil t.block(url)
   end
 
+  # Five products, not one product asked for at five sizes. `sized` rewrites
+  # the `._SS<n>_.` modifier to the size `rows` implies, so URLs differing only
+  # there share a cache entry — five of those are one download, and counting
+  # five would be counting a bug. Built that way, what this measured was
+  # thread startup: five downloads if every worker reached `path.exist?`
+  # before the first one wrote the file, one if the first worker drained the
+  # queue alone. It passed or failed on how fast the machine spawns threads.
   def test_prefetch_warms_the_cache_for_every_url
     t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
-    urls = (1..5).map { |i| url(100 + i) }
+    urls = (1..5).map { |i| url("41ib#{i}") }
     t.prefetch(urls + urls)
     assert_equal 5, t.fetched.size
     urls.each { |u| assert t.block(u) }
