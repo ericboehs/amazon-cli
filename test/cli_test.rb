@@ -4826,16 +4826,16 @@ end
 # Everything but the network and chafa. The two seams it replaces are the two
 # that can't run in CI, and both are exercised separately below.
 class FakeThumbnail < Amazon::Thumbnail
-  attr_reader :fetched, :rendered
+  attr_reader :fetched
 
   def initialize(body: "JPEGBYTES", **kw)
     super(**kw)
     @body = body
     @fetched = []
-    @rendered = []
-    # `prefetch` calls `get` from eight threads at once, and an Array that
-    # eight threads push to is only safe by the GVL's good graces. Rendering
-    # stays sequential, so @rendered needs no lock.
+    # `prefetch` calls `get` from up to FETCH_THREADS workers, and an Array
+    # that several threads push to is only safe by the GVL's good graces.
+    # Counting those pushes is what most of these tests assert on, so it is
+    # the one number that must not be approximate.
     @fetched_lock = Mutex.new
   end
 
@@ -4846,10 +4846,7 @@ class FakeThumbnail < Amazon::Thumbnail
     @body
   end
 
-  def render(path)
-    @rendered << path
-    "<image #{File.basename(path)}>"
-  end
+  def render(path) = "<image #{File.basename(path)}>"
 end
 
 class ThumbnailTest < Minitest::Test
@@ -4861,7 +4858,11 @@ class ThumbnailTest < Minitest::Test
 
   def teardown = Amazon::Thumbnail.command = nil
 
-  def url(id = "41ib") = "https://m.media-amazon.com/images/I/#{id}._SS145_.jpg"
+  # Keyword, not positional: this argument used to be a size, and `url(240)`
+  # still reads as "240 pixels" while now meaning image id 240. A stale call
+  # site would build five plausible URLs and pass green while testing nothing.
+  # Vary the id to get distinct images — varying the size is one download.
+  def url(id: "41ib") = "https://m.media-amazon.com/images/I/#{id}._SS145_.jpg"
 
   # Piping kitty graphics into a file writes megabytes of escape codes where
   # the user expected text, and there is no way to tell from the other end.
@@ -4942,6 +4943,19 @@ class ThumbnailTest < Minitest::Test
     assert_includes big.fetched.first, "._SS480_."
   end
 
+  # The other direction, and the one that had no test: within a single run,
+  # `rows` decides the size, so what the caller asked for is discarded. Two
+  # URLs differing only in `._SS<n>_.` are one JPEG and must be one download.
+  # Sequential on purpose — asking `prefetch` this question gets an answer
+  # that depends on how fast the machine spawns threads.
+  def test_urls_that_differ_only_in_size_are_one_download
+    t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    assert t.block("https://m.media-amazon.com/images/I/41ib._SS100_.jpg")
+    assert t.block("https://m.media-amazon.com/images/I/41ib._SS500_.jpg")
+    assert_equal 1, t.fetched.size
+    assert_equal ["https://m.media-amazon.com/images/I/41ib._SS240_.jpg"], t.fetched
+  end
+
   # Amazon's "no image available" graphic. Six rows and a download to draw a
   # grey rectangle that says nothing.
   def test_amazons_no_image_graphic_is_not_drawn
@@ -4964,20 +4978,40 @@ class ThumbnailTest < Minitest::Test
     assert_nil t.block(url)
   end
 
-  # Five products, not one product asked for at five sizes. `sized` rewrites
-  # the `._SS<n>_.` modifier to the size `rows` implies, so URLs differing only
-  # there share a cache entry — five of those are one download, and counting
-  # five would be counting a bug. Built that way, what this measured was
-  # thread startup: five downloads if every worker reached `path.exist?`
-  # before the first one wrote the file, one if the first worker drained the
-  # queue alone. It passed or failed on how fast the machine spawns threads.
+  # The failure path is where keying the in-memory Hash on the raw URL cost
+  # something the disk cache couldn't hide: a miss stores nil, and under the
+  # old key the next size variant missed too, re-fetched, and apologised a
+  # second time for the same photo Amazon doesn't have.
+  def test_a_photo_amazon_wont_serve_is_one_failure_at_any_size
+    t = FakeThumbnail.new(rows: 6, body: nil, stream: FakeTTY.new)
+    assert_nil t.block("https://m.media-amazon.com/images/I/41ib._SS100_.jpg")
+    assert_nil t.block("https://m.media-amazon.com/images/I/41ib._SS500_.jpg")
+    assert_equal 1, t.fetched.size, "the second ask is the first ask"
+    assert_equal 1, t.failures
+  end
+
+  # Five products, not one product asked for at five sizes: `sized` rewrites
+  # the `._SS<n>_.` modifier to whatever `rows` implies, so size-only variants
+  # collapse to one download and asserting five of those would be asserting a
+  # bug. The doubled list is here for the `uniq` in `prefetch`; the second
+  # assert_equal is the cache actually being warm afterwards.
   def test_prefetch_warms_the_cache_for_every_url
     t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
-    urls = (1..5).map { |i| url("41ib#{i}") }
+    urls = (1..5).map { |i| url(id: "41ib#{i}") }
     t.prefetch(urls + urls)
     assert_equal 5, t.fetched.size
     urls.each { |u| assert t.block(u) }
     assert_equal 5, t.fetched.size, "block() should not re-download what prefetch fetched"
+  end
+
+  # `uniq` ran on the URLs as asked for while the cache keyed on the rewritten
+  # ones, so one image requested at five sizes became five queue entries and
+  # five threads racing to write one file. Deterministic now: five collapse to
+  # one before any thread starts, so there is one download and no race to win.
+  def test_prefetch_dedups_urls_that_differ_only_in_size
+    t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
+    t.prefetch((1..5).map { |i| "https://m.media-amazon.com/images/I/41ib._SS#{100 + i}_.jpg" })
+    assert_equal 1, t.fetched.size
   end
 
   def test_prefetch_skips_the_placeholders_and_the_blanks
@@ -6241,6 +6275,28 @@ class ThumbnailHardeningTest < Minitest::Test
     assert_equal 0, t.failures
   end
 
+  # `@failures += 1` is a read and a separate write on a counter eight workers
+  # share. Under the GVL a lost update is unlikely rather than impossible, so
+  # this is the size where "unlikely" would start showing up — and an
+  # undercount reads to the user as photos Amazon simply doesn't have.
+  def test_every_failure_across_every_worker_is_counted
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:download) { |_u| nil }
+    t.prefetch(Array.new(500) { |i| "https://example.com/#{i}.jpg" })
+    assert_equal 500, t.failures
+  end
+
+  # One photo Amazon won't serve is one apology. Before `prefetch` deduped on
+  # the key it caches on, these five went down five separate paths and the
+  # user was told five photos couldn't be fetched — then went looking for four
+  # products that were never missing anything.
+  def test_one_image_at_five_sizes_is_one_missing_photo
+    t = Amazon::Thumbnail.new(rows: 6)
+    t.define_singleton_method(:download) { |_u| nil }
+    t.prefetch((1..5).map { |i| "https://m.media-amazon.com/images/I/41ib._SS#{100 + i}_.jpg" })
+    assert_equal 1, t.failures
+  end
+
   # A placeholder is not a failure: Amazon's "no image available" graphic is
   # correctly skipped, and apologising for it would be noise on every run.
   def test_a_skipped_placeholder_is_not_a_failure
@@ -6250,14 +6306,17 @@ class ThumbnailHardeningTest < Minitest::Test
     assert_equal 0, t.failures
   end
 
-  # Eight threads share one Hash.
+  # Eight threads share one Hash. Asserted through `block`, because a write
+  # that lands in the Hash but under a key `block` won't look up is the same
+  # lost download from the user's side.
   def test_concurrent_fetches_all_land
     t = Amazon::Thumbnail.new(rows: 4)
     t.define_singleton_method(:download) { |u| "/tmp/#{u[-5..]}" }
+    t.define_singleton_method(:render) { |path| "<#{path}>" }
     urls = Array.new(50) { |i| "https://example.com/#{i}.jpg" }
     t.prefetch(urls)
     t.define_singleton_method(:download) { |_u| flunk('should have been cached') }
-    urls.each { |u| assert t.send(:drawable?, u) }
+    urls.each { |u| assert t.block(u), "#{u} never made it into the cache" }
   end
 end
 

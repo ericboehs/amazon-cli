@@ -67,9 +67,9 @@ module Amazon
       @cache = {}
       # Not for control flow — for saying so afterwards. See `failures`.
       @failures = 0
-      # Eight threads write to @cache. CRuby's GVL makes that survivable in
-      # practice rather than by contract, and this costs nothing on a Hash
-      # that is written 59 times.
+      # Eight threads write to @cache and bump @failures. CRuby's GVL makes
+      # that survivable in practice rather than by contract, and this costs
+      # nothing on a Hash that is written 59 times.
       @cache_lock = Mutex.new
     end
 
@@ -100,7 +100,7 @@ module Amazon
     # downloading 59 thumbnails one at a time is a minute of waiting.
     def prefetch(urls)
       queue = Queue.new
-      urls.uniq.select { |u| drawable?(u) }.each { |u| queue << u }
+      urls.select { |u| drawable?(u) }.uniq { |u| cache_key(u) }.each { |u| queue << u }
       Array.new([FETCH_THREADS, queue.size].min) do
         Thread.new do
           # A thumbnail is decoration; a decoration must not be able to end the
@@ -123,7 +123,7 @@ module Amazon
     def block(url)
       return nil unless drawable?(url)
 
-      path = @cache_lock.synchronize { @cache.fetch(url, :miss) }
+      path = @cache_lock.synchronize { @cache.fetch(cache_key(url), :miss) }
       path = store(url, safe_download(url)) if path == :miss
       return nil if path.nil?
 
@@ -133,18 +133,37 @@ module Amazon
     private
 
     def store(url, path)
-      @cache_lock.synchronize { @cache[url] = path }
+      @cache_lock.synchronize { @cache[cache_key(url)] = path }
     end
+
+    # One key for both caches, and it has to be the rewritten URL, because that
+    # is what actually goes over the network. Keying the Hash on the URL as
+    # asked for while `cache_path` keyed on `sized` meant one product requested
+    # at two sizes was two entries pointing at one file — and `prefetch`'s
+    # `uniq`, which also saw the raw URLs, let both into the queue for two
+    # threads to race over. Downloading the same JPEG twice is cheap. Counting
+    # it as two photos that couldn't be fetched is a lie to the user.
+    def cache_key(url) = sized(url)
 
     # Distinct from `download`'s own rescue: that one knows which failures are
     # expected, this one exists because the list is never complete.
     def safe_download(url)
       path = download(url)
-      @failures += 1 if path.nil?
+      count_failure if path.nil?
       path
     rescue StandardError
-      @failures += 1
+      count_failure
       nil
+    end
+
+    # `@failures += 1` is a read and a separate write, run by up to
+    # FETCH_THREADS workers. The GVL makes a lost update unlikely on CRuby
+    # rather than impossible, and offers nothing at all on JRuby or
+    # TruffleRuby — and an undercount here reads to the user as "some photos
+    # are just missing", which is the one thing this counter exists to rule
+    # out. Reuses @cache_lock: nothing calls this while holding it.
+    def count_failure
+      @cache_lock.synchronize { @failures += 1 }
     end
 
     # Worth a download and six rows of screen. Both callers ask, because a
@@ -223,10 +242,11 @@ module Amazon
       url.sub(/\._SS\d+_\./, "._SS#{@rows * PIXELS_PER_ROW}_.")
     end
 
-    # Keyed by the URL as asked for, size included: the same product at 6 rows
-    # and at 14 is two different downloads.
+    # Keyed by the URL as rewritten, size included: the same product at 6 rows
+    # and at 14 is two different downloads, and at two requested sizes within
+    # one run it is one.
     def cache_path(url)
-      key = Digest::SHA256.hexdigest(sized(url))[0, 16]
+      key = Digest::SHA256.hexdigest(cache_key(url))[0, 16]
       Config.cache_dir.join("thumbs", "#{key}.img")
     end
   end
