@@ -4861,8 +4861,9 @@ class ThumbnailTest < Minitest::Test
   # Keyword, not positional: this argument used to be a size, and `url(240)`
   # still reads as "240 pixels" while now meaning image id 240. A stale call
   # site would build five plausible URLs and pass green while testing nothing.
-  # Vary the id to get distinct images — varying the size is one download.
-  def url(id: "41ib") = "https://m.media-amazon.com/images/I/#{id}._SS145_.jpg"
+  # Vary the id for distinct images; `size:` is what the caller asked for, and
+  # `rows` overrules it — which is why varying it is one download, not many.
+  def url(id: "41ib", size: 145) = "https://m.media-amazon.com/images/I/#{id}._SS#{size}_.jpg"
 
   # Piping kitty graphics into a file writes megabytes of escape codes where
   # the user expected text, and there is no way to tell from the other end.
@@ -4950,10 +4951,9 @@ class ThumbnailTest < Minitest::Test
   # that depends on how fast the machine spawns threads.
   def test_urls_that_differ_only_in_size_are_one_download
     t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
-    assert t.block("https://m.media-amazon.com/images/I/41ib._SS100_.jpg")
-    assert t.block("https://m.media-amazon.com/images/I/41ib._SS500_.jpg")
-    assert_equal 1, t.fetched.size
-    assert_equal ["https://m.media-amazon.com/images/I/41ib._SS240_.jpg"], t.fetched
+    assert t.block(url(size: 100))
+    assert t.block(url(size: 500))
+    assert_equal [url(size: 240)], t.fetched, "both asks are one JPEG at the size rows implies"
   end
 
   # Amazon's "no image available" graphic. Six rows and a download to draw a
@@ -4984,8 +4984,8 @@ class ThumbnailTest < Minitest::Test
   # second time for the same photo Amazon doesn't have.
   def test_a_photo_amazon_wont_serve_is_one_failure_at_any_size
     t = FakeThumbnail.new(rows: 6, body: nil, stream: FakeTTY.new)
-    assert_nil t.block("https://m.media-amazon.com/images/I/41ib._SS100_.jpg")
-    assert_nil t.block("https://m.media-amazon.com/images/I/41ib._SS500_.jpg")
+    assert_nil t.block(url(size: 100))
+    assert_nil t.block(url(size: 500))
     assert_equal 1, t.fetched.size, "the second ask is the first ask"
     assert_equal 1, t.failures
   end
@@ -5010,7 +5010,7 @@ class ThumbnailTest < Minitest::Test
   # one before any thread starts, so there is one download and no race to win.
   def test_prefetch_dedups_urls_that_differ_only_in_size
     t = FakeThumbnail.new(rows: 6, stream: FakeTTY.new)
-    t.prefetch((1..5).map { |i| "https://m.media-amazon.com/images/I/41ib._SS#{100 + i}_.jpg" })
+    t.prefetch((1..5).map { |i| url(size: 100 + i) })
     assert_equal 1, t.fetched.size
   end
 

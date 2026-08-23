@@ -70,7 +70,7 @@ module Amazon
       # Eight threads write to @cache and bump @failures. CRuby's GVL makes
       # that survivable in practice rather than by contract, and this costs
       # nothing on a Hash that is written 59 times.
-      @cache_lock = Mutex.new
+      @state_lock = Mutex.new
     end
 
     # Why images can't be drawn, or nil if they can.
@@ -123,7 +123,7 @@ module Amazon
     def block(url)
       return nil unless drawable?(url)
 
-      path = @cache_lock.synchronize { @cache.fetch(cache_key(url), :miss) }
+      path = @state_lock.synchronize { @cache.fetch(cache_key(url), :miss) }
       path = store(url, safe_download(url)) if path == :miss
       return nil if path.nil?
 
@@ -133,7 +133,7 @@ module Amazon
     private
 
     def store(url, path)
-      @cache_lock.synchronize { @cache[cache_key(url)] = path }
+      @state_lock.synchronize { @cache[cache_key(url)] = path }
     end
 
     # One key for both caches, and it has to be the rewritten URL, because that
@@ -161,9 +161,9 @@ module Amazon
     # rather than impossible, and offers nothing at all on JRuby or
     # TruffleRuby — and an undercount here reads to the user as "some photos
     # are just missing", which is the one thing this counter exists to rule
-    # out. Reuses @cache_lock: nothing calls this while holding it.
+    # out. Reuses the cache's lock: nothing calls this while holding it.
     def count_failure
-      @cache_lock.synchronize { @failures += 1 }
+      @state_lock.synchronize { @failures += 1 }
     end
 
     # Worth a download and six rows of screen. Both callers ask, because a
