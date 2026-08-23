@@ -5094,7 +5094,7 @@ class StubThumbnails
   end
 
   # The real renderer counts what it couldn't fetch so the command can say so.
-  attr_accessor :failures
+  attr_accessor :failures, :first_error
 
   def failures = @failures || 0
 end
@@ -6306,6 +6306,77 @@ class ThumbnailHardeningTest < Minitest::Test
     assert_equal 0, t.failures
   end
 
+  # This is the one that was found in the wild: a NameError raised inside the
+  # fetcher hit `get`'s bare `rescue StandardError`, came back as nil, and was
+  # reported as one more photo Amazon didn't have. The rescue stays — a broken
+  # thumbnail must not end a listing — but the exception no longer evaporates.
+  # Driven through the real `get`, because stubbing `get` tests `safe_download`
+  # instead and leaves the rescue that actually did the swallowing untouched.
+  def test_gets_own_rescue_keeps_what_it_swallows
+    t = Amazon::Thumbnail.new(rows: 4)
+    assert_nil t.send(:get, 'not a url at all')
+    assert_kind_of URI::InvalidURIError, t.first_error
+  end
+
+  # A scheme this fetcher refuses is a decision, not an accident: it returns
+  # nil without raising, so there is nothing to report under -v either.
+  def test_a_refused_scheme_is_not_an_error_to_report
+    t = Amazon::Thumbnail.new(rows: 4)
+    assert_nil t.send(:get, 'file:///etc/passwd')
+    assert_nil t.first_error
+  end
+
+  # Anything the worker raises outside `get` lands in `safe_download`'s rescue,
+  # which counts and records in one place.
+  def test_a_bug_above_get_is_counted_and_kept
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:get) { |*| raise NameError, 'uninitialized constant Config' }
+    t.prefetch(['https://e.com/a.jpg'])
+    assert_equal 1, t.failures
+    assert_kind_of NameError, t.first_error
+    assert_includes t.first_error.message, 'uninitialized constant Config'
+  end
+
+  # A full cache disk is `download`'s rescue, one layer below `get`'s.
+  def test_a_write_that_cannot_land_is_kept_too
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:get) { |*| 'JPEGBYTES' }
+    t.define_singleton_method(:cache_path) { |_u| raise Errno::ENOSPC, 'thumbs' }
+    t.prefetch(['https://e.com/a.jpg'])
+    assert_kind_of Errno::ENOSPC, t.first_error
+  end
+
+  # First, not last: the one that started the trouble is the one worth naming,
+  # and after a disk fills every subsequent error says the same thing anyway.
+  def test_the_first_error_wins
+    t = Amazon::Thumbnail.new(rows: 4)
+    seen = 0
+    t.define_singleton_method(:get) do |*|
+      seen += 1
+      raise(seen == 1 ? Errno::ENOSPC : Errno::ECONNRESET)
+    end
+    t.prefetch(['https://e.com/a.jpg'])
+    t.prefetch(['https://e.com/b.jpg'])
+    assert_kind_of Errno::ENOSPC, t.first_error
+  end
+
+  # A photo Amazon simply doesn't have is a failure with no exception behind
+  # it, and inventing one would make a 404 look like a crash under -v.
+  def test_a_plain_missing_photo_records_no_error
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:download) { |_u| nil }
+    t.prefetch(['https://e.com/a.jpg'])
+    assert_equal 1, t.failures
+    assert_nil t.first_error
+  end
+
+  def test_a_clean_run_records_no_error
+    t = Amazon::Thumbnail.new(rows: 4)
+    t.define_singleton_method(:download) { |_u| '/tmp/x.img' }
+    t.prefetch(['https://e.com/a.jpg'])
+    assert_nil t.first_error
+  end
+
   # Eight threads share one Hash. Asserted through `block`, because a write
   # that lands in the Hash but under a key `block` won't look up is the same
   # lost download from the user's side.
@@ -6331,6 +6402,58 @@ class MissingImageReportTest < Minitest::Test
   def report(renderer)
     _, err = capture_io_streams { report_missing_images(renderer) }
     err
+  end
+
+  def verbosely(renderer)
+    @global = Amazon::GlobalOptions.new(json: false, quiet: false, verbose: true)
+    report(renderer)
+  end
+
+  # The count says how many and can't say why, and "the CDN is slow" and "this
+  # CLI has a bug" are the same sentence without it.
+  def test_verbose_names_the_first_error
+    stub = StubThumbnails.new
+    stub.failures = 2
+    stub.first_error = Errno::ENOSPC.new("/home/x/.cache/amazon")
+    said = verbosely(stub)
+    assert_includes said, '2 photos could not be fetched'
+    assert_includes said, 'Errno::ENOSPC'
+    assert_includes said, '/home/x/.cache/amazon'
+  end
+
+  # A bug in the fetcher reaches the user as a missing photo. Under -v it has
+  # to be distinguishable from a network that dropped one.
+  def test_verbose_does_not_disguise_a_bug_as_a_missing_photo
+    stub = StubThumbnails.new
+    stub.failures = 1
+    stub.first_error = NameError.new('uninitialized constant Amazon::Thumbnail::Config')
+    assert_includes verbosely(stub), 'NameError: uninitialized constant'
+  end
+
+  # Without -v the sentence is what it always was: one line, no class names,
+  # no backtrace fragments in the middle of a listing.
+  def test_the_quiet_sentence_is_unchanged_by_a_recorded_error
+    stub = StubThumbnails.new
+    stub.failures = 2
+    stub.first_error = Errno::ENOSPC.new('/tmp')
+    assert_equal "amazon: 2 photos could not be fetched\n", report(stub)
+  end
+
+  # Counted but unexplained: a 404 is a failure with no exception behind it,
+  # and -v must not invent one or print a bare "(first error: )".
+  def test_verbose_says_nothing_extra_when_nothing_was_raised
+    stub = StubThumbnails.new
+    stub.failures = 1
+    assert_equal "amazon: 1 photo could not be fetched\n", verbosely(stub)
+  end
+
+  # An error with no failure is not a report. `get` records a rescue that a
+  # retry then recovered from; apologising for a photo the user can see is
+  # worse than saying nothing.
+  def test_a_recorded_error_alone_is_not_an_apology
+    stub = StubThumbnails.new
+    stub.first_error = Errno::ECONNRESET.new
+    assert_empty verbosely(stub)
   end
 
   def test_it_says_how_many_and_only_when_there_were_any

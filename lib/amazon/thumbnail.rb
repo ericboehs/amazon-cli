@@ -48,6 +48,17 @@ module Amazon
     # end instead of nothing at all.
     attr_reader :failures
 
+    # The first thing that actually went wrong, or nil.
+    #
+    # `failures` says how many photos are missing; it cannot say whether the
+    # CDN timed out or this file has a bug, and those look identical from the
+    # outside — a blank margin and one apologetic sentence. Three rescues in
+    # here return nil on purpose, and a NameError travels that path as
+    # comfortably as a socket error does: one was found swallowed here,
+    # reported to the user as one more photo Amazon didn't have. Keeping the
+    # first exception costs an ivar and is what `--verbose` prints.
+    attr_reader :first_error
+
     # `rows` drives everything: the width follows from it, because terminal
     # cells are about twice as tall as they are wide and a thumbnail that
     # ignores that is a portrait of a squashed bottle.
@@ -67,6 +78,7 @@ module Amazon
       @cache = {}
       # Not for control flow — for saying so afterwards. See `failures`.
       @failures = 0
+      @first_error = nil
       # Eight threads write to @cache and bump @failures. CRuby's GVL makes
       # that survivable in practice rather than by contract, and this costs
       # nothing on a Hash that is written 59 times.
@@ -151,8 +163,8 @@ module Amazon
       path = download(url)
       count_failure if path.nil?
       path
-    rescue StandardError
-      count_failure
+    rescue StandardError => e
+      count_failure(e)
       nil
     end
 
@@ -162,8 +174,19 @@ module Amazon
     # TruffleRuby — and an undercount here reads to the user as "some photos
     # are just missing", which is the one thing this counter exists to rule
     # out. Reuses the cache's lock: nothing calls this while holding it.
-    def count_failure
-      @state_lock.synchronize { @failures += 1 }
+    def count_failure(err = nil)
+      @state_lock.synchronize do
+        @failures += 1
+        @first_error ||= err
+      end
+    end
+
+    # Separate from `count_failure` because the two don't always coincide: a
+    # rescue that returns nil is one failure with a reason, but `get` swallows
+    # its exception and hands `download` a nil that is counted a layer up.
+    # Recording at the throw site is the only place the exception still exists.
+    def note_error(err)
+      @state_lock.synchronize { @first_error ||= err }
     end
 
     # Worth a download and six rows of screen. Both callers ask, because a
@@ -208,7 +231,8 @@ module Amazon
       File.binwrite(tmp, body)
       File.rename(tmp, path)
       path
-    rescue SystemCallError, IOError
+    rescue SystemCallError, IOError => e
+      note_error(e)
       nil
     end
 
@@ -229,9 +253,12 @@ module Amazon
       end
 
       nil
-    rescue StandardError
+    rescue StandardError => e
       # A thumbnail is decoration. Nothing about a slow CDN, a captive portal,
-      # or a DNS failure should take down a subscription listing.
+      # or a DNS failure should take down a subscription listing — but this is
+      # also where a bug in this file goes to look like a network problem, so
+      # the exception is kept even though the return value can't carry it.
+      note_error(e)
       nil
     end
 
